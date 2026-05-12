@@ -1,0 +1,11 @@
+.env
+config/local.yaml
+data/raw/
+data/processed/
+runs/
+baseline_repos/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
