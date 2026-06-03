@@ -168,8 +168,6 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
         event_texts.extend(split_sentences(context, limit=4))
     if question:
         event_texts.append(f"Clinical question or presentation: {question}")
-    if answer:
-        event_texts.append(f"Final answer or diagnosis target: {answer}")
     if explanation and explanation != answer:
         event_texts.extend(split_sentences(explanation, limit=3))
     if len(event_texts) < 3:

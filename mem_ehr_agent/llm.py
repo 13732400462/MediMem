@@ -37,6 +37,7 @@ class DeepSeekClient:
                 ],
                 temperature=0,
                 max_tokens=8,
+                json_mode=False,
             )
             text = result.text.strip()
             # Some OpenAI-compatible gateways answer health pings with "PONG".
@@ -50,7 +51,8 @@ class DeepSeekClient:
         messages: list[dict[str, str]],
         *,
         temperature: float = 0.1,
-        max_tokens: int = 1200,
+        max_tokens: int | None = None,
+        json_mode: bool = True,
     ) -> LLMResult:
         if not self.config.enabled:
             raise LLMError("DeepSeek API config is not enabled.")
@@ -59,18 +61,48 @@ class DeepSeekClient:
             "model": self.config.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
         started = time.time()
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=self.config.timeout)
-        except requests.RequestException as exc:
-            raise LLMError(f"DeepSeek request failed: {exc}") from exc
+        response = None
+        retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+        last_error: Exception | None = None
+        for token_attempt in range(4):
+            for attempt in range(4):
+                try:
+                    response = requests.post(url, headers=headers, json=payload, timeout=self.config.timeout)
+                except requests.RequestException as exc:
+                    last_error = exc
+                    if attempt == 3:
+                        raise LLMError(f"DeepSeek request failed after retries: {exc}") from exc
+                    time.sleep(2**attempt)
+                    continue
+                if response.status_code not in retryable_statuses:
+                    break
+                if attempt == 3:
+                    break
+                time.sleep(2**attempt)
+            if response is None:
+                break
+            body = response.text[:500] if response.status_code >= 400 else ""
+            if (
+                response.status_code == 400
+                and "maximum context length" in body
+                and int(payload["max_tokens"]) > 128
+                and token_attempt < 3
+            ):
+                payload["max_tokens"] = max(128, int(payload["max_tokens"]) - 256)
+                continue
+            break
         latency = time.time() - started
+        if response is None:
+            raise LLMError(f"DeepSeek request failed: {last_error}")
         if response.status_code >= 400:
             body = response.text[:500]
             raise LLMError(f"DeepSeek API HTTP {response.status_code}: {body}")
@@ -102,10 +134,38 @@ def extract_json_object(text: str) -> dict[str, Any]:
             return obj
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{.*\}", cleaned, flags=re.S)
-    if not match:
+    candidate = first_balanced_json_object(cleaned)
+    if candidate is None:
         raise ValueError(f"No JSON object found in LLM output: {text[:300]}")
-    obj = json.loads(match.group(0))
+    obj = json.loads(candidate)
     if not isinstance(obj, dict):
         raise ValueError("LLM JSON output is not an object.")
     return obj
+
+
+def first_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        start = text.find("{", start + 1)
+    return None
