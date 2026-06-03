@@ -30,6 +30,8 @@ def test_generic_medmcqa_row_can_be_converted_to_case_schema():
     pmoa_like = generic_row_to_pmoa_like(row, spec, 1)
     assert pmoa_like["_source_dataset"] == "medmcqa"
     assert len(pmoa_like["textual_timeseries"]) >= 3
+    runtime_text = " ".join(item["event"] for item in pmoa_like["textual_timeseries"])
+    assert "Final answer or diagnosis target" not in runtime_text
     cases = source_rows_to_cases(
         "medmcqa",
         [row],
@@ -42,4 +44,3 @@ def test_generic_medmcqa_row_can_be_converted_to_case_schema():
     for poison in case["poison_records"]:
         assert "expected_op" not in poison
         assert "revised_claim" not in poison
-

@@ -6,6 +6,40 @@ from typing import Any
 
 from .llm import DeepSeekClient, extract_json_object
 from .memory import apply_critique, bootstrap_memory
+from .medical_terms import canonicalize_diagnosis, canonicalize_diagnoses
+
+
+TARGET_LEAKAGE_PATTERNS = (
+    r"final\s+answer\s+or\s+diagnosis\s+target",
+    r"final\s+answer\s+target",
+    r"final\s+answer",
+    r"diagnosis\s+target",
+    r"soap\s+assessment\s+target",
+    r"topic\s+or\s+diagnosis\s+target",
+    r"doctor\s+assessment\s+target",
+    r"correct\s+answer",
+)
+TARGET_LEAKAGE_RE = re.compile(r"(?i)\b(?:" + "|".join(TARGET_LEAKAGE_PATTERNS) + r")\b\s*:?\s*")
+TARGET_LEAKAGE_PREFIX_RE = re.compile(r"(?i)^\s*(?:" + "|".join(TARGET_LEAKAGE_PATTERNS) + r")\s*:?\s*")
+
+
+def contains_target_leakage(text: Any) -> bool:
+    return bool(TARGET_LEAKAGE_RE.search(str(text or "")))
+
+
+def sanitize_runtime_text(text: Any) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if TARGET_LEAKAGE_PREFIX_RE.search(raw):
+        return ""
+    cleaned = TARGET_LEAKAGE_RE.sub("", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n-:;")
+    return cleaned
+
+
+def runtime_leakage_filtered_count(items: list[Any]) -> int:
+    return sum(1 for item in items if contains_target_leakage(item))
 
 
 def case_context(case: dict[str, Any], *, max_events: int | None = None, include_labs: bool = True) -> str:
@@ -18,7 +52,10 @@ def case_context(case: dict[str, Any], *, max_events: int | None = None, include
         "timeline:",
     ]
     for event in events:
-        lines.append(f"- t={event.get('time')} [{event.get('type')}] {event.get('text')}")
+        text = sanitize_runtime_text(event.get("text"))
+        if not text:
+            continue
+        lines.append(f"- t={event.get('time')} [{event.get('type')}] {text}")
     if include_labs:
         lines.append("labs:")
         for lab in case.get("synthetic_labs", [])[:12]:
@@ -26,18 +63,88 @@ def case_context(case: dict[str, Any], *, max_events: int | None = None, include
     return "\n".join(lines)
 
 
+def compact_case_context(case: dict[str, Any], *, max_events: int = 24, include_labs: bool = True) -> str:
+    events = list(case.get("events", []))
+    if len(events) <= max_events:
+        return case_context(case, max_events=None, include_labs=include_labs)
+    high_value_types = {"diagnosis", "imaging", "pathology", "treatment", "lab"}
+    selected: dict[str, dict[str, Any]] = {}
+
+    def add(event: dict[str, Any]) -> None:
+        selected[str(event.get("event_id") or len(selected))] = event
+
+    for event in events[: max(1, max_events // 3)]:
+        add(event)
+    for event in events:
+        text = sanitize_runtime_text(event.get("text")).lower()
+        if event.get("type") in high_value_types or any(term in text for term in ("diagnos", "confirmed", "patholog", "biopsy", "ct", "mri")):
+            add(event)
+    for event in events[-max(1, max_events // 3) :]:
+        add(event)
+
+    compact_events = sorted(selected.values(), key=lambda item: (int(item.get("time", 0) or 0), str(item.get("event_id") or "")))
+    if len(compact_events) > max_events:
+        compact_events = compact_events[: max_events - 1] + compact_events[-1:]
+    compact_case = dict(case)
+    compact_case["events"] = compact_events
+    context = case_context(compact_case, max_events=None, include_labs=include_labs)
+    return f"{context}\nshown_events={len(compact_events)}/{len(events)}"
+
+
 def prediction_json_prompt(method: str, context: str, extra: str = "") -> list[dict[str, str]]:
+    is_ours_method = "ours" in method or "medimem" in method
+    list_policy = (
+        "diagnosis_list should contain 5 to 7 evidence-supported clinical entities when the case contains multiple diagnoses, "
+        "including the final diagnosis, etiology or pathology entity, major complications, and anatomic abnormalities. "
+        "Do not fill the list with symptoms, procedures, imaging modalities, or treatment names. "
+        if is_ours_method
+        else "diagnosis_list must contain at most 5 concise diagnoses. "
+    )
     system = (
         "You are a clinical research diagnosis evaluator. This is not medical advice. "
         "Use only the provided case evidence. Return one compact JSON object with keys: "
-        "primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary. "
-        "confidence must be a number from 0 to 1."
+        "primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary, "
+        "species_context, diagnosis_granularity. "
+        "confidence must be a number from 0 to 1. evidence must be an array of strings. "
+        f"{list_policy}evidence must contain at most 5 concise strings. "
+        "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
+        "priors to animal cases unless the provided evidence supports them. "
+        "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
+        "procedure, broad organ finding, or unrelated complication. diagnosis_granularity must be one of "
+        "final_disease, etiology, complication, anatomy_finding, pathology_entity, symptom_or_state, uncertain. "
+        "reasoning_summary must be one short sentence. "
+        "Do not include markdown, prose, or code fences outside the JSON object."
     )
     user = f"[METHOD]\n{method}\n\n[CASE]\n{context}\n\n{extra}\n\nReturn JSON only."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def normalize_prediction(case_id: str, method: str, raw: dict[str, Any], usage: dict[str, int] | None = None) -> dict[str, Any]:
+def is_context_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "maximum context length" in text or "context length" in text
+
+
+def truncate_context_middle(context: str, max_chars: int) -> str:
+    if len(context) <= max_chars:
+        return context
+    head_chars = max_chars * 2 // 3
+    tail_chars = max_chars - head_chars
+    omitted = len(context) - head_chars - tail_chars
+    return (
+        context[:head_chars].rstrip()
+        + f"\n\n[... truncated {omitted} characters to fit model context ...]\n\n"
+        + context[-tail_chars:].lstrip()
+    )
+
+
+def normalize_prediction(
+    case_id: str,
+    method: str,
+    raw: dict[str, Any],
+    usage: dict[str, int] | None = None,
+    *,
+    enable_normalization: bool = True,
+) -> dict[str, Any]:
     diag_list = raw.get("diagnosis_list") or raw.get("diagnoses") or []
     if isinstance(diag_list, str):
         diag_list = [d.strip() for d in re.split(r"[,;/|]", diag_list) if d.strip()]
@@ -49,23 +156,54 @@ def normalize_prediction(case_id: str, method: str, raw: dict[str, Any], usage: 
     except (TypeError, ValueError):
         confidence = 0.5
     primary = str(raw.get("primary_diagnosis") or (diag_list[0] if diag_list else "Unknown")).strip()
+    primary = canonicalize_diagnosis(primary, enabled=enable_normalization)
+    diag_list = canonicalize_diagnoses([str(d).strip() for d in diag_list if str(d).strip()], enabled=enable_normalization)
+    species_context = str(raw.get("species_context") or raw.get("species") or "human").strip() or "human"
+    diagnosis_granularity = str(raw.get("diagnosis_granularity") or infer_diagnosis_granularity(primary)).strip()
     return {
         "case_id": case_id,
         "method": method,
         "primary_diagnosis": primary or "Unknown",
-        "diagnosis_list": [str(d).strip() for d in diag_list if str(d).strip()] or ([primary] if primary else []),
+        "diagnosis_list": diag_list or ([primary] if primary else []),
         "confidence": max(0.0, min(1.0, confidence)),
         "evidence": [str(e) for e in evidence],
         "reasoning_summary": str(raw.get("reasoning_summary") or raw.get("summary") or ""),
+        "species_context": species_context,
+        "diagnosis_granularity": diagnosis_granularity,
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-def heuristic_predict(case: dict[str, Any], method: str, *, max_events: int | None = None) -> dict[str, Any]:
+def infer_diagnosis_granularity(text: str) -> str:
+    low = str(text).lower()
+    if not low or low == "unknown":
+        return "uncertain"
+    if any(term in low for term in ("metastasis", "failure", "injury", "infection", "complication")):
+        return "complication"
+    if any(term in low for term in ("carcinoma", "tumor", "tumour", "lymphoma", "leukemia", "sarcoma", "melanoma")):
+        return "pathology_entity"
+    if any(term in low for term in ("pain", "fever", "dyspnea", "bleeding", "elevated", "low ")):
+        return "symptom_or_state"
+    if any(term in low for term in ("lobe", "mass", "lesion", "nodule", "aneurysm")):
+        return "anatomy_finding"
+    return "final_disease"
+
+
+def heuristic_predict(
+    case: dict[str, Any],
+    method: str,
+    *,
+    max_events: int | None = None,
+    enable_normalization: bool = True,
+) -> dict[str, Any]:
     events = case.get("events", [])
     if max_events is not None:
         events = events[:max_events]
-    joined_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", " ".join(str(e.get("text", "")) for e in events).lower())).strip()
+    joined_norm = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9]+", " ", " ".join(sanitize_runtime_text(e.get("text")) for e in events).lower()),
+    ).strip()
     candidates: list[tuple[float, str, str]] = []
     if "e granulosus" in joined_norm or "echinococ" in joined_norm:
         candidates.append((0.96, "Echinococcosis", "E. granulosus / echinococcosis evidence in timeline"))
@@ -75,7 +213,9 @@ def heuristic_predict(case: dict[str, Any], method: str, *, max_events: int | No
         (0.72, r"(?:showed|found)\s+([^.;]*(?:lesion|hematoma|leukemia|shock|failure|cancer)[^.;]*)", "key finding"),
     ]
     for event in events:
-        text = str(event.get("text", ""))
+        text = sanitize_runtime_text(event.get("text"))
+        if not text:
+            continue
         for score, pattern, reason in patterns:
             match = re.search(pattern, text, flags=re.I)
             if match:
@@ -85,10 +225,10 @@ def heuristic_predict(case: dict[str, Any], method: str, *, max_events: int | No
     if not candidates:
         typed = [e for e in events if e.get("type") == "diagnosis"]
         if typed:
-            text = str(typed[-1].get("text", ""))
+            text = sanitize_runtime_text(typed[-1].get("text"))
             candidates.append((0.55, cleanup_diagnosis(text), text))
     if not candidates:
-        text = " ".join(str(e.get("text", "")) for e in events[-2:])
+        text = " ".join(sanitize_runtime_text(e.get("text")) for e in events[-2:])
         candidates.append((0.35, cleanup_diagnosis(text[:100]) or "Unknown", text[:180]))
     candidates.sort(key=lambda x: x[0], reverse=True)
     diagnoses = []
@@ -106,8 +246,37 @@ def heuristic_predict(case: dict[str, Any], method: str, *, max_events: int | No
             "confidence": candidates[0][0],
             "evidence": evidence[:4],
             "reasoning_summary": "Rule-based fallback extracted explicit longitudinal diagnostic evidence.",
+            "species_context": infer_case_species(case),
+            "diagnosis_granularity": infer_diagnosis_granularity(diagnoses[0]),
         },
+        enable_normalization=enable_normalization,
     )
+
+
+def infer_case_species(case: dict[str, Any]) -> str:
+    flags = case.get("data_quality_flags") or {}
+    if flags.get("species_context"):
+        return str(flags["species_context"])
+    text = " ".join(
+        [
+            str(case.get("demographics") or ""),
+            " ".join(sanitize_runtime_text(event.get("text")) for event in case.get("events", [])[:20]),
+        ]
+    ).lower()
+    for species, terms in {
+        "dog": ("dog", "canine"),
+        "cat": ("cat", "feline"),
+        "horse": ("horse", "equine"),
+        "cow": ("cow", "bovine", "cattle"),
+        "sheep": ("sheep", "ovine"),
+        "goat": ("goat", "caprine"),
+        "pig": ("pig", "porcine", "swine"),
+        "mouse": ("mouse", "murine"),
+        "rat": ("rat",),
+    }.items():
+        if any(re.search(rf"\b{re.escape(term)}\b", text) for term in terms):
+            return species
+    return "human"
 
 
 def cleanup_diagnosis(text: str) -> str:
@@ -119,20 +288,7 @@ def cleanup_diagnosis(text: str) -> str:
 
 
 def canonicalize(text: str) -> str:
-    low = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
-    mapping = {
-        "sle": "Systemic lupus erythematosus",
-        "nxg": "Necrobiotic xanthogranuloma",
-        "extra nodal rdd": "Rosai-Dorfman-Destombes disease",
-        "rdd": "Rosai-Dorfman-Destombes disease",
-        "e granulosus": "Echinococcosis",
-        "invasive ductal carcinoma": "Breast cancer",
-        "bilateral poland syndrome": "Poland syndrome",
-    }
-    for key, value in mapping.items():
-        if low == key or key in low:
-            return value
-    return text
+    return canonicalize_diagnosis(text)
 
 
 def run_llm_prediction(
@@ -144,21 +300,47 @@ def run_llm_prediction(
     extra: str = "",
     fallback_max_events: int | None = None,
     temperature: float = 0.1,
+    fail_on_llm_error: bool = False,
+    enable_normalization: bool = True,
 ) -> dict[str, Any]:
     if client is None:
-        return heuristic_predict(case, method, max_events=fallback_max_events)
+        return heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
+    context_attempts = [context]
+    for max_chars in (24000, 18000, 12000):
+        truncated = truncate_context_middle(context, max_chars)
+        if truncated != context_attempts[-1]:
+            context_attempts.append(truncated)
+    last_exc: Exception | None = None
     try:
-        result = client.chat(prediction_json_prompt(method, context, extra), temperature=temperature, max_tokens=900)
-        raw = extract_json_object(result.text)
-        return normalize_prediction(case["case_id"], method, raw, result.usage)
-    except Exception as exc:  # noqa: BLE001 - prediction should degrade to fallback, not crash the run
-        pred = heuristic_predict(case, method, max_events=fallback_max_events)
+        for attempt_context in context_attempts:
+            try:
+                result = client.chat(prediction_json_prompt(method, attempt_context, extra), temperature=temperature)
+                break
+            except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
+                last_exc = exc
+                if not is_context_limit_error(exc):
+                    raise
+        else:
+            raise last_exc or RuntimeError("LLM prediction failed without an exception.")
+    except Exception as exc:  # noqa: BLE001 - API failures can be configured as hard blockers
+        if fail_on_llm_error:
+            raise RuntimeError(f"LLM prediction failed for {case['case_id']} ({method}): {exc}") from exc
+        pred = heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
         pred["reasoning_summary"] += f" LLM fallback reason: {exc}"
         pred["llm_error"] = str(exc)
         return pred
+    try:
+        raw = extract_json_object(result.text)
+        return normalize_prediction(case["case_id"], method, raw, result.usage, enable_normalization=enable_normalization)
+    except Exception as exc:  # noqa: BLE001 - prediction should degrade to fallback, not crash the run
+        pred = heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
+        pred["reasoning_summary"] += f" LLM fallback reason: {exc}"
+        pred["llm_error"] = str(exc)
+        pred["usage"] = result.usage
+        return pred
 
 
-def run_direct(case: dict[str, Any], client: DeepSeekClient | None) -> dict[str, Any]:
+def run_direct(case: dict[str, Any], client: DeepSeekClient | None, *, fail_on_llm_error: bool = False) -> dict[str, Any]:
     return run_llm_prediction(
         case,
         method="direct_deepseek",
@@ -166,7 +348,1390 @@ def run_direct(case: dict[str, Any], client: DeepSeekClient | None) -> dict[str,
         context=case_context(case, max_events=min(4, len(case.get("events", []))), include_labs=False),
         extra="Make a diagnosis from this limited truncated context.",
         fallback_max_events=min(4, len(case.get("events", []))),
+        fail_on_llm_error=fail_on_llm_error,
     )
+
+
+def run_single_cot_agent(
+    case: dict[str, Any],
+    client: DeepSeekClient | None,
+    *,
+    polluted: bool = False,
+    fail_on_llm_error: bool = False,
+) -> dict[str, Any]:
+    method = "baseline_polluted_single_cot_agent" if polluted else "baseline_single_cot_agent"
+    extra = (
+        "Give a brief clinical reasoning summary and the final diagnosis. "
+        "Do not output full chain-of-thought or step-by-step hidden reasoning; keep reasoning_summary to one short sentence."
+    )
+    if polluted:
+        extra += (
+            "\nUse the limited case context plus the following previously stored memory cards. "
+            "The memory cards may be stale, mixed, or cross-patient, and this baseline has no dedicated cleaning tool.\n"
+            f"{pollution_memory_context(case)}"
+        )
+    pred = run_llm_prediction(
+        case,
+        method=method,
+        client=client,
+        context=case_context(case, max_events=min(4, len(case.get("events", []))), include_labs=False),
+        extra=extra,
+        fallback_max_events=min(4, len(case.get("events", []))),
+        temperature=0.05,
+        fail_on_llm_error=fail_on_llm_error,
+    )
+    pred["cot_style"] = "single_agent_concise"
+    pred["pollution_exposed"] = polluted
+    pred["runtime_leakage_filtered_count"] = runtime_leakage_filtered_count(
+        [event.get("text") for event in case.get("events", [])[: min(4, len(case.get("events", [])))]]
+        + ([poison.get("text") for poison in case.get("poison_records", [])] if polluted else [])
+    )
+    pred["memory_leakage_filtered_count"] = (
+        runtime_leakage_filtered_count([poison.get("text") for poison in case.get("poison_records", [])]) if polluted else 0
+    )
+    return pred
+
+
+def pollution_memory_context(case: dict[str, Any]) -> str:
+    lines = ["[POLLUTED_MEMORY_CONTEXT]"]
+    for poison in case.get("poison_records", []):
+        text = sanitize_runtime_text(poison.get("text"))
+        if not text:
+            continue
+        lines.append(
+            f"- id={poison.get('poison_id')} type={poison.get('pollution_type')} "
+            f"text={text}"
+        )
+    return "\n".join(lines)
+
+
+def safe_memory_ops_for_prompt(case: dict[str, Any], ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    safe_ops: list[dict[str, Any]] = []
+    for op in ops:
+        target = str(op.get("target") or "")
+        safe_op: dict[str, Any] = {
+            "op": op.get("op"),
+            "target": target,
+            "touched_memory_ids": op.get("touched_memory_ids") or [],
+            "revised_memory_id": op.get("revised_memory_id"),
+        }
+        if op.get("op") == "Revise":
+            safe_op["preserved_fact_count"] = len([x for x in op.get("preserved_facts", []) if str(x).strip()])
+            safe_op["revision_note"] = (
+                "Preserve source-grounded evidence by reference only; do not use the prior interpretation as a diagnosis."
+            )
+        safe_ops.append(safe_op)
+    return safe_ops
+
+
+def source_aligned_evidence_notes(cards: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    high_value_tags = {"diagnosis", "imaging", "pathology", "treatment", "lab", "follow_up", "follow-up"}
+    notes = []
+    for card in cards:
+        if card.get("status") not in {"active", "flagged"}:
+            continue
+        tags = {str(tag).lower() for tag in card.get("tags", [])}
+        summary = sanitize_runtime_text(card.get("summary"))
+        if not summary:
+            continue
+        low = summary.lower()
+        if not (
+            tags & high_value_tags
+            or any(term in low for term in ("diagnos", "patholog", "biopsy", "ct", "mri", "treatment", "follow-up", "follow up"))
+        ):
+            continue
+        scope = card.get("time_scope") or {}
+        notes.append(
+            {
+                "time": scope.get("start") if isinstance(scope, dict) else None,
+                "summary": summary,
+                "refs": card.get("evidence_refs") or [],
+                "tags": sorted(tags),
+                "confidence": card.get("confidence"),
+            }
+        )
+    notes.sort(key=lambda item: str(item.get("time") or ""))
+    return notes[-limit:]
+
+
+def diagnosis_event_candidates(case: dict[str, Any], *, limit: int = 10) -> list[dict[str, Any]]:
+    candidates = []
+    for event in case.get("events", []):
+        if event.get("type") != "diagnosis":
+            continue
+        text = sanitize_runtime_text(event.get("text"))
+        if not text:
+            continue
+        candidates.append(
+            {
+                "time": event.get("time"),
+                "event_id": event.get("event_id"),
+                "text": text,
+            }
+        )
+    candidates.sort(key=lambda item: str(item.get("time") or ""))
+    return candidates[-limit:]
+
+
+def clean_diagnosis_candidate_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text)).strip(" .,:;")
+    cleaned = re.sub(r"^(?:diagnosed with|diagnosed as|diagnosis of)\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^ihc confirmed\s+", "", cleaned, flags=re.I)
+    return cleaned.strip(" .,:;")
+
+
+def diagnosis_candidate_priority(text: str) -> int:
+    low = text.lower()
+    if re.search(r"\b(no history of|no symptoms|no cancer symptoms|normal)\b", low):
+        return -10
+    score = 0
+    if re.search(r"\b(diagnosed with|diagnosed as|diagnosis of|suspected|confirmed|ihc confirmed)\b", low):
+        score += 5
+    if re.search(r"\b(cancer|carcinoma|adenocarcinoma|lymphoma|disease|syndrome|pneumonia|dmmr|metastasis|carcinomatosis)\b", low):
+        score += 2
+    return score
+
+
+DIAGNOSTIC_ENTITY_TERMS = (
+    "abnormality",
+    "adenocarcinoma",
+    "amenorrhea",
+    "anemia",
+    "aneurysm",
+    "anomaly",
+    "airway",
+    "arrest",
+    "anxiety",
+    "arthritis",
+    "asthma",
+    "bleeding",
+    "brachydactyly",
+    "bursitis",
+    "cancer",
+    "canal",
+    "carcinoma",
+    "carcinomatosis",
+    "congestion",
+    "covid",
+    "cystadenoma",
+    "deficiency",
+    "deformity",
+    "depression",
+    "defect",
+    "dextrocardia",
+    "diabetes",
+    "disease",
+    "displacement",
+    "dmmr",
+    "dysplasia",
+    "dysgerminoma",
+    "dysphagia",
+    "dyspnea",
+    "endocarditis",
+    "epilepsy",
+    "effusion",
+    "emboli",
+    "embolism",
+    "fistula",
+    "fibrosis",
+    "fracture",
+    "gastritis",
+    "gammaglobulinemia",
+    "gammopathy",
+    "gist",
+    "hernia",
+    "hemangioma",
+    "hemorrhage",
+    "hepatitis",
+    "hematoma",
+    "hoarseness",
+    "hydronephrosis",
+    "hyperglycemia",
+    "hyperplasia",
+    "hyperkeratosis",
+    "hyperlipidemia",
+    "hypertension",
+    "hypopituitarism",
+    "hypothyroidism",
+    "hypogonadism",
+    "hypophosphatemic",
+    "hypersplenism",
+    "infarction",
+    "infection",
+    "insufficiency",
+    "inversion",
+    "involvement",
+    "injury",
+    "keratosis",
+    "leukemia",
+    "leiomyoma",
+    "lichen",
+    "lobe",
+    "lymphangioma",
+    "malformation",
+    "lymphoma",
+    "malrotation",
+    "metastases",
+    "metastasis",
+    "mediastinal",
+    "metrorrhagia",
+    "microangiopathy",
+    "microvascular",
+    "mutation",
+    "myocardial",
+    "myxoma",
+    "myeloma",
+    "melanoma",
+    "migraine",
+    "necrobiotic",
+    "neoplasm",
+    "nephritis",
+    "myelitis",
+    "mucormycosis",
+    "mycobacterium",
+    "myasthenia",
+    "neuropathy",
+    "obesity",
+    "oligozoospermia",
+    "osteomyelitis",
+    "osteomalacia",
+    "osteoporosis",
+    "poliomyelitis",
+    "pneumonia",
+    "pneumothorax",
+    "peritonitis",
+    "perforation",
+    "pericarditis",
+    "phimosis",
+    "pleurisy",
+    "planus",
+    "pancreatitis",
+    "polymorphism",
+    "polyneuropathy",
+    "prostatitis",
+    "pseudoaneurysm",
+    "pyuria",
+    "pyopericardium",
+    "rosacea",
+    "rhabdomyosarcoma",
+    "rhinitis",
+    "regurgitation",
+    "syndrome",
+    "syndactyly",
+    "sinusitis",
+    "stenosis",
+    "sporotrichosis",
+    "stroke",
+    "situs",
+    "thrombocytopenia",
+    "thromboembolism",
+    "thrombophilia",
+    "thrombotic",
+    "tuberculosis",
+    "thymoma",
+    "tachycardia",
+    "tumor",
+    "ulcer",
+    "urosepsis",
+    "ureter",
+    "web",
+    "xanthogranuloma",
+    "zoster",
+)
+
+NON_DIAGNOSTIC_TERMS = (
+    "biopsy",
+    "chemotherapy",
+    "colonoscopy",
+    "ct",
+    "documented source",
+    "endoscopy",
+    "evidence",
+    "examination",
+    "history",
+    "imaging",
+    "mri",
+    "pet",
+    "radiotherapy",
+    "resection",
+    "scan",
+    "screening",
+    "source evidence",
+    "surgery",
+    "therapy",
+    "treatment",
+)
+
+SYMPTOM_OR_STATE_TERMS = (
+    "acute kidney injury",
+    "cough",
+    "fever",
+    "headache",
+    "nausea",
+    "pain",
+    "stable",
+    "vomiting",
+)
+
+
+PUBLIC_DIAGNOSIS_CUE_MAP: tuple[tuple[str, str], ...] = (
+    ("bronchioloalveolar carcinoma", "bronchioloalveolar carcinoma"),
+    ("non-mucinous bac", "bronchioloalveolar carcinoma"),
+    ("acute non-stemi", "acute non st elevation myocardial infarction"),
+    ("nstemi", "acute non st elevation myocardial infarction"),
+    ("non-st-segment elevation myocardial infarction", "acute non st elevation myocardial infarction"),
+    ("st-segment elevation myocardial infarction", "acute st elevation myocardial infarction"),
+    ("coronary artery anomalies", "coronary artery anomaly"),
+    ("posterior right diagonal artery", "posterior right diagonal artery variant"),
+    ("right diagonal artery", "posterior right diagonal artery variant"),
+    ("hyperglycemia", "hyperglycemia"),
+    ("hyperlipidemia", "hyperlipidemia"),
+    ("hypertension", "hypertension"),
+    ("hepatitis b", "hepatitis b"),
+    ("rosai-dorfman-destombes", "rosai dorfman destombes disease"),
+    ("rosai dorfman destombes", "rosai dorfman destombes disease"),
+    ("kidney calculi", "kidney calculi"),
+    ("borderline resectable pdac", "pancreatic ductal adenocarcinoma"),
+    ("pdac", "pancreatic ductal adenocarcinoma"),
+    ("pancreatic ductal adenocarcinoma", "pancreatic ductal adenocarcinoma"),
+    ("cerebrovascular accident", "cerebrovascular accident"),
+    ("lynch syndrome", "lynch syndrome"),
+    ("retrocaval ureter", "retrocaval ureter"),
+    ("ureteropelvic junction obstruction", "ureteropelvic junction obstruction"),
+    ("k-wire migration", "k wire migration"),
+    ("kirschner wire migration", "k wire migration"),
+    ("urinary bladder injury", "urinary bladder injury"),
+    ("bladder injury", "urinary bladder injury"),
+    ("vesicovaginal fistula", "vesicovaginal fistula"),
+    ("ureterovaginal fistula", "ureterovaginal fistula"),
+    ("serous cystadenoma", "serous cystadenoma"),
+    ("ivc aneurysm", "inferior vena cava aneurysm"),
+    ("inferior vena cava aneurysm", "inferior vena cava aneurysm"),
+    ("venous malformations", "venous malformation"),
+    ("venous malformation", "venous malformation"),
+    ("gastritis", "gastritis"),
+    ("phosphaturic mesenchymal tumor", "tumor induced osteomalacia"),
+    ("tumor-induced osteomalacia", "tumor induced osteomalacia"),
+    ("hypophosphatemic osteomalacia", "hypophosphatemic osteomalacia"),
+    ("osteoporosis", "osteoporosis"),
+    ("recurrent contralateral pneumothorax", "recurrent contralateral pneumothorax"),
+    ("azygos lobe", "azygos lobe"),
+    ("pneumothorax", "pneumothorax"),
+    ("invasive ductal carcinoma", "breast cancer"),
+    ("hypogonadotropic hypogonadism", "hypogonadotropic hypogonadism"),
+    ("oligozoospermia", "oligozoospermia"),
+    ("obesity", "obesity"),
+    ("thrombotic microangiopathy", "thrombotic microangiopathy"),
+    ("hemolytic anemia", "hemolytic anemia"),
+    ("colon metastasis", "colon metastasis"),
+    ("systemic lupus erythematosus", "systemic lupus erythematosus"),
+    ("diagnosed with sle", "systemic lupus erythematosus"),
+    ("raynaud", "raynaud phenomenon"),
+    ("microvascular angina", "microvascular angina"),
+    ("uterine inversion", "uterine inversion"),
+    ("metrorrhagia", "metrorrhagia"),
+    ("anemia", "anemia"),
+    ("good's syndrome", "good syndrome"),
+    ("goods syndrome", "good syndrome"),
+    ("thymoma", "thymoma"),
+    ("hypogammaglobulinemia", "hypogammaglobulinemia"),
+    ("oral lichen planus", "oral lichen planus"),
+    ("patent foramen ovale", "patent foramen ovale"),
+    ("pulmonary emboli", "pulmonary embolism"),
+    ("pulmonary embolism", "pulmonary embolism"),
+    ("cryptogenic stroke", "cryptogenic stroke"),
+    ("watershed stroke", "cryptogenic stroke"),
+    ("thrombophilia", "thrombophilia"),
+    ("factor ii gene", "factor ii gene mutation"),
+    ("factor ii 20210a", "factor ii gene mutation"),
+    ("pai-1 4g/5g", "pai 1 4g 5g gene polymorphism"),
+    ("prothrombin gene mutation", "prothrombin gene mutation"),
+    ("septic arthritis", "septic arthritis"),
+    ("type 2 diabetes", "type 2 diabetes mellitus"),
+    ("diabetes mellitus", "type 2 diabetes mellitus"),
+    ("osteoarthritis", "osteoarthritis"),
+    ("congenital hip defect", "congenital hip defect"),
+    ("monoclonal gammopathy", "monoclonal gammopathy"),
+    ("polyneuropathy", "polyneuropathy"),
+    ("neuropathic ulcer", "neuropathy"),
+    ("neuropathy", "neuropathy"),
+    ("cellulitis", "cellulitis"),
+    ("ischemic stroke", "ischemic stroke"),
+    ("intracerebral hemorrhage", "intracerebral hemorrhage"),
+    ("hemorrhage (ich)", "intracerebral hemorrhage"),
+    ("ich", "intracerebral hemorrhage"),
+    ("epilepsy", "epilepsy"),
+    ("primary lung signet", "primary lung signet ring cell carcinoma"),
+    ("signet-ring cell", "primary lung signet ring cell carcinoma"),
+    ("signet ring cell", "primary lung signet ring cell carcinoma"),
+    ("iga nephropathy", "iga nephropathy"),
+    ("atrial fibrillation", "atrial fibrillation"),
+    ("arterial hypertension", "arterial hypertension"),
+    ("mitral stenosis", "mitral stenosis"),
+    ("mitral regurgitation", "mitral regurgitation"),
+    ("aortic regurgitation", "aortic regurgitation"),
+    ("ventricular tachycardia", "ventricular tachycardia"),
+    ("supraventricular tachycardia", "supraventricular tachycardia"),
+    ("partial anomalous pulmonary venous connection", "partial anomalous pulmonary venous connection"),
+    ("papvc", "partial anomalous pulmonary venous connection"),
+    ("regressed left ventricle", "regressed left ventricle"),
+    ("intestinal malrotation", "intestinal malrotation"),
+    ("malrotation", "intestinal malrotation"),
+    ("duodenal web", "duodenal web"),
+    ("lupus nephritis", "lupus nephritis"),
+    ("dysphagia", "dysphagia"),
+    ("dyspnea associated", "dyspnea associated"),
+    ("dyspnea", "dyspnea"),
+    ("oropharyngeal and neck masses", "oropharyngeal and neck masses"),
+    ("difficult airway", "difficult airway"),
+    ("pulmonary arrest", "pulmonary arrest"),
+    ("brain injury", "brain injury"),
+    ("hoarseness", "hoarseness of voice"),
+    ("cholelithiasis", "cholelithiasis"),
+    ("cholecystocolonic fistula", "cholecystocolonic fistula"),
+    ("heart failure with reduced ejection fraction", "heart failure with reduced ejection fraction"),
+    ("hfr ef", "heart failure with reduced ejection fraction"),
+    ("middle cerebral artery", "middle cerebral artery ischemic stroke"),
+    ("pseudoaneurysm", "pseudoaneurysm"),
+    ("arteriocolonic fistula", "arteriocolonic fistula"),
+    ("imaa", "inferior mesenteric artery aneurysm"),
+    ("inferior mesenteric artery aneurysm", "inferior mesenteric artery aneurysm"),
+    ("hematochezia", "hematochezia"),
+    ("ischemic colitis", "ischemic colitis"),
+    ("sigmoid colon", "sigmoid colon inflammation"),
+    ("epidermoid cyst", "epidermoid cyst"),
+    ("epidermal cyst", "epidermoid cyst"),
+    ("impacted tooth in infratemporal fossa", "displacement of maxillary third molar into the infratemporal fossa"),
+    ("tooth into ipsilateral infratemporal fossa", "displacement of maxillary third molar into the infratemporal fossa"),
+    ("maxillary third molar", "displacement of maxillary third molar into the infratemporal fossa"),
+    ("hematoma", "hematoma or hemangioma"),
+    ("primary malignant melanoma of the esophagus", "primary malignant melanoma of the esophagus"),
+    ("malignant melanoma of esophagus", "primary malignant melanoma of the esophagus"),
+    ("pmme", "primary malignant melanoma of the esophagus"),
+    ("seborrheic keratosis", "seborrheic keratosis"),
+    ("tuberculous pleurisy", "tuberculous pleurisy"),
+    ("metastatic colorectal cancer", "metastatic colorectal cancer"),
+    ("liver metastasis of intestinal-type adenocarcinoma", "metastatic colorectal cancer"),
+    ("hodgkin lymphoma", "hodgkin lymphoma"),
+    ("classical hodgkin lymphoma", "classical hodgkin lymphoma of mixed cellularity"),
+    ("herpes zoster", "herpes zoster"),
+    ("transverse myelitis", "transverse myelitis"),
+    ("tm with hz", "transverse myelitis"),
+    ("vzv", "herpes zoster"),
+    ("gb minen", "mixed neuroendocrine non neuroendocrine tumor of the gallbladder"),
+    ("gallbladder minen", "mixed neuroendocrine non neuroendocrine tumor of the gallbladder"),
+    ("gb cancer", "gallbladder cancer"),
+    ("gallbladder adenocarcinoma", "gallbladder adenocarcinoma"),
+    ("large cell neuroendocrine carcinoma", "large cell neuroendocrine carcinoma"),
+    ("lcnec", "large cell neuroendocrine carcinoma"),
+    ("neuroendocrine tumor", "neuroendocrine tumor"),
+    ("s. brasiliensis", "sporotrichosis"),
+    ("sporothrix brasiliensis", "sporotrichosis"),
+    ("sporotrichosis", "sporotrichosis"),
+    ("feline sporotrichosis", "feline sporotrichosis"),
+    ("myasthenia gravis", "myasthenia gravis"),
+    ("malignant melanoma", "malignant melanoma"),
+    ("gastrointestinal stromal tumor", "gastrointestinal stromal tumor"),
+    ("sdha-deficient gist", "sdha deficient gastrointestinal stromal tumor"),
+    ("sdha deficient gist", "sdha deficient gastrointestinal stromal tumor"),
+    ("gist histology", "gastrointestinal stromal tumor"),
+    ("nxg", "necrobiotic xanthogranuloma"),
+    ("poland syndrome", "poland syndrome"),
+    ("spindle cell sclerosing rhabdomyosarcoma", "spindle cell sclerosing rhabdomyosarcoma"),
+    ("crush injury", "crush injury of the left lower extremity"),
+    ("invasive mucinous adenocarcinoma", "invasive mucinous adenocarcinoma"),
+    ("cerebral mucormycosis", "cerebral mucormycosis"),
+    ("mucormycosis", "cerebral mucormycosis"),
+    ("mycobacterium persicum", "mycobacterium persicum infection"),
+    ("congenital hip defects", "congenital hip defect"),
+    ("septic arthritis", "septic arthritis"),
+    ("migraines", "migraine"),
+    ("migraine", "migraine"),
+    ("allergic rhinitis", "allergic rhinitis"),
+    ("rhino sinusitis", "rhino sinusitis"),
+    ("persistent dry cough", "persistent dry cough"),
+    ("uterine fibroids", "uterine fibroids"),
+    ("uterine fibroid", "uterine fibroids"),
+    ("mediastinal abscess", "mediastinal abscess"),
+    ("pyopericardium", "pyopericardium"),
+    ("pericardial effusion", "pericardial effusion"),
+    ("non-small cell lung cancer", "non small cell lung cancer"),
+    ("nsclc", "non small cell lung cancer"),
+    ("phimosis", "phimosis"),
+    ("splenic hemangioma", "splenic hemangioma"),
+    ("hypersplenism", "hypersplenism"),
+    ("multiple myeloma", "multiple myeloma"),
+    ("chronic liver disease", "chronic liver disease"),
+    ("echinococcosis", "echinococcosis"),
+    ("echinococcus", "echinococcosis"),
+    ("poliomyelitis", "poliomyelitis"),
+)
+
+
+def normalize_diagnosis_entity_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text)).strip(" .,:;()[]")
+    cleaned = re.sub(
+        r"^(?:diagnosed with|diagnosed as|diagnosis of|suspected|confirmed|ihc confirmed|"
+        r"pathology confirmed|surgical pathology confirmed|frozen section confirmed|"
+        r"preliminary diagnosis of|diagnosis revised to)\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\b(?:diagnosis )?confirmed$", "", cleaned, flags=re.I).strip(" .,:;")
+    cleaned = re.sub(r"\s*\((?:stage|t\d|n\d|m\d)[^)]+\)", "", cleaned, flags=re.I).strip(" .,:;")
+    if "," in cleaned:
+        first = cleaned.split(",", 1)[0].strip()
+        if is_likely_diagnostic_entity(first, allow_primary=False):
+            cleaned = first
+    cleaned = re.sub(r"\b(?:with|due to|associated with|after|following|confirmed via|confirmed by)\b.*$", "", cleaned, flags=re.I).strip(" .,:;")
+    return canonicalize_diagnosis(cleaned)
+
+
+def recall_candidate_fragments(text: str) -> list[str]:
+    cleaned = clean_diagnosis_candidate_text(text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;")
+    if not cleaned:
+        return []
+    parts = [cleaned]
+    for pattern in (r"\s*;\s*", r"\s*\|\s*", r"\s*,\s*", r"\s+and\s+", r"\s+plus\s+"):
+        next_parts: list[str] = []
+        for part in parts:
+            next_parts.extend(re.split(pattern, part, flags=re.I))
+        parts = next_parts
+    fragments: list[str] = []
+    for part in parts:
+        part = re.sub(r"^(?:with|plus|and|including)\s+", "", part, flags=re.I).strip(" .,:;()[]")
+        part = re.sub(r"\b(?:was|were|is|are)\s+(?:also\s+)?(?:diagnosed|confirmed)\b.*$", "", part, flags=re.I).strip(" .,:;")
+        if part:
+            fragments.append(part)
+    return fragments
+
+
+def is_likely_diagnostic_entity(text: str, *, allow_primary: bool = False) -> bool:
+    low = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(text).lower())).strip()
+    if not low:
+        return False
+    if allow_primary:
+        return True
+    noisy_phrases = (
+        "absence of",
+        "anterior tracheal wall mass",
+        "case discussion",
+        "cerebral infarction suspected",
+        "cerebral infarction treatment",
+        "ct scan",
+        "cystic cavity",
+        "cystic lesion",
+        "cystic mass",
+        "denied risk factors",
+        "depression on scalp",
+        "differential diagnosis",
+        "elevation in leads",
+        "fdg pet",
+        "genetic testing",
+        "genomic alterations",
+        "high tumor mutational burden",
+        "infection control",
+        "laminated keratin",
+        "low density mediastinal lesion",
+        "mediastinal mass",
+        "microvascular occlusion",
+        "mild tracheal compression",
+        "molecular diagnostics",
+        "mutation",
+        "pet ct",
+        "post operative recovery",
+        "round depression",
+        "scan normalization",
+        "st segment depression",
+        "st segment elevation",
+        "surgical removal",
+        "tumor markers",
+        "well circumscribed",
+    )
+    if any(phrase in low for phrase in noisy_phrases):
+        return False
+    if "diagnosis-redacted" in low or "preserve documented" in low:
+        return False
+    if re.search(r"\b(monitored by|visited by|followed by|regimen|screening|history of|relapsed at|remission at)\b", low):
+        return False
+    if low in {"stable disease", "disease progression"}:
+        return False
+    if re.search(r"\b(no|normal|negative|refused)\b", low):
+        return False
+    if re.search(r"\b(?:mg|ng|pg|u/l|mmhg|beats|min|cm|mm|%|high|low)\b", low):
+        return False
+    if any(term in low for term in SYMPTOM_OR_STATE_TERMS) and not any(term in low for term in DIAGNOSTIC_ENTITY_TERMS):
+        return False
+    if any(term in low for term in NON_DIAGNOSTIC_TERMS) and not any(term in low for term in DIAGNOSTIC_ENTITY_TERMS):
+        return False
+    return any(term in low for term in DIAGNOSTIC_ENTITY_TERMS)
+
+
+def diagnosis_key(text: str) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9]+", " ", canonicalize_diagnosis(str(text)).lower()),
+    ).strip()
+
+
+def diagnosis_entity_from_text(raw_text: str) -> str:
+    raw = str(raw_text or "")
+    normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", raw.lower())).strip()
+    for cue, entity in PUBLIC_DIAGNOSIS_CUE_MAP:
+        cue_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", cue.lower())).strip()
+        if cue_norm and re.search(rf"\b{re.escape(cue_norm)}\b", normalized):
+            return canonicalize_diagnosis(entity)
+    return normalize_diagnosis_entity_text(raw)
+
+
+def visible_diagnosis_source_rows(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(pred.get("diagnosis_list", [])):
+        rows.append({"source": "prediction", "rank": idx, "text": str(item), "weight": 3.0})
+    for idx, item in enumerate(pred.get("evidence", [])):
+        rows.append({"source": "prediction_evidence", "rank": idx, "text": str(item), "weight": 2.2})
+    for idx, item in enumerate(diagnosis_candidates):
+        rows.append(
+            {
+                "source": "diagnosis_event",
+                "rank": idx,
+                "text": str(item.get("text") or ""),
+                "event_id": item.get("event_id"),
+                "time": item.get("time"),
+                "weight": 3.4,
+            }
+        )
+    for idx, note in enumerate(evidence_notes):
+        tags = {str(tag).lower() for tag in note.get("tags", [])}
+        summary = sanitize_runtime_text(note.get("summary"))
+        if not summary:
+            continue
+        if tags & {"diagnosis", "pathology", "imaging", "treatment", "follow_up", "follow-up"} or re.search(
+            r"\b(diagnos|patholog|biopsy|confirmed|revealed|showed|treated|metastasis|anomaly)\b",
+            summary,
+            flags=re.I,
+        ):
+            rows.append(
+                {
+                    "source": "evidence_note",
+                    "rank": idx,
+                    "text": summary,
+                    "refs": note.get("refs") or [],
+                    "time": note.get("time"),
+                    "weight": 2.8 if tags & {"diagnosis", "pathology"} else 2.2,
+                }
+            )
+    for idx, event in enumerate(case.get("events", [])):
+        text = sanitize_runtime_text(event.get("text"))
+        if not text:
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type in {"diagnosis", "pathology", "imaging", "treatment", "follow_up", "follow-up"} or re.search(
+            r"\b(diagnos|confirmed|patholog|biopsy|carcinoma|tumor|aneurysm|metastasis|syndrome|pneumothorax|ureter|fracture|infection)\b",
+            text,
+            flags=re.I,
+        ):
+            weight = 2.6 if event_type in {"diagnosis", "pathology"} else 1.8
+        else:
+            weight = 1.4
+        rows.append(
+            {
+                "source": f"timeline_{event_type or 'clinical'}",
+                "rank": idx,
+                "text": text,
+                "event_id": event.get("event_id"),
+                "time": event.get("time"),
+                "weight": weight,
+            }
+        )
+    return [row for row in rows if str(row.get("text") or "").strip()]
+
+
+def add_visible_diagnosis_candidates(
+    candidates: dict[str, dict[str, Any]],
+    raw_text: str,
+    *,
+    source: str,
+    weight: float,
+    rank: int,
+    evidence: str,
+) -> None:
+    fragments = recall_candidate_fragments(raw_text) or [raw_text]
+    for fragment in fragments:
+        entity = diagnosis_entity_from_text(fragment)
+        if not entity or not is_likely_diagnostic_entity(entity, allow_primary=False):
+            continue
+        key = diagnosis_key(entity)
+        if not key:
+            continue
+        item = candidates.setdefault(
+            key,
+            {"entity": entity, "score": 0.0, "sources": set(), "evidence": [], "best_rank": rank},
+        )
+        item["score"] += weight
+        item["sources"].add(source)
+        item["best_rank"] = min(int(item.get("best_rank", rank)), rank)
+        if evidence and evidence not in item["evidence"]:
+            item["evidence"].append(evidence[:240])
+
+    normalized_blob = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(raw_text).lower())).strip()
+    for cue, entity in PUBLIC_DIAGNOSIS_CUE_MAP:
+        cue_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", cue.lower())).strip()
+        if not cue_norm or not re.search(rf"\b{re.escape(cue_norm)}\b", normalized_blob):
+            continue
+        canonical = canonicalize_diagnosis(entity)
+        key = diagnosis_key(canonical)
+        item = candidates.setdefault(
+            key,
+            {"entity": canonical, "score": 0.0, "sources": set(), "evidence": [], "best_rank": rank},
+        )
+        item["score"] += weight + 1.2
+        item["sources"].add(source)
+        item["best_rank"] = min(int(item.get("best_rank", rank)), rank)
+        if evidence and evidence not in item["evidence"]:
+            item["evidence"].append(evidence[:240])
+
+
+def evidence_driven_diagnosis_rerank(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+    *,
+    max_items: int = 12,
+) -> dict[str, Any]:
+    """Recall and reorder diagnosis_list using only visible timeline and memory-derived evidence."""
+    candidates: dict[str, dict[str, Any]] = {}
+    primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
+    if primary:
+        candidates[diagnosis_key(primary)] = {
+            "entity": primary,
+            "score": 4.0,
+            "sources": {"primary"},
+            "evidence": list(pred.get("evidence") or [])[:2],
+            "best_rank": 0,
+        }
+
+    for rank, row in enumerate(visible_diagnosis_source_rows(case, pred, evidence_notes, diagnosis_candidates)):
+        text = str(row.get("text") or "")
+        source = str(row.get("source") or "visible")
+        add_visible_diagnosis_candidates(
+            candidates,
+            text,
+            source=source,
+            weight=float(row.get("weight") or 1.0),
+            rank=rank,
+            evidence=text,
+        )
+
+    filtered = []
+    for item in candidates.values():
+        entity = str(item.get("entity") or "")
+        key = diagnosis_key(entity)
+        if not key:
+            continue
+        sources = set(item.get("sources") or [])
+        score = float(item.get("score") or 0.0)
+        if "primary" not in sources and score < 2.6:
+            continue
+        if not is_likely_diagnostic_entity(entity, allow_primary="primary" in sources):
+            continue
+        filtered.append(item)
+
+    filtered.sort(
+        key=lambda item: (
+            0 if diagnosis_key(str(item.get("entity"))) == diagnosis_key(primary) else 1,
+            -float(item.get("score") or 0.0),
+            int(item.get("best_rank", 9999)),
+            str(item.get("entity") or ""),
+        )
+    )
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in filtered:
+        entity = str(item.get("entity") or "").strip()
+        key = diagnosis_key(entity)
+        if entity and key not in seen:
+            merged.append(entity)
+            seen.add(key)
+        if len(merged) >= max_items:
+            break
+
+    if not merged:
+        return pred
+    updated = dict(pred)
+    existing = [canonicalize_diagnosis(str(item)).strip() for item in pred.get("diagnosis_list", []) if str(item).strip()]
+    visible_keys = {diagnosis_key(str(item.get("entity") or "")) for item in filtered}
+    preserved: list[str] = []
+    preserved_seen: set[str] = set()
+    for item in merged + existing:
+        key = diagnosis_key(item)
+        if item in existing and key != diagnosis_key(primary):
+            if key not in visible_keys:
+                continue
+            if not is_likely_diagnostic_entity(item, allow_primary=False):
+                continue
+        if item and key and key not in preserved_seen:
+            preserved.append(item)
+            preserved_seen.add(key)
+        if len(preserved) >= max_items:
+            break
+    updated["diagnosis_list"] = preserved
+    updated["diagnosis_candidate_pool"] = {
+        "enabled": True,
+        "candidate_count": len(candidates),
+        "retained_count": len(preserved),
+    }
+    if primary:
+        primary_key = diagnosis_key(primary)
+        primary_candidate = next((item for item in filtered if diagnosis_key(str(item.get("entity"))) == primary_key), None)
+        primary_evidence = list((primary_candidate or {}).get("evidence") or [])
+        evidence = [str(item) for item in updated.get("evidence", []) if str(item).strip()]
+        if not any(diagnosis_key(primary) and diagnosis_key(primary) in diagnosis_key(item) for item in evidence):
+            evidence_source = next((item for item in primary_evidence if str(item).strip()), "")
+            if evidence_source:
+                evidence = [evidence_source] + evidence
+        updated["evidence"] = evidence[:5]
+    return updated
+
+
+def diagnosis_second_pass_prompt(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    candidate_rows = visible_diagnosis_source_rows(case, pred, evidence_notes, diagnosis_candidates)
+    candidate_lines = []
+    seen_text: set[str] = set()
+    for row in candidate_rows[:80]:
+        text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
+        if not text or text.lower() in seen_text:
+            continue
+        seen_text.add(text.lower())
+        candidate_lines.append(
+            f"- source={row.get('source')} time={row.get('time')} refs={row.get('refs') or row.get('event_id')} text={text[:260]}"
+        )
+    current = {
+        "primary_diagnosis": pred.get("primary_diagnosis"),
+        "diagnosis_list": pred.get("diagnosis_list", []),
+        "evidence": pred.get("evidence", []),
+        "reasoning_summary": pred.get("reasoning_summary", ""),
+    }
+    system = (
+        "You are a clinical research diagnosis reconciler. Use only the provided visible evidence candidates. "
+        "Return one compact JSON object with keys primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary, "
+        "species_context, diagnosis_granularity. diagnosis_list must contain 5 to 8 concise evidence-supported diagnosis "
+        "entities when available, including final disease, etiology/pathology, key complications, and anatomic abnormalities. "
+        "Do not include symptoms, procedures, imaging modality names, normal/negative findings, or treatment names as diagnoses. "
+        "Prefer the most specific final explanatory diagnosis as primary_diagnosis, but keep important comorbid diagnoses in diagnosis_list. "
+        "Do not invent diagnoses absent from the visible evidence. Return JSON only."
+    )
+    user = (
+        f"[CASE_ID]\n{case.get('case_id')}\n\n"
+        f"[CURRENT_PREDICTION]\n{current}\n\n"
+        f"[VISIBLE_EVIDENCE_CANDIDATES]\n{chr(10).join(candidate_lines)}\n\n"
+        "Reconcile the final primary diagnosis and diagnosis_list. Return JSON only."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def llm_diagnosis_second_pass(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    client: DeepSeekClient | None,
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+    *,
+    fail_on_llm_error: bool = False,
+    enable_normalization: bool = True,
+) -> dict[str, Any]:
+    if client is None:
+        return pred
+    try:
+        result = client.chat(
+            diagnosis_second_pass_prompt(case, pred, evidence_notes, diagnosis_candidates),
+            temperature=0.0,
+            max_tokens=700,
+        )
+        raw = extract_json_object(result.text)
+        refined = normalize_prediction(
+            str(case.get("case_id")),
+            str(pred.get("method") or "ours_second_pass"),
+            raw,
+            result.usage,
+            enable_normalization=enable_normalization,
+        )
+    except Exception as exc:  # noqa: BLE001 - second pass should not break a completed primary prediction
+        if fail_on_llm_error:
+            raise RuntimeError(f"Diagnosis second pass failed for {case.get('case_id')}: {exc}") from exc
+        updated = dict(pred)
+        updated["diagnosis_second_pass_error"] = str(exc)
+        return updated
+
+    updated = dict(pred)
+    previous_usage = pred.get("usage") or {}
+    usage = refined.get("usage") or {}
+    updated.update(
+        {
+            "primary_diagnosis": refined.get("primary_diagnosis") or pred.get("primary_diagnosis"),
+            "diagnosis_list": refined.get("diagnosis_list") or pred.get("diagnosis_list", []),
+            "confidence": refined.get("confidence", pred.get("confidence")),
+            "evidence": refined.get("evidence") or pred.get("evidence", []),
+            "reasoning_summary": refined.get("reasoning_summary") or pred.get("reasoning_summary", ""),
+            "species_context": refined.get("species_context", pred.get("species_context")),
+            "diagnosis_granularity": refined.get("diagnosis_granularity", pred.get("diagnosis_granularity")),
+            "diagnosis_second_pass": {"enabled": True},
+            "usage": {
+                "prompt_tokens": int(previous_usage.get("prompt_tokens", 0) or 0) + int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(previous_usage.get("completion_tokens", 0) or 0)
+                + int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(previous_usage.get("total_tokens", 0) or 0) + int(usage.get("total_tokens", 0) or 0),
+            },
+        }
+    )
+    return evidence_driven_diagnosis_rerank(case, updated, evidence_notes, diagnosis_candidates)
+
+
+COUNTERFACTUAL_CPG_THRESHOLD = 0.40
+
+
+def counterfactual_verification_prompt(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    intervention: str,
+    context: str,
+    extra: str,
+) -> list[dict[str, str]]:
+    system = (
+        "You are a clinical research counterfactual verifier. This is not medical advice. "
+        "Use only the visible case evidence and the stated counterfactual intervention. "
+        "Do not assume labels, expected effects, or hidden ground truth. Return one compact JSON object with keys: "
+        "primary_diagnosis, confidence_for_original_diagnosis, counterfactual_primary_diagnosis, "
+        "causal_consistency_summary. confidence_for_original_diagnosis must be a number from 0 to 1. "
+        "The confidence is specifically the probability/confidence that the original diagnosis remains supported "
+        "after the intervention. Return JSON only."
+    )
+    user = (
+        f"[CASE_ID]\n{case.get('case_id')}\n\n"
+        f"[ORIGINAL_DIAGNOSIS_TO_VERIFY]\n{pred.get('primary_diagnosis')}\n\n"
+        f"[ORIGINAL_CONFIDENCE]\n{pred.get('confidence')}\n\n"
+        f"[COUNTERFACTUAL_INTERVENTION]\n{intervention}\n\n"
+        f"[VISIBLE_CASE]\n{context}\n\n"
+        f"{extra}\n\n"
+        "Re-run the causal reasoning under the counterfactual intervention. Return JSON only."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def run_counterfactual_verification(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    client: DeepSeekClient | None,
+    *,
+    context: str,
+    extra: str,
+    threshold: float = COUNTERFACTUAL_CPG_THRESHOLD,
+    fail_on_llm_error: bool = False,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    counterfactuals = list(case.get("counterfactuals") or [])
+    if not counterfactuals:
+        return {
+            "enabled": True,
+            "available": False,
+            "passed": False,
+            "threshold": threshold,
+            "cpg": 0.0,
+            "summary": "No counterfactual intervention was provided for this case.",
+        }, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    intervention = str(counterfactuals[0].get("intervention") or counterfactuals[0].get("remove") or "").strip()
+    original_confidence = max(0.0, min(1.0, _safe_float(pred.get("confidence"), 0.5)))
+    if client is None:
+        raise RuntimeError(
+            "Counterfactual verification requires a real LLM API client. "
+            "Use --require-api for formal runs or --disable-counterfactual-verification for the ablation only."
+        )
+
+    try:
+        result = client.chat(
+            counterfactual_verification_prompt(case, pred, intervention, context, extra),
+            temperature=0.0,
+            max_tokens=700,
+        )
+        raw = extract_json_object(result.text)
+    except Exception as exc:  # noqa: BLE001
+        if fail_on_llm_error:
+            raise RuntimeError(f"Counterfactual verification failed for {case.get('case_id')}: {exc}") from exc
+        return {
+            "enabled": True,
+            "available": True,
+            "intervention": intervention,
+            "original_confidence": original_confidence,
+            "counterfactual_confidence_for_original": original_confidence,
+            "cpg": 0.0,
+            "threshold": threshold,
+            "passed": False,
+            "counterfactual_primary_diagnosis": pred.get("primary_diagnosis"),
+            "summary": f"Counterfactual verification failed: {exc}",
+        }, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    cf_confidence = max(0.0, min(1.0, _safe_float(raw.get("confidence_for_original_diagnosis"), original_confidence)))
+    cpg = max(0.0, original_confidence - cf_confidence)
+    return {
+        "enabled": True,
+        "available": True,
+        "intervention": intervention,
+        "original_confidence": original_confidence,
+        "counterfactual_confidence_for_original": cf_confidence,
+        "cpg": cpg,
+        "threshold": threshold,
+        "passed": cpg >= threshold,
+        "primary_diagnosis": str(raw.get("primary_diagnosis") or pred.get("primary_diagnosis") or ""),
+        "counterfactual_primary_diagnosis": str(
+            raw.get("counterfactual_primary_diagnosis") or raw.get("primary_diagnosis") or ""
+        ),
+        "summary": str(raw.get("causal_consistency_summary") or raw.get("summary") or ""),
+    }, result.usage
+
+
+def counterfactual_revision_extra(base_extra: str, verification: dict[str, Any]) -> str:
+    return (
+        f"{base_extra}\n\n"
+        "[COUNTERFACTUAL_VERIFICATION_FAILURE]\n"
+        f"intervention={verification.get('intervention')}\n"
+        f"original_confidence={verification.get('original_confidence')}\n"
+        f"counterfactual_confidence_for_original={verification.get('counterfactual_confidence_for_original')}\n"
+        f"cpg={verification.get('cpg')} threshold={verification.get('threshold')}\n"
+        f"counterfactual_primary_diagnosis={verification.get('counterfactual_primary_diagnosis')}\n"
+        f"summary={verification.get('summary')}\n"
+        "The original diagnosis did not show enough causal sensitivity to the intervention. "
+        "Re-examine the cleaned memory operations, evidence chain, and initial hypothesis. "
+        "Return the safest evidence-supported final diagnosis and lower confidence if causal support remains weak."
+    )
+
+
+def add_usage(previous: dict[str, Any] | None, extra: dict[str, Any] | None) -> dict[str, int]:
+    previous = previous or {}
+    extra = extra or {}
+    return {
+        "prompt_tokens": int(previous.get("prompt_tokens", 0) or 0) + int(extra.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(previous.get("completion_tokens", 0) or 0) + int(extra.get("completion_tokens", 0) or 0),
+        "total_tokens": int(previous.get("total_tokens", 0) or 0) + int(extra.get("total_tokens", 0) or 0),
+    }
+
+
+def evidence_gated_diagnosis_recall(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+    *,
+    max_items: int = 7,
+) -> dict[str, Any]:
+    """Expand diagnosis_list with source-visible diagnoses without changing primary."""
+    primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
+    existing = [canonicalize_diagnosis(str(item)).strip() for item in pred.get("diagnosis_list", []) if str(item).strip()]
+    if primary and primary not in existing:
+        existing = [primary] + existing
+    if len(existing) > 3:
+        updated = dict(pred)
+        updated["diagnosis_list"] = existing[:max_items]
+        updated["diagnosis_recall_added_count"] = 0
+        updated["diagnosis_recall_sources"] = {}
+        return updated
+
+    source_rows: list[tuple[int, str, str]] = []
+    for item in diagnosis_candidates:
+        text = str(item.get("text") or "")
+        if re.search(r"\b(diagnosed|diagnosis|confirmed|pathology|ihc|revealed|showed)\b", text, flags=re.I):
+            source_rows.append((0, text, "diagnosis_event"))
+
+    source_blob = " ".join(text for _, text, _ in source_rows).lower()
+    recalled: list[str] = []
+    sources: dict[str, str] = {}
+    seen = {
+        re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", item.lower())).strip()
+        for item in existing
+        if item
+    }
+
+    def add(raw: str, source: str) -> None:
+        entity = normalize_diagnosis_entity_text(raw)
+        if not entity or not is_likely_diagnostic_entity(entity, allow_primary=False):
+            return
+        key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", entity.lower())).strip()
+        if not key or key in seen:
+            return
+        entity_tokens = [tok for tok in re.findall(r"[a-z0-9]+", entity.lower()) if len(tok) > 2]
+        if entity_tokens and not any(tok in source_blob for tok in entity_tokens):
+            return
+        recalled.append(entity)
+        sources[entity] = source
+        seen.add(key)
+
+    for _, text, source in sorted(source_rows, key=lambda row: row[0]):
+        for fragment in recall_candidate_fragments(text):
+            add(fragment, source)
+            if len(recalled) >= 2:
+                break
+        if len(recalled) >= 2:
+            break
+
+    updated = dict(pred)
+    merged = []
+    merged_seen: set[str] = set()
+    for item in existing + recalled:
+        key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", item.lower())).strip()
+        if item and key not in merged_seen:
+            merged.append(item)
+            merged_seen.add(key)
+    updated["diagnosis_list"] = merged[:max_items]
+    updated["diagnosis_recall_added_count"] = max(0, len(updated["diagnosis_list"]) - len(existing))
+    updated["diagnosis_recall_sources"] = sources
+    return updated
+
+
+def refine_diagnosis_list(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
+    if not primary:
+        return pred
+
+    candidate_rows: list[tuple[int, int, str]] = [(0, 0, primary)]
+
+    for idx, item in enumerate(diagnosis_candidates):
+        candidate_rows.append((1, idx, str(item.get("text") or "")))
+
+    for idx, note in enumerate(evidence_notes):
+        tags = {str(tag).lower() for tag in note.get("tags", [])}
+        summary = str(note.get("summary") or "")
+        low = summary.lower()
+        if tags & {"diagnosis", "pathology"} or any(term in low for term in ("diagnos", "patholog", "biopsy", "confirmed")):
+            candidate_rows.append((2, idx, summary))
+
+    for idx, item in enumerate(pred.get("diagnosis_list", [])):
+        candidate_rows.append((3, idx, str(item)))
+
+    refined: list[str] = []
+    seen: set[str] = set()
+    accepted_by_source: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+
+    def add_candidate(raw_text: str, *, source: int, allow_primary: bool = False) -> bool:
+        entity = normalize_diagnosis_entity_text(raw_text)
+        if not entity or not is_likely_diagnostic_entity(entity, allow_primary=allow_primary):
+            return False
+        key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", entity.lower())).strip()
+        if not key or key in seen:
+            return False
+        refined.append(entity)
+        seen.add(key)
+        accepted_by_source[source] = accepted_by_source.get(source, 0) + 1
+        return True
+
+    add_candidate(primary, source=0, allow_primary=True)
+    high_confidence_candidates = 0
+    for source, _, raw in sorted(candidate_rows[1:], key=lambda row: (row[0], row[1])):
+        if add_candidate(raw, source=source):
+            if source in {1, 2}:
+                high_confidence_candidates += 1
+
+    max_items = 5 if high_confidence_candidates > 3 or accepted_by_source.get(3, 0) >= 3 else 3
+    updated = dict(pred)
+    updated["diagnosis_list"] = refined[:max_items]
+    updated["diagnosis_list_refinement"] = {
+        "enabled": True,
+        "candidate_count": len(candidate_rows),
+        "high_confidence_candidate_count": high_confidence_candidates,
+        "max_items": max_items,
+    }
+    return updated
+
+
+def prefer_visible_diagnosis_candidate(case: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
+    candidates = [
+        item | {
+            "clean_text": clean_diagnosis_candidate_text(str(item.get("text") or "")),
+            "priority": diagnosis_candidate_priority(str(item.get("text") or "")),
+        }
+        for item in diagnosis_event_candidates(case, limit=20)
+    ]
+    candidates = [item for item in candidates if item["priority"] > 0 and item["clean_text"]]
+    if not candidates:
+        return pred
+    evidence_blob = " ".join(str(x) for x in pred.get("evidence", []))
+    diag_blob = " ".join(str(x) for x in pred.get("diagnosis_list", []))
+    primary = str(pred.get("primary_diagnosis") or "")
+
+    def support_score(item: dict[str, Any]) -> tuple[int, int]:
+        clean = item["clean_text"]
+        support = 0
+        if clean.lower() in evidence_blob.lower() or clean.lower() in diag_blob.lower():
+            support += 4
+        if canonicalize_diagnosis(clean) in [canonicalize_diagnosis(str(x)) for x in pred.get("diagnosis_list", [])]:
+            support += 4
+        if clean.lower() in primary.lower() or primary.lower() in clean.lower():
+            support += 2
+        return support + int(item["priority"]), int(item.get("time") or 0)
+
+    best = max(candidates, key=support_score)
+    if support_score(best)[0] < 5:
+        return pred
+    new_primary = canonicalize_diagnosis(best["clean_text"])
+    if not new_primary or canonicalize_diagnosis(primary) == new_primary:
+        return pred
+    updated = dict(pred)
+    updated["primary_diagnosis"] = new_primary
+    diagnosis_list = [new_primary]
+    for item in pred.get("diagnosis_list", []):
+        canonical = canonicalize_diagnosis(str(item))
+        if canonical and canonical not in diagnosis_list:
+            diagnosis_list.append(canonical)
+    updated["diagnosis_list"] = diagnosis_list[:5]
+    updated["reasoning_summary"] = (
+        str(pred.get("reasoning_summary") or "")
+        + " Primary diagnosis selected from visible diagnosis-event candidates."
+    ).strip()
+    updated["primary_selection"] = {
+        "source": "visible_diagnosis_event",
+        "event_id": best.get("event_id"),
+        "time": best.get("time"),
+    }
+    return updated
+
+
+def evidence_support_score_for_text(text: str, pred: dict[str, Any], case: dict[str, Any]) -> float:
+    candidate = canonicalize_diagnosis(str(text))
+    if not candidate:
+        return 0.0
+    blobs = [
+        " ".join(str(item) for item in pred.get("evidence", [])),
+        " ".join(str(item) for item in pred.get("diagnosis_list", [])),
+        " ".join(
+            sanitize_runtime_text(event.get("text"))
+            for event in case.get("events", [])
+            if event.get("type") == "diagnosis"
+        ),
+    ]
+    score = 0.0
+    for blob in blobs:
+        low_blob = blob.lower()
+        low_candidate = candidate.lower()
+        if low_candidate and low_candidate in low_blob:
+            score += 2.0
+        else:
+            candidate_tokens = {tok for tok in re.findall(r"[a-z0-9]+", low_candidate) if len(tok) > 3}
+            blob_tokens = set(re.findall(r"[a-z0-9]+", low_blob))
+            if candidate_tokens:
+                score += len(candidate_tokens & blob_tokens) / len(candidate_tokens)
+    return score
+
+
+def verify_primary_with_evidence(case: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
+    primary = str(pred.get("primary_diagnosis") or "")
+    primary_support = evidence_support_score_for_text(primary, pred, case)
+    if primary_support >= 1.0:
+        updated = dict(pred)
+        updated["primary_evidence_support"] = primary_support
+        return updated
+    candidates = []
+    for item in pred.get("diagnosis_list", []):
+        candidates.append(str(item))
+    for item in diagnosis_event_candidates(case, limit=12):
+        candidates.append(clean_diagnosis_candidate_text(str(item.get("text") or "")))
+    scored = [
+        (evidence_support_score_for_text(candidate, pred, case), candidate)
+        for candidate in candidates
+        if is_likely_diagnostic_entity(candidate, allow_primary=True)
+    ]
+    if not scored:
+        updated = dict(pred)
+        updated["primary_evidence_support"] = primary_support
+        updated["primary_selection_warning"] = "low_evidence_support"
+        return updated
+    best_score, best_candidate = max(scored, key=lambda item: item[0])
+    if best_score <= primary_support or best_score < 1.0:
+        updated = dict(pred)
+        updated["primary_evidence_support"] = primary_support
+        updated["primary_selection_warning"] = "low_evidence_support"
+        return updated
+    new_primary = canonicalize_diagnosis(best_candidate)
+    updated = dict(pred)
+    updated["primary_diagnosis"] = new_primary
+    updated["diagnosis_granularity"] = infer_diagnosis_granularity(new_primary)
+    updated["primary_evidence_support"] = best_score
+    updated["primary_selection"] = {
+        "source": "evidence_verifier",
+        "previous_primary": primary,
+        "previous_support": primary_support,
+    }
+    diagnosis_list = [new_primary]
+    for item in pred.get("diagnosis_list", []):
+        canonical = canonicalize_diagnosis(str(item))
+        if canonical and canonical not in diagnosis_list:
+            diagnosis_list.append(canonical)
+    updated["diagnosis_list"] = diagnosis_list[:5]
+    return updated
+
+
+def format_memory_line(card: dict[str, Any]) -> str:
+    summary = sanitize_runtime_text(card.get("summary"))
+    if not summary:
+        return ""
+    return (
+        f"- {summary} "
+        f"(status={card.get('status')}, confidence={card.get('confidence')}, refs={card.get('evidence_refs')})"
+    )
+
+
+def run_direct_polluted(
+    case: dict[str, Any],
+    client: DeepSeekClient | None,
+    *,
+    fail_on_llm_error: bool = False,
+) -> dict[str, Any]:
+    pred = run_llm_prediction(
+        case,
+        method="baseline_polluted_direct_deepseek",
+        client=client,
+        context=case_context(case, max_events=min(4, len(case.get("events", []))), include_labs=False),
+        extra=(
+            "Make a diagnosis from this limited truncated context plus the following previously stored memory cards. "
+            "The memory cards may be stale, mixed, or cross-patient, but this baseline has no dedicated cleaning tool.\n"
+            f"{pollution_memory_context(case)}"
+        ),
+        fallback_max_events=min(4, len(case.get("events", []))),
+        fail_on_llm_error=fail_on_llm_error,
+    )
+    pred["pollution_exposed"] = True
+    pred["runtime_leakage_filtered_count"] = runtime_leakage_filtered_count(
+        [event.get("text") for event in case.get("events", [])[: min(4, len(case.get("events", [])))]]
+        + [poison.get("text") for poison in case.get("poison_records", [])]
+    )
+    pred["memory_leakage_filtered_count"] = runtime_leakage_filtered_count(
+        [poison.get("text") for poison in case.get("poison_records", [])]
+    )
+    return pred
 
 
 def run_ours(
@@ -175,33 +1740,195 @@ def run_ours(
     *,
     memory_dir: str | Path,
     strategy: dict[str, Any],
+    fail_on_llm_error: bool = False,
 ) -> dict[str, Any]:
     memory_path = Path(memory_dir) / f"{case['case_id']}.memory.jsonl"
     store = bootstrap_memory(case, memory_path)
-    ops = apply_critique(case, store)
+    features = strategy.get("features") or {}
+    disable_memory_cleaning = bool(features.get("disable_memory_cleaning"))
+    ops = [] if disable_memory_cleaning else apply_critique(
+        case,
+        store,
+        client,
+        fail_on_llm_error=fail_on_llm_error,
+        enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
+    )
+    prompt_ops = safe_memory_ops_for_prompt(case, ops)
     query = "final diagnosis longitudinal causal evidence treatment imaging pathology labs"
-    top_k = int(strategy.get("top_k", 5))
-    memories = store.retrieve(query, k=top_k)
-    memory_lines = [
-        f"- {m.get('summary')} (status={m.get('status')}, confidence={m.get('confidence')}, refs={m.get('evidence_refs')})"
-        for m in memories
+    top_k = resolve_top_k(case, strategy)
+    retrieved_memories = store.retrieve(query, k=top_k)
+    evidence_notes = [] if features.get("disable_evidence_note_injection") else source_aligned_evidence_notes(store.cards)
+    diagnosis_candidates = [] if features.get("disable_evidence_note_injection") else diagnosis_event_candidates(case)
+    seen_ids: set[str] = set()
+    memories = []
+    for memory in retrieved_memories:
+        memory_id = str(memory.get("memory_id") or "")
+        if memory_id not in seen_ids:
+            memories.append(memory)
+            seen_ids.add(memory_id)
+    memory_lines = [line for line in (format_memory_line(m) for m in memories) if line]
+    evidence_lines = [
+        f"- t={note.get('time')} refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
+        for note in evidence_notes
+    ]
+    diagnosis_candidate_lines = [
+        f"- t={item.get('time')} ref={item.get('event_id')} diagnosis_text={item.get('text')}"
+        for item in diagnosis_candidates
     ]
     extra = (
-        "Use the active JSONL memory cards and ignore discarded/invalidated outdated hypotheses.\n"
+        "Use the active JSONL memory cards and source-aligned evidence notes. "
+        "Prefer timeline/evidence refs over stale interpretations when choosing primary_diagnosis. "
+        "If a diagnosis event candidate directly captures the final explanatory state, use that concise text as primary_diagnosis "
+        "and put broader underlying diseases in diagnosis_list rather than replacing it.\n"
         f"[MEMORY_CARDS]\n{chr(10).join(memory_lines)}\n"
-        f"[MEMORY_OPS]\n{ops}\n"
-        "Before finalizing, check whether longitudinal evidence contradicts the initial hypothesis."
+        f"[SOURCE_ALIGNED_EVIDENCE_NOTES]\n{chr(10).join(evidence_lines)}\n"
+        f"[DIAGNOSIS_EVENT_CANDIDATES]\n{chr(10).join(diagnosis_candidate_lines)}\n"
+        f"[MEMORY_OPS]\n{prompt_ops}\n"
+        "Before finalizing, check whether longitudinal evidence contradicts the initial hypothesis. "
+        "Do not treat a prior interpretation as a diagnosis unless timeline evidence supports it."
     )
     pred = run_llm_prediction(
         case,
-        method=f"ours_topk{top_k}_round{strategy.get('rounds', 1)}",
+        method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
         client=client,
         context=case_context(case, include_labs=True),
         extra=extra,
         fallback_max_events=None,
         temperature=float(strategy.get("temperature", 0.05)),
+        fail_on_llm_error=fail_on_llm_error,
+        enable_normalization=not bool(features.get("disable_normalization")),
     )
+    if not features.get("disable_evidence_note_injection"):
+        pred = prefer_visible_diagnosis_candidate(case, pred)
+        pred = refine_diagnosis_list(case, pred, evidence_notes, diagnosis_candidates)
+        pred = verify_primary_with_evidence(case, pred)
+        pred = evidence_gated_diagnosis_recall(case, pred, evidence_notes, diagnosis_candidates)
+        pred = evidence_driven_diagnosis_rerank(case, pred, evidence_notes, diagnosis_candidates)
+        pred = llm_diagnosis_second_pass(
+            case,
+            pred,
+            client,
+            evidence_notes,
+            diagnosis_candidates,
+            fail_on_llm_error=False,
+            enable_normalization=not bool(features.get("disable_normalization")),
+        )
+    if features.get("disable_counterfactual_verification"):
+        pred["counterfactual_verification"] = {
+            "enabled": False,
+            "passed": False,
+            "threshold": COUNTERFACTUAL_CPG_THRESHOLD,
+            "cpg": 0.0,
+            "summary": "Counterfactual verification disabled by feature flag.",
+        }
+        pred["counterfactual_revision_triggered"] = False
+    else:
+        verification, cf_usage = run_counterfactual_verification(
+            case,
+            pred,
+            client,
+            context=case_context(case, include_labs=True),
+            extra=extra,
+            threshold=COUNTERFACTUAL_CPG_THRESHOLD,
+            fail_on_llm_error=fail_on_llm_error,
+        )
+        pred["usage"] = add_usage(pred.get("usage"), cf_usage)
+        pred["counterfactual_verification"] = verification
+        pred["counterfactual_revision_triggered"] = False
+        if verification.get("available") and not verification.get("passed"):
+            pre_counterfactual_prediction = {
+                key: pred.get(key)
+                for key in [
+                    "primary_diagnosis",
+                    "diagnosis_list",
+                    "confidence",
+                    "evidence",
+                    "reasoning_summary",
+                    "species_context",
+                    "diagnosis_granularity",
+                ]
+            }
+            revision = run_llm_prediction(
+                case,
+                method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
+                client=client,
+                context=case_context(case, include_labs=True),
+                extra=counterfactual_revision_extra(extra, verification),
+                fallback_max_events=None,
+                temperature=0.0,
+                fail_on_llm_error=fail_on_llm_error,
+                enable_normalization=not bool(features.get("disable_normalization")),
+            )
+            pred.update(
+                {
+                    "primary_diagnosis": revision.get("primary_diagnosis", pred.get("primary_diagnosis")),
+                    "diagnosis_list": revision.get("diagnosis_list", pred.get("diagnosis_list", [])),
+                    "confidence": revision.get("confidence", pred.get("confidence")),
+                    "evidence": revision.get("evidence", pred.get("evidence", [])),
+                    "reasoning_summary": revision.get("reasoning_summary", pred.get("reasoning_summary", "")),
+                    "species_context": revision.get("species_context", pred.get("species_context")),
+                    "diagnosis_granularity": revision.get("diagnosis_granularity", pred.get("diagnosis_granularity")),
+                    "counterfactual_revision_triggered": True,
+                    "pre_counterfactual_prediction": pre_counterfactual_prediction,
+                    "usage": add_usage(pred.get("usage"), revision.get("usage")),
+                }
+            )
     pred["memory_ops"] = ops
+    pred["prompt_memory_ops"] = prompt_ops
+    pred["pollution_exposed"] = True
     pred["retrieved_memory_count"] = len(memories)
+    pred["source_evidence_note_count"] = len(evidence_notes)
+    pred["diagnosis_candidate_count"] = len(diagnosis_candidates)
+    pred["runtime_leakage_filtered_count"] = runtime_leakage_filtered_count(
+        [event.get("text") for event in case.get("events", [])]
+        + [memory.get("summary") for memory in memories]
+        + [card.get("summary") for card in store.cards]
+    )
+    pred["memory_leakage_filtered_count"] = runtime_leakage_filtered_count(
+        [memory.get("summary") for memory in memories]
+    )
+    pred["memory_leakage_filtered_from_store_count"] = runtime_leakage_filtered_count(
+        [card.get("summary") for card in store.cards]
+    )
     pred["strategy"] = strategy
+    pred["optimization_features"] = feature_state(strategy)
     return pred
+
+
+def resolve_top_k(case: dict[str, Any], strategy: dict[str, Any]) -> int:
+    features = strategy.get("features") or {}
+    if "top_k" in strategy and not features.get("top_k_is_auto"):
+        return int(strategy["top_k"])
+    if features.get("disable_dynamic_top_k"):
+        return int(strategy.get("fallback_top_k", 3))
+    events = case.get("events", [])
+    event_count = len(events)
+    if event_count < 20:
+        top_k = 3
+    elif event_count <= 50:
+        top_k = 5
+    else:
+        top_k = 8
+    evidence_terms = ("pathology", "biopsy", "imaging", "ct", "mri", "diagnosis", "diagnosed", "follow-up", "follow up")
+    evidence_hits = sum(
+        1
+        for event in events
+        if any(term in sanitize_runtime_text(event.get("text")).lower() for term in evidence_terms)
+    )
+    if event_count > 50 and evidence_hits:
+        top_k = max(top_k, 8)
+    elif evidence_hits >= 3:
+        top_k = max(top_k, 8)
+    return int(top_k)
+
+
+def feature_state(strategy: dict[str, Any]) -> dict[str, bool]:
+    features = strategy.get("features") or {}
+    return {
+        "diagnosis_normalization": not bool(features.get("disable_normalization")),
+        "dynamic_top_k": not bool(features.get("disable_dynamic_top_k")),
+        "memory_cleaning": not bool(features.get("disable_memory_cleaning")),
+        "critic_op_guard": not bool(features.get("disable_critic_op_guard")),
+        "evidence_note_injection": not bool(features.get("disable_evidence_note_injection")),
+        "counterfactual_verification": not bool(features.get("disable_counterfactual_verification")),
+    }

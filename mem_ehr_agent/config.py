@@ -22,7 +22,8 @@ class DeepSeekConfig:
     base_url: str
     api_key: str
     model: str
-    timeout: int = 90
+    timeout: int = 180
+    max_tokens: int = 700
 
     @property
     def enabled(self) -> bool:
@@ -35,6 +36,6 @@ def get_deepseek_config(env_path: str | Path = ".env") -> DeepSeekConfig:
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.shunyu.tech/v1").rstrip("/"),
         api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-v3.2"),
-        timeout=int(os.getenv("DEEPSEEK_TIMEOUT", "90")),
+        timeout=int(os.getenv("DEEPSEEK_TIMEOUT", "180")),
+        max_tokens=int(os.getenv("DEEPSEEK_MAX_TOKENS", "700")),
     )
-
