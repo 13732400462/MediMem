@@ -7,13 +7,13 @@
 项目根目录：
 
 ```bash
-/home/yyh/mem_ehr_agent
+/home/syh/mem_ehr_agent
 ```
 
 最新完成实验：
 
 ```bash
-/home/yyh/mem_ehr_agent/runs/20260512_165750
+/home/syh/mem_ehr_agent/runs/20260512_165750
 ```
 
 DeepSeek 测试配置已写入服务器 `.env`，文件权限为 `600`。不要提交或打印 API key。
@@ -21,7 +21,7 @@ DeepSeek 测试配置已写入服务器 `.env`，文件权限为 `600`。不要�
 ## 快速运行
 
 ```bash
-cd /home/yyh/mem_ehr_agent
+cd /home/syh/mem_ehr_agent
 source .venv/bin/activate
 python -m mem_ehr_agent data validate --dataset data/processed/samples.jsonl
 python -m mem_ehr_agent optimize --dataset data/processed/samples.jsonl --max-rounds 10 --require-api --max-workers 6
@@ -156,7 +156,7 @@ runs/20260512_165750/predictions/ours_round_001.jsonl
 服务器测试命令：
 
 ```bash
-cd /home/yyh/mem_ehr_agent
+cd /home/syh/mem_ehr_agent
 .venv/bin/python -m pytest -q
 ```
 
