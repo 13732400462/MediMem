@@ -35,6 +35,37 @@ def test_list_f1():
     assert score > 0.4
 
 
+def test_label_aliases_and_primary_diag_objective_are_scored():
+    cases = [
+        {
+            "case_id": "mcqa_1",
+            "labels": {
+                "primary_diagnosis": "Mite",
+                "diagnosis_list": ["Mite"],
+                "label_aliases": ["A", "Mite"],
+            },
+            "qa_tasks": [{"type": "CDR", "answer": "Mite"}],
+            "expected_memory_ops": [],
+        }
+    ]
+    preds = [
+        {
+            "case_id": "mcqa_1",
+            "method": "full_medimem_demo",
+            "primary_diagnosis": "A",
+            "diagnosis_list": ["A"],
+            "confidence": 0.8,
+            "evidence": [],
+        }
+    ]
+
+    result = evaluate_predictions(cases, preds)
+    summary = result["summary"][0]
+    assert summary["primary_diagnosis_top1_accuracy"] == 1.0
+    assert summary["diagnosis_list_f1"] == 1.0
+    assert summary["primary_diag_objective"] == 1.0
+
+
 def test_medical_aliases_match_current_error_patterns():
     assert canonicalize_diagnosis("CAH in newborn screening test") == "congenital adrenal hyperplasia"
     assert diagnosis_match("SLE", "Systemic lupus erythematosus")

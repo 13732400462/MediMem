@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .agents import case_context, pollution_memory_context, run_llm_prediction
+from .agents import case_context, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
 from .amem_baseline import run_amem_adapter
 from .llm import DeepSeekClient
 
@@ -74,8 +74,11 @@ def run_colacare_adapter(
     # visits/labs and asks a meta-doctor to diagnose from multi-agent evidence summaries.
     encounter_lines = []
     for enc in case.get("encounters", []):
+        summary = sanitize_runtime_text(enc.get("summary"))
+        if not summary:
+            continue
         labs = ", ".join(f"{lab.get('name')}={lab.get('value')}{lab.get('unit')}" for lab in enc.get("labs", [])[:4])
-        encounter_lines.append(f"- t={enc.get('time')} summary={enc.get('summary')} labs={labs}")
+        encounter_lines.append(f"- t={enc.get('time')} summary={summary} labs={labs}")
     context = "\n".join(
         [
             f"case_id: {case['case_id']}",

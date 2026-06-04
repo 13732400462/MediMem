@@ -7,6 +7,14 @@ from typing import Any
 from .llm import DeepSeekClient, extract_json_object
 from .memory import apply_critique, bootstrap_memory
 from .medical_terms import canonicalize_diagnosis, canonicalize_diagnoses
+from .task_profiles import (
+    CLINICAL_ASSESSMENT_ENTITY,
+    LONGITUDINAL_DIAGNOSIS,
+    MEDICAL_ANSWER_ENTITY,
+    case_task_profile,
+    diagnosis_list_budget,
+    task_profile_prompt_policy,
+)
 
 
 TARGET_LEAKAGE_PATTERNS = (
@@ -91,12 +99,12 @@ def compact_case_context(case: dict[str, Any], *, max_events: int = 24, include_
     return f"{context}\nshown_events={len(compact_events)}/{len(events)}"
 
 
-def prediction_json_prompt(method: str, context: str, extra: str = "") -> list[dict[str, str]]:
+def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_profile: str = LONGITUDINAL_DIAGNOSIS) -> list[dict[str, str]]:
     is_ours_method = "ours" in method or "medimem" in method
+    min_items, max_items = diagnosis_list_budget(task_profile)
     list_policy = (
-        "diagnosis_list should contain 5 to 7 evidence-supported clinical entities when the case contains multiple diagnoses, "
-        "including the final diagnosis, etiology or pathology entity, major complications, and anatomic abnormalities. "
-        "Do not fill the list with symptoms, procedures, imaging modalities, or treatment names. "
+        f"diagnosis_list should contain {min_items} to {max_items} evidence-supported entities for this task profile. "
+        "Use the profile-specific target granularity instead of expanding unrelated concepts. "
         if is_ours_method
         else "diagnosis_list must contain at most 5 concise diagnoses. "
     )
@@ -106,7 +114,7 @@ def prediction_json_prompt(method: str, context: str, extra: str = "") -> list[d
         "primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary, "
         "species_context, diagnosis_granularity. "
         "confidence must be a number from 0 to 1. evidence must be an array of strings. "
-        f"{list_policy}evidence must contain at most 5 concise strings. "
+        f"{task_profile_prompt_policy(task_profile)} {list_policy}evidence must contain at most 5 concise strings. "
         "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
         "priors to animal cases unless the provided evidence supports them. "
         "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
@@ -303,6 +311,7 @@ def run_llm_prediction(
     fail_on_llm_error: bool = False,
     enable_normalization: bool = True,
 ) -> dict[str, Any]:
+    task_profile = case_task_profile(case)
     if client is None:
         return heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
     context_attempts = [context]
@@ -314,7 +323,10 @@ def run_llm_prediction(
     try:
         for attempt_context in context_attempts:
             try:
-                result = client.chat(prediction_json_prompt(method, attempt_context, extra), temperature=temperature)
+                result = client.chat(
+                    prediction_json_prompt(method, attempt_context, extra, task_profile=task_profile),
+                    temperature=temperature,
+                )
                 break
             except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
                 last_exc = exc
@@ -977,6 +989,148 @@ def diagnosis_key(text: str) -> str:
     ).strip()
 
 
+def profile_list_budget_for_case(case: dict[str, Any]) -> int:
+    return diagnosis_list_budget(case_task_profile(case))[1]
+
+
+def normalize_answer_entity(text: str, *, enable_normalization: bool = True) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;()[]")
+    if not cleaned:
+        return ""
+    return canonicalize_diagnosis(cleaned, enabled=enable_normalization)
+
+
+def answer_option_candidates(case: dict[str, Any]) -> list[str]:
+    candidates = []
+    for option in case.get("answer_options") or []:
+        text = str(option.get("text") or "").strip()
+        label = str(option.get("label") or "").strip()
+        if text:
+            candidates.append(text)
+        if label and text:
+            candidates.append(f"{label}. {text}")
+    return candidates
+
+
+def text_overlap_score(candidate: str, blobs: list[str]) -> float:
+    candidate_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(candidate).lower())).strip()
+    if not candidate_norm:
+        return 0.0
+    candidate_tokens = {tok for tok in candidate_norm.split() if len(tok) > 1}
+    score = 0.0
+    for blob in blobs:
+        blob_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(blob).lower())).strip()
+        if not blob_norm:
+            continue
+        if candidate_norm in blob_norm:
+            score += 4.0
+        elif candidate_tokens:
+            blob_tokens = set(blob_norm.split())
+            score += len(candidate_tokens & blob_tokens) / len(candidate_tokens)
+    return score
+
+
+def apply_profile_diagnosis_list_budget(case: dict[str, Any], pred: dict[str, Any], *, enable_normalization: bool = True) -> dict[str, Any]:
+    max_items = profile_list_budget_for_case(case)
+    primary = normalize_answer_entity(pred.get("primary_diagnosis"), enable_normalization=enable_normalization)
+    merged = []
+    seen = set()
+    for item in [primary] + [str(x) for x in pred.get("diagnosis_list", [])]:
+        entity = normalize_answer_entity(item, enable_normalization=enable_normalization)
+        key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", entity.lower())).strip()
+        if entity and key and key not in seen:
+            seen.add(key)
+            merged.append(entity)
+        if len(merged) >= max_items:
+            break
+    updated = dict(pred)
+    updated["primary_diagnosis"] = primary or pred.get("primary_diagnosis") or "Unknown"
+    updated["diagnosis_list"] = merged or ([updated["primary_diagnosis"]] if updated["primary_diagnosis"] else [])
+    updated["diagnosis_list_budget"] = {"task_profile": case_task_profile(case), "max_items": max_items}
+    return updated
+
+
+def select_primary_for_task_profile(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    evidence_notes: list[dict[str, Any]],
+    diagnosis_candidates: list[dict[str, Any]],
+    *,
+    enable_normalization: bool = True,
+) -> dict[str, Any]:
+    profile = case_task_profile(case)
+    current = str(pred.get("primary_diagnosis") or "")
+    blobs = [
+        current,
+        " ".join(str(item) for item in pred.get("diagnosis_list", [])),
+        " ".join(str(item) for item in pred.get("evidence", [])),
+        str(pred.get("reasoning_summary") or ""),
+    ]
+    candidates: list[tuple[str, str, float]] = [(current, "model_primary", 3.0)]
+
+    if profile == MEDICAL_ANSWER_ENTITY:
+        for option in answer_option_candidates(case):
+            candidates.append((option, "answer_options", 2.5 + text_overlap_score(option, blobs)))
+        for item in pred.get("diagnosis_list", []):
+            candidates.append((str(item), "model_list", 1.5 + text_overlap_score(str(item), blobs)))
+        best = max(candidates, key=lambda row: (row[2], -len(row[0]))) if candidates else ("", "none", 0.0)
+        selected = re.sub(r"^[A-E]\.\s*", "", best[0]).strip()
+        selected = normalize_answer_entity(selected, enable_normalization=enable_normalization)
+        if selected:
+            updated = dict(pred)
+            updated["primary_diagnosis"] = selected
+            updated["diagnosis_granularity"] = "answer_entity"
+            updated["primary_selection_pass"] = {
+                "enabled": True,
+                "task_profile": profile,
+                "source": best[1],
+                "score": best[2],
+                "previous_primary": current,
+            }
+            return apply_profile_diagnosis_list_budget(case, updated, enable_normalization=enable_normalization)
+
+    source_rows = visible_diagnosis_source_rows(case, pred, evidence_notes, diagnosis_candidates)
+    for rank, row in enumerate(source_rows):
+        text = str(row.get("text") or "")
+        if not text:
+            continue
+        entity = diagnosis_entity_from_text(text)
+        if entity:
+            candidates.append((entity, str(row.get("source") or "visible"), float(row.get("weight") or 1.0) + max(0.0, 2.0 - rank / 40)))
+
+    def longitudinal_score(row: tuple[str, str, float]) -> tuple[float, int]:
+        candidate, source, base = row
+        low = candidate.lower()
+        score = base + text_overlap_score(candidate, blobs)
+        if source in {"timeline_diagnosis", "diagnosis_event", "timeline_pathology"}:
+            score += 2.0
+        if re.search(r"\b(complication|metastasis|metastases|failure|injury|embolism|effusion|bleeding)\b", low):
+            score -= 1.6
+        if re.search(r"\b(carcinoma|cancer|lymphoma|leukemia|disease|syndrome|infection|pneumonia|tumor|tumour)\b", low):
+            score += 1.0
+        return score, -len(candidate)
+
+    if profile in {LONGITUDINAL_DIAGNOSIS, CLINICAL_ASSESSMENT_ENTITY} and candidates:
+        best = max(candidates, key=longitudinal_score)
+        selected = normalize_answer_entity(best[0], enable_normalization=enable_normalization)
+        if selected and selected.lower() != "unknown":
+            updated = dict(pred)
+            updated["primary_diagnosis"] = selected
+            updated["diagnosis_granularity"] = infer_diagnosis_granularity(selected)
+            updated["primary_selection_pass"] = {
+                "enabled": True,
+                "task_profile": profile,
+                "source": best[1],
+                "score": longitudinal_score(best)[0],
+                "previous_primary": current,
+            }
+            return apply_profile_diagnosis_list_budget(case, updated, enable_normalization=enable_normalization)
+
+    updated = dict(pred)
+    updated["primary_selection_pass"] = {"enabled": True, "task_profile": profile, "source": "unchanged"}
+    return apply_profile_diagnosis_list_budget(case, updated, enable_normalization=enable_normalization)
+
+
 def diagnosis_entity_from_text(raw_text: str) -> str:
     raw = str(raw_text or "")
     normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", raw.lower())).strip()
@@ -1109,6 +1263,7 @@ def evidence_driven_diagnosis_rerank(
     max_items: int = 12,
 ) -> dict[str, Any]:
     """Recall and reorder diagnosis_list using only visible timeline and memory-derived evidence."""
+    max_items = min(max_items, profile_list_budget_for_case(case))
     candidates: dict[str, dict[str, Any]] = {}
     primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
     if primary:
@@ -1146,14 +1301,19 @@ def evidence_driven_diagnosis_rerank(
             continue
         filtered.append(item)
 
-    filtered.sort(
-        key=lambda item: (
-            0 if diagnosis_key(str(item.get("entity"))) == diagnosis_key(primary) else 1,
-            -float(item.get("score") or 0.0),
-            int(item.get("best_rank", 9999)),
-            str(item.get("entity") or ""),
-        )
-    )
+    profile = case_task_profile(case)
+
+    def sort_key(item: dict[str, Any]) -> tuple[float, int, int, str]:
+        entity = str(item.get("entity") or "")
+        score = float(item.get("score") or 0.0)
+        primary_bonus = 2.5 if diagnosis_key(entity) == diagnosis_key(primary) else 0.0
+        if profile == MEDICAL_ANSWER_ENTITY:
+            primary_bonus = 4.0 if diagnosis_key(entity) == diagnosis_key(primary) else 0.0
+        elif re.search(r"\b(complication|metastasis|metastases|failure|injury|embolism|effusion|bleeding)\b", entity.lower()):
+            score -= 1.2
+        return (-(score + primary_bonus), int(item.get("best_rank", 9999)), len(entity), entity)
+
+    filtered.sort(key=sort_key)
 
     merged: list[str] = []
     seen: set[str] = set()
@@ -1210,6 +1370,8 @@ def diagnosis_second_pass_prompt(
     evidence_notes: list[dict[str, Any]],
     diagnosis_candidates: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
+    profile = case_task_profile(case)
+    min_items, max_items = diagnosis_list_budget(profile)
     candidate_rows = visible_diagnosis_source_rows(case, pred, evidence_notes, diagnosis_candidates)
     candidate_lines = []
     seen_text: set[str] = set()
@@ -1230,10 +1392,8 @@ def diagnosis_second_pass_prompt(
     system = (
         "You are a clinical research diagnosis reconciler. Use only the provided visible evidence candidates. "
         "Return one compact JSON object with keys primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary, "
-        "species_context, diagnosis_granularity. diagnosis_list must contain 5 to 8 concise evidence-supported diagnosis "
-        "entities when available, including final disease, etiology/pathology, key complications, and anatomic abnormalities. "
-        "Do not include symptoms, procedures, imaging modality names, normal/negative findings, or treatment names as diagnoses. "
-        "Prefer the most specific final explanatory diagnosis as primary_diagnosis, but keep important comorbid diagnoses in diagnosis_list. "
+        f"species_context, diagnosis_granularity. {task_profile_prompt_policy(profile)} "
+        f"diagnosis_list must contain {min_items} to {max_items} concise evidence-supported entities when available. "
         "Do not invent diagnoses absent from the visible evidence. Return JSON only."
     )
     user = (
@@ -1446,6 +1606,7 @@ def evidence_gated_diagnosis_recall(
     max_items: int = 7,
 ) -> dict[str, Any]:
     """Expand diagnosis_list with source-visible diagnoses without changing primary."""
+    max_items = min(max_items, profile_list_budget_for_case(case))
     primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
     existing = [canonicalize_diagnosis(str(item)).strip() for item in pred.get("diagnosis_list", []) if str(item).strip()]
     if primary and primary not in existing:
@@ -1556,7 +1717,8 @@ def refine_diagnosis_list(
             if source in {1, 2}:
                 high_confidence_candidates += 1
 
-    max_items = 5 if high_confidence_candidates > 3 or accepted_by_source.get(3, 0) >= 3 else 3
+    profile_max_items = profile_list_budget_for_case(case)
+    max_items = min(profile_max_items, 5 if high_confidence_candidates > 3 or accepted_by_source.get(3, 0) >= 3 else 3)
     updated = dict(pred)
     updated["diagnosis_list"] = refined[:max_items]
     updated["diagnosis_list_refinement"] = {
@@ -1569,6 +1731,8 @@ def refine_diagnosis_list(
 
 
 def prefer_visible_diagnosis_candidate(case: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
+    if case_task_profile(case) == MEDICAL_ANSWER_ENTITY:
+        return pred
     candidates = [
         item | {
             "clean_text": clean_diagnosis_candidate_text(str(item.get("text") or "")),
@@ -1607,7 +1771,7 @@ def prefer_visible_diagnosis_candidate(case: dict[str, Any], pred: dict[str, Any
         canonical = canonicalize_diagnosis(str(item))
         if canonical and canonical not in diagnosis_list:
             diagnosis_list.append(canonical)
-    updated["diagnosis_list"] = diagnosis_list[:5]
+    updated["diagnosis_list"] = diagnosis_list[:profile_list_budget_for_case(case)]
     updated["reasoning_summary"] = (
         str(pred.get("reasoning_summary") or "")
         + " Primary diagnosis selected from visible diagnosis-event candidates."
@@ -1648,6 +1812,10 @@ def evidence_support_score_for_text(text: str, pred: dict[str, Any], case: dict[
 
 
 def verify_primary_with_evidence(case: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
+    if case_task_profile(case) == MEDICAL_ANSWER_ENTITY:
+        updated = dict(pred)
+        updated["primary_evidence_support"] = evidence_support_score_for_text(str(pred.get("primary_diagnosis") or ""), pred, case)
+        return updated
     primary = str(pred.get("primary_diagnosis") or "")
     primary_support = evidence_support_score_for_text(primary, pred, case)
     if primary_support >= 1.0:
@@ -1690,7 +1858,7 @@ def verify_primary_with_evidence(case: dict[str, Any], pred: dict[str, Any]) -> 
         canonical = canonicalize_diagnosis(str(item))
         if canonical and canonical not in diagnosis_list:
             diagnosis_list.append(canonical)
-    updated["diagnosis_list"] = diagnosis_list[:5]
+    updated["diagnosis_list"] = diagnosis_list[:profile_list_budget_for_case(case)]
     return updated
 
 
@@ -1813,6 +1981,21 @@ def run_ours(
             fail_on_llm_error=False,
             enable_normalization=not bool(features.get("disable_normalization")),
         )
+        pred = select_primary_for_task_profile(
+            case,
+            pred,
+            evidence_notes,
+            diagnosis_candidates,
+            enable_normalization=not bool(features.get("disable_normalization")),
+        )
+    else:
+        pred = select_primary_for_task_profile(
+            case,
+            pred,
+            [],
+            [],
+            enable_normalization=not bool(features.get("disable_normalization")),
+        )
     if features.get("disable_counterfactual_verification"):
         pred["counterfactual_verification"] = {
             "enabled": False,
@@ -1835,7 +2018,18 @@ def run_ours(
         pred["usage"] = add_usage(pred.get("usage"), cf_usage)
         pred["counterfactual_verification"] = verification
         pred["counterfactual_revision_triggered"] = False
-        if verification.get("available") and not verification.get("passed"):
+        counterfactual_primary = str(verification.get("counterfactual_primary_diagnosis") or "").strip()
+        current_primary = str(pred.get("primary_diagnosis") or "").strip()
+        high_confidence_contradiction = (
+            verification.get("available")
+            and verification.get("passed")
+            and float(verification.get("counterfactual_confidence_for_original") or 1.0) <= 0.20
+            and counterfactual_primary
+            and current_primary
+            and diagnosis_key(counterfactual_primary) != diagnosis_key(current_primary)
+        )
+        pred["counterfactual_revision_policy"] = "audit_only_unless_high_confidence_contradiction"
+        if high_confidence_contradiction:
             pre_counterfactual_prediction = {
                 key: pred.get(key)
                 for key in [
@@ -1872,6 +2066,13 @@ def run_ours(
                     "pre_counterfactual_prediction": pre_counterfactual_prediction,
                     "usage": add_usage(pred.get("usage"), revision.get("usage")),
                 }
+            )
+            pred = select_primary_for_task_profile(
+                case,
+                pred,
+                evidence_notes,
+                diagnosis_candidates,
+                enable_normalization=not bool(features.get("disable_normalization")),
             )
     pred["memory_ops"] = ops
     pred["prompt_memory_ops"] = prompt_ops

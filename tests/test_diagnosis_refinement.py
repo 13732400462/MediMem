@@ -4,6 +4,7 @@ from mem_ehr_agent.agents import (
     refine_diagnosis_list,
     run_counterfactual_verification,
     run_ours,
+    select_primary_for_task_profile,
 )
 from mem_ehr_agent.llm import LLMResult
 from mem_ehr_agent.medical_terms import canonicalize_diagnosis
@@ -147,6 +148,61 @@ def test_evidence_driven_rerank_recalls_visible_entities_without_labels():
     assert "chronic cough" not in updated["diagnosis_list"]
 
 
+def test_medical_answer_entity_primary_can_be_non_disease_option():
+    case = {
+        "case_id": "medmcqa_demo",
+        "task_profile": "medical_answer_entity",
+        "answer_options": [
+            {"label": "A", "text": "Mite"},
+            {"label": "B", "text": "Fungus"},
+            {"label": "C", "text": "Virus"},
+        ],
+        "events": [
+            {"event_id": "ev_q", "time": 0, "type": "clinical", "text": "Scabies is caused by which organism?"},
+            {"event_id": "ev_o", "time": 1, "type": "clinical", "text": "Answer options: A. Mite; B. Fungus; C. Virus"},
+        ],
+    }
+    pred = {
+        "primary_diagnosis": "parasitic infestation",
+        "diagnosis_list": ["parasitic infestation", "Mite", "skin disease", "itching"],
+        "evidence": ["The selected option is Mite."],
+        "reasoning_summary": "Mite best matches scabies.",
+    }
+
+    updated = select_primary_for_task_profile(case, pred, evidence_notes=[], diagnosis_candidates=[])
+
+    assert updated["primary_diagnosis"] == "Mite"
+    assert len(updated["diagnosis_list"]) <= 3
+    assert updated["diagnosis_granularity"] == "answer_entity"
+
+
+def test_longitudinal_primary_selector_keeps_main_diagnosis_over_complication():
+    case = {
+        "case_id": "pmoa_demo",
+        "task_profile": "longitudinal_diagnosis",
+        "events": [
+            {"event_id": "ev_title", "time": 0, "type": "diagnosis", "text": "Initial clinical task/source title: Case report of non-small cell lung cancer"},
+            {"event_id": "ev_comp", "time": 5, "type": "diagnosis", "text": "Later course complicated by pleural effusion and respiratory failure."},
+        ],
+    }
+    pred = {
+        "primary_diagnosis": "respiratory failure",
+        "diagnosis_list": ["respiratory failure", "non-small cell lung cancer", "pleural effusion"],
+        "evidence": ["case report of non-small cell lung cancer"],
+        "reasoning_summary": "",
+    }
+
+    updated = select_primary_for_task_profile(
+        case,
+        pred,
+        evidence_notes=[],
+        diagnosis_candidates=[{"event_id": "ev_title", "time": 0, "text": case["events"][0]["text"]}],
+    )
+
+    assert updated["primary_diagnosis"] == "non small cell lung cancer"
+    assert len(updated["diagnosis_list"]) <= 8
+
+
 class CounterfactualClient:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -212,7 +268,7 @@ def test_counterfactual_verification_requires_real_client():
         raise AssertionError("counterfactual verification must not use offline fallback")
 
 
-def test_run_ours_triggers_one_counterfactual_revision(tmp_path):
+def test_run_ours_keeps_counterfactual_audit_only_without_high_confidence_contradiction(tmp_path):
     case = {
         "case_id": "case_cf_revision",
         "demographics": {},
@@ -252,7 +308,8 @@ def test_run_ours_triggers_one_counterfactual_revision(tmp_path):
     )
 
     assert pred["method"] == "medimem_topk3_round1"
-    assert pred["counterfactual_revision_triggered"] is True
-    assert pred["pre_counterfactual_prediction"]["primary_diagnosis"] == "pneumonia"
-    assert pred["primary_diagnosis"] == "undifferentiated respiratory illness"
+    assert pred["counterfactual_revision_triggered"] is False
+    assert "pre_counterfactual_prediction" not in pred
+    assert pred["primary_diagnosis"] == "pneumonia"
     assert round(pred["counterfactual_verification"]["cpg"], 2) == 0.10
+    assert pred["counterfactual_revision_policy"] == "audit_only_unless_high_confidence_contradiction"
