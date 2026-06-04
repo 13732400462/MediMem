@@ -62,6 +62,10 @@ def diagnosis_match(pred: str, gold: str) -> bool:
     return p == g or substring_match or token_f1(p, g) >= 0.72
 
 
+def diagnosis_match_any(pred: str, golds: list[str]) -> bool:
+    return any(diagnosis_match(pred, gold) for gold in golds if str(gold).strip())
+
+
 def list_f1(preds: list[str], golds: list[str]) -> float:
     preds = unique_normalized_items(preds)
     golds = unique_normalized_items(golds)
@@ -79,6 +83,41 @@ def list_f1(preds: list[str], golds: list[str]) -> float:
                 continue
             score = token_f1(pred, gold)
             if diagnosis_match(pred, gold):
+                score = max(score, 0.9)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is not None and best_score >= 0.5:
+            matched_gold.add(best_idx)
+            tp += 1
+    precision = tp / len(preds)
+    recall = tp / len(golds)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def list_f1_with_aliases(preds: list[str], golds: list[str], aliases: list[str]) -> float:
+    preds = unique_normalized_items(preds)
+    golds = unique_normalized_items(golds)
+    alias_group = [str(item) for item in aliases if str(item).strip()]
+    if not preds and not golds:
+        return 1.0
+    if not preds or not golds:
+        return 0.0
+    matched_gold: set[int] = set()
+    tp = 0
+    for pred in preds:
+        best_idx = None
+        best_score = 0.0
+        for idx, gold in enumerate(golds):
+            if idx in matched_gold:
+                continue
+            gold_aliases = [gold]
+            if diagnosis_match(gold, alias_group[0] if alias_group else "") or idx == 0:
+                gold_aliases.extend(alias_group)
+            score = max(token_f1(pred, item) for item in gold_aliases if str(item).strip())
+            if diagnosis_match_any(pred, gold_aliases):
                 score = max(score, 0.9)
             if score > best_score:
                 best_score = score
@@ -394,8 +433,11 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
     for pred in predictions:
         case = case_by_id[pred["case_id"]]
         labels = case["labels"]
-        primary_ok = diagnosis_match(pred.get("primary_diagnosis", ""), labels.get("primary_diagnosis", ""))
-        diag_f1 = list_f1(pred.get("diagnosis_list", []), labels.get("diagnosis_list", []))
+        primary_golds = [str(labels.get("primary_diagnosis", ""))]
+        primary_golds.extend(str(item) for item in labels.get("label_aliases", []) if str(item).strip())
+        primary_ok = diagnosis_match_any(pred.get("primary_diagnosis", ""), primary_golds)
+        gold_diagnosis_list = list(labels.get("diagnosis_list", []))
+        diag_f1 = list_f1_with_aliases(pred.get("diagnosis_list", []), gold_diagnosis_list, list(labels.get("label_aliases", [])))
         diagnosis_items = [pred.get("primary_diagnosis", "")] + [str(item) for item in pred.get("diagnosis_list", [])]
         cdr_f1s = []
         for qa in case.get("qa_tasks", []):
@@ -440,11 +482,16 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
 
 def summarize_case_rows(method: str, vals: list[dict[str, Any]]) -> dict[str, Any]:
     n = len(vals)
+    primary_acc = avg(vals, "primary_correct")
+    diagnosis_f1 = avg(vals, "diagnosis_f1")
     return {
         "method": method,
         "n": n,
-        "primary_diagnosis_top1_accuracy": avg(vals, "primary_correct"),
-        "diagnosis_list_f1": avg(vals, "diagnosis_f1"),
+        "primary_diagnosis_top1_accuracy": primary_acc,
+        "diagnosis_list_f1": diagnosis_f1,
+        "primary_diag_objective": (
+            0.65 * primary_acc + 0.35 * diagnosis_f1 if primary_acc is not None and diagnosis_f1 is not None else None
+        ),
         "cdr_f1": avg(vals, "cdr_f1"),
         "hard_pollution_suppression": avg(vals, "hard_pollution_suppression"),
         "memory_pollution_suppression": avg(vals, "pollution_suppression"),

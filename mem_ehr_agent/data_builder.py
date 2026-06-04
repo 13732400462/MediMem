@@ -7,6 +7,7 @@ from typing import Any
 from .data_sources import paired_source_rows
 from .io_utils import write_jsonl, write_text
 from .schemas import validate_case
+from .task_profiles import DEFAULT_TASK_PROFILE, LONGITUDINAL_DIAGNOSIS
 
 
 def _as_events(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -99,6 +100,14 @@ def dedupe(items: list[str]) -> list[str]:
             seen.add(norm)
             out.append(item)
     return out
+
+
+def as_text_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def normalize_text(text: str) -> str:
@@ -444,7 +453,9 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
     events = _as_events(pmoa_row)
     diagnoses = _diagnoses(pmoa_row)
     labs = _synthetic_labs(diagnoses, events)
-    primary = choose_primary_diagnosis(events, diagnoses)
+    task_profile = str(pmoa_row.get("_task_profile") or DEFAULT_TASK_PROFILE)
+    primary = choose_primary_diagnosis(events, diagnoses) if task_profile == LONGITUDINAL_DIAGNOSIS else (diagnoses[0] if diagnoses else "Medical answer entity")
+    label_aliases = as_text_list(pmoa_row.get("_label_aliases")) or [primary]
     if primary and not any(normalize_text(primary) == normalize_text(d) for d in diagnoses):
         diagnoses = [primary] + diagnoses
     elif primary:
@@ -483,8 +494,11 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
         "labels": {
             "primary_diagnosis": primary,
             "diagnosis_list": diagnoses,
+            "label_aliases": label_aliases,
             "outcome": pmoa_row.get("death_info", {}),
         },
+        "answer_options": pmoa_row.get("_answer_options") or [],
+        "task_profile": task_profile,
         "qa_tasks": [
             {
                 "qa_id": f"{case_id}_idr",
@@ -523,6 +537,7 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
             "has_follow_up": any(int(event.get("time", 0) or 0) > 0 for event in events),
             "label_fragment_like": is_fragment_like_label(primary),
             "species_context": infer_species_context(pmoa_row, events),
+            "task_profile": task_profile,
         },
     }
     return case

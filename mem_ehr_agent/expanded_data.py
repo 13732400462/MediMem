@@ -10,6 +10,7 @@ from typing import Any
 from .data_builder import build_case, write_prefix_slices
 from .data_sources import fetch_hf_rows, fetch_pmc_patient_rows, fetch_pmoa_rows
 from .io_utils import ensure_dir, write_jsonl, write_text
+from .task_profiles import task_profile_for_source
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,67 @@ def option_answer(row: dict[str, Any]) -> str:
     return next((option for option in options if option), text_value(row, "output", "answer", "target"))
 
 
+def answer_options(row: dict[str, Any]) -> list[dict[str, str]]:
+    options = []
+    for label, keys in (
+        ("A", ("opa", "A")),
+        ("B", ("opb", "B")),
+        ("C", ("opc", "C")),
+        ("D", ("opd", "D")),
+        ("E", ("ope", "E")),
+    ):
+        value = text_value(row, *keys)
+        if value:
+            options.append({"label": label, "text": value})
+    return options
+
+
+def option_aliases(row: dict[str, Any], answer: str) -> list[str]:
+    aliases = [answer] if answer else []
+    options = answer_options(row)
+    raw = row.get("cop", row.get("answer_idx", row.get("answer")))
+    label_to_idx = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "0": 0, "1": 1, "2": 2, "3": 3, "4": 4}
+    if isinstance(raw, int) and 0 <= raw < len(options):
+        aliases.append(options[raw]["label"])
+    elif isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in label_to_idx and label_to_idx[low] < len(options):
+            aliases.append(options[label_to_idx[low]]["label"])
+        elif raw.strip() and raw.strip() != answer:
+            aliases.append(raw.strip())
+    out = []
+    seen = set()
+    for alias in aliases:
+        key = re.sub(r"\s+", " ", str(alias).lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(str(alias))
+    return out
+
+
+def scrub_answer_explanation(text: str, answer: str = "") -> str:
+    cleaned = re.sub(r"\bRef\s*:.*$", "", str(text or ""), flags=re.I).strip()
+    if not cleaned:
+        return ""
+    sentences = split_sentences(cleaned, limit=12)
+    kept = []
+    answer_norm = re.escape(str(answer or "").strip())
+    marker_re = re.compile(
+        r"\b(?:correct\s+answer|answer|ans\.?|option)\b\s*(?:is|:|=|-)?\s*(?:['\"]?[a-e]['\"]?|['\"]?[^.;]{1,80}['\"]?)",
+        flags=re.I,
+    )
+    for sentence in sentences:
+        low = sentence.lower()
+        if marker_re.search(sentence):
+            continue
+        if answer and re.search(r"\b(?:is|was|are|were)\s+['\"]?" + answer_norm + r"['\"]?", sentence, flags=re.I):
+            continue
+        if "correct answer" in low or "ans." in low:
+            continue
+        kept.append(sentence)
+    return " ".join(kept[:4]).strip()
+
+
 def split_sentences(text: str, *, limit: int = 8) -> list[str]:
     chunks = [item.strip() for item in re.split(r"(?<=[.;?!])\s+|\n+", text) if item.strip()]
     return chunks[:limit] if chunks else ([text.strip()] if text.strip() else [])
@@ -156,7 +218,9 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
     question = text_value(row, "question", "instruction", "input", "dialogue", "dialog")
     context = text_value(row, "context", "patient", "note", "conversation", "dialogue", "dialog")
     answer = option_answer(row)
+    options = answer_options(row)
     explanation = text_value(row, "exp", "explanation", "output", "response", "soap_summary", "summary")
+    safe_explanation = scrub_answer_explanation(explanation, answer) if spec.source_type == "medical_mcqa" else explanation
     subject = text_value(row, "subject_name", "topic_name", "category", "department")
     diagnosis_seed = answer or explanation or subject or title
     diagnoses = diagnosis_from_text(diagnosis_seed, fallback=subject or "Medical answer entity")
@@ -168,8 +232,11 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
         event_texts.extend(split_sentences(context, limit=4))
     if question:
         event_texts.append(f"Clinical question or presentation: {question}")
-    if explanation and explanation != answer:
-        event_texts.extend(split_sentences(explanation, limit=3))
+    if options:
+        option_text = "; ".join(f"{item['label']}. {item['text']}" for item in options)
+        event_texts.append(f"Answer options: {option_text}")
+    if safe_explanation and safe_explanation != answer:
+        event_texts.extend(split_sentences(safe_explanation, limit=3))
     if len(event_texts) < 3:
         event_texts.extend([f"Source type: {spec.source_type}", f"Dataset: {spec.name}"])
 
@@ -185,6 +252,9 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
         "_source_type": spec.source_type,
         "_source_url": spec.url,
         "_source_id": source_id,
+        "_task_profile": task_profile_for_source(spec.name),
+        "_answer_options": options,
+        "_label_aliases": option_aliases(row, answer),
     }
 
 
@@ -208,6 +278,9 @@ def pmc_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx: int
         "_source_type": spec.source_type,
         "_source_url": spec.url,
         "_source_id": source_id,
+        "_task_profile": task_profile_for_source(spec.name),
+        "_answer_options": [],
+        "_label_aliases": diagnoses,
     }
 
 
@@ -256,6 +329,9 @@ def source_rows_to_cases(
                     "_source_type": spec.source_type,
                     "_source_url": spec.url,
                     "_source_id": stable_source_id(spec.name, row, idx),
+                    "_task_profile": task_profile_for_source(spec.name),
+                    "_answer_options": [],
+                    "_label_aliases": row.get("diagnoses") or row.get("diagnosis") or [],
                 }
             )
         elif source_name == "pmc_patients":
@@ -282,6 +358,8 @@ def source_rows_to_cases(
         flags["source_type"] = spec.source_type
         flags["source_id"] = source_id
         flags["source_url"] = spec.url
+        flags["task_profile"] = task_profile_for_source(spec.name)
+        case["task_profile"] = flags["task_profile"]
         cases.append(case)
     return cases
 

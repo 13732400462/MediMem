@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .agents import case_context, pollution_memory_context, run_llm_prediction
+from .agents import case_context, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
 from .llm import DeepSeekClient
 
 
@@ -308,8 +308,10 @@ class SourceAlignedAMEMSystem:
         return evolved, note
 
 
-def event_to_note_fields(case: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
-    content = str(event.get("text") or "")
+def event_to_note_fields(case: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
+    content = sanitize_runtime_text(event.get("text"))
+    if not content:
+        return None
     event_type = str(event.get("type") or "clinical")
     context = (
         f"Patient {case.get('case_id')} longitudinal EHR event at t={event.get('time')}. "
@@ -329,6 +331,8 @@ def build_amem_system(case: dict[str, Any]) -> SourceAlignedAMEMSystem:
     system = SourceAlignedAMEMSystem()
     for event in case.get("events", []):
         fields = event_to_note_fields(case, event)
+        if fields is None:
+            continue
         system.add_note(**fields)
     return system
 
