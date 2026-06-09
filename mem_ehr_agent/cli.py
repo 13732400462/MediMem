@@ -62,6 +62,13 @@ def cmd_experiment_suite(args: argparse.Namespace) -> None:
         require_api=args.require_api,
         max_workers=args.max_workers,
         focused=args.focused,
+        suite_profile=args.suite_profile,
+        baseline_set=args.baseline_set,
+        ablation_groups=args.ablation_groups,
+        counterfactual_policy=args.counterfactual_policy,
+        counterfactual_sample_rate=args.counterfactual_sample_rate,
+        counterfactual_risk_threshold=args.counterfactual_risk_threshold,
+        defer_reports=args.defer_reports,
     )
     print(f"run_dir={run_dir}")
 
@@ -93,6 +100,7 @@ def cmd_data_build_medical_pool(args: argparse.Namespace) -> None:
         sources=parse_source_names(args.sources),
         require_real_data=args.require_real_data,
         cache_dir=args.cache_dir,
+        random_seed=args.random_seed,
     )
     print(f"wrote medical_ehr_pool manifest to {Path(args.output_dir) / 'manifest.json'}")
     print(f"pooled_path={manifest['pooled_path']}")
@@ -173,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail if any selected source cannot provide the requested number of real rows.",
     )
     pool.add_argument("--cache-dir", default=None)
+    pool.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Stable per-source sampling seed; samples from a larger fetched/cache pool when set.",
+    )
     pool.set_defaults(func=cmd_data_build_medical_pool)
     validate = data_sub.add_parser("validate")
     validate.add_argument("--dataset", default="data/processed/samples.jsonl")
@@ -208,6 +222,36 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument("--dataset", default="data/processed/samples.jsonl")
     suite.add_argument("--require-api", action="store_true", help="Stop if DeepSeek API is unavailable instead of using fallback.")
     suite.add_argument("--max-workers", type=int, default=16)
+    suite.add_argument(
+        "--suite-profile",
+        default="standard",
+        choices=["standard", "fast-formal", "fast_formal", "fast_formal_with_required_pipelines"],
+        help="Use fast-formal for required pipelines plus full/no-memory-cleaning/no-evidence ablations.",
+    )
+    suite.add_argument(
+        "--baseline-set",
+        default=None,
+        choices=["all", "focused", "required"],
+        help="all includes polluted variants; required runs direct/cot/amem/ddo/colacare only.",
+    )
+    suite.add_argument(
+        "--ablation-groups",
+        default=None,
+        help="Comma-separated groups, e.g. full,no_memory_cleaning,no_evidence_note_injection.",
+    )
+    suite.add_argument(
+        "--counterfactual-policy",
+        default="always",
+        choices=["always", "risk_sample", "never"],
+        help="risk_sample runs counterfactual verification only for high-risk plus sampled low-risk cases.",
+    )
+    suite.add_argument("--counterfactual-sample-rate", type=float, default=0.20)
+    suite.add_argument("--counterfactual-risk-threshold", type=float, default=0.55)
+    suite.add_argument(
+        "--defer-reports",
+        action="store_true",
+        help="Write metrics/predictions/leakage during the run, then render markdown/error analysis once at the end.",
+    )
     suite.add_argument(
         "--focused",
         action="store_true",

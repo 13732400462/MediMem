@@ -1,10 +1,13 @@
 from mem_ehr_agent.metrics import (
     build_leakage_audit,
+    build_leakage_audit_details,
     build_expected_memory_op_distribution,
     build_memory_op_confusion,
     add_merged_ours_summaries,
     build_slice_breakdown,
     build_metric_gate,
+    build_source_metrics,
+    diagnosis_metrics_applicable,
     diagnosis_match,
     evaluate_predictions,
     action_quality,
@@ -17,6 +20,7 @@ from mem_ehr_agent.metrics import (
     revision_accuracy,
     stale_memory_action_accuracy,
     stale_memory_challenge_score,
+    summarize_leakage_audit_details,
     token_f1,
 )
 from mem_ehr_agent.medical_terms import canonicalize_diagnosis
@@ -24,6 +28,94 @@ from mem_ehr_agent.medical_terms import canonicalize_diagnosis
 
 def test_token_f1_overlap():
     assert token_f1("acute myeloid leukemia", "myeloid leukemia") > 0.7
+
+
+def test_source_metrics_groups_pooled_cases_by_source_dataset():
+    cases = [
+        {
+            "case_id": "medqa_0001",
+            "labels": {"primary_diagnosis": "asthma", "diagnosis_list": ["asthma"]},
+            "qa_tasks": [{"type": "CDR", "answer": "asthma"}],
+            "counterfactuals": [],
+            "data_quality_flags": {"source_dataset": "medqa"},
+        },
+        {
+            "case_id": "medmcqa_0001",
+            "labels": {"primary_diagnosis": "pneumonia", "diagnosis_list": ["pneumonia"]},
+            "qa_tasks": [{"type": "CDR", "answer": "pneumonia"}],
+            "counterfactuals": [],
+            "data_quality_flags": {"source_dataset": "medmcqa"},
+        },
+    ]
+    preds = [
+        {"case_id": "medqa_0001", "method": "direct_deepseek", "primary_diagnosis": "asthma", "diagnosis_list": ["asthma"]},
+        {
+            "case_id": "medmcqa_0001",
+            "method": "direct_deepseek",
+            "primary_diagnosis": "pneumonia",
+            "diagnosis_list": ["pneumonia"],
+        },
+        {
+            "case_id": "medqa_0001",
+            "method": "full_medimem_topk3_round1",
+            "primary_diagnosis": "asthma",
+            "diagnosis_list": ["asthma"],
+            "memory_ops": [],
+        },
+        {
+            "case_id": "medmcqa_0001",
+            "method": "full_medimem_topk3_round1",
+            "primary_diagnosis": "pneumonia",
+            "diagnosis_list": ["pneumonia"],
+            "memory_ops": [],
+        },
+    ]
+    eval_result = evaluate_predictions(cases, preds)
+    rows = build_source_metrics(cases, eval_result["case_rows"], group_names=["full"])
+    methods_by_source = {
+        (row["source"], row["method"]): int(row["n"])
+        for row in rows
+        if row["method"] in {"direct_deepseek", "full_medimem_merged"}
+    }
+    assert methods_by_source[("overall", "direct_deepseek")] == 2
+    assert methods_by_source[("medqa", "direct_deepseek")] == 1
+    assert methods_by_source[("medmcqa", "direct_deepseek")] == 1
+    assert methods_by_source[("medqa", "full_medimem_merged")] == 1
+    assert methods_by_source[("medmcqa", "full_medimem_merged")] == 1
+
+
+def test_source_metrics_match_single_source_method_n_sets():
+    cases = [
+        {
+            "case_id": "medqa_0001",
+            "labels": {"primary_diagnosis": "asthma", "diagnosis_list": ["asthma"]},
+            "qa_tasks": [{"type": "CDR", "answer": "asthma"}],
+            "counterfactuals": [],
+            "data_quality_flags": {"source_dataset": "medqa"},
+        },
+        {
+            "case_id": "medmcqa_0001",
+            "labels": {"primary_diagnosis": "pneumonia", "diagnosis_list": ["pneumonia"]},
+            "qa_tasks": [{"type": "CDR", "answer": "pneumonia"}],
+            "counterfactuals": [],
+            "data_quality_flags": {"source_dataset": "medmcqa"},
+        },
+    ]
+    preds = [
+        {"case_id": case["case_id"], "method": method, "primary_diagnosis": case["labels"]["primary_diagnosis"], "diagnosis_list": case["labels"]["diagnosis_list"]}
+        for case in cases
+        for method in ("direct_deepseek", "ablate_no_memory_cleaning_medimem_topk3_round1")
+    ]
+    pooled = build_source_metrics(cases, evaluate_predictions(cases, preds)["case_rows"], group_names=["ablate_no_memory_cleaning"])
+    pooled_source_pairs = {
+        (row["method"], int(row["n"]))
+        for row in pooled
+        if row["source"] == "medqa"
+    }
+    single_eval = evaluate_predictions([cases[0]], [pred for pred in preds if pred["case_id"] == "medqa_0001"])
+    single_source = build_source_metrics([cases[0]], single_eval["case_rows"], group_names=["ablate_no_memory_cleaning"], include_overall=False)
+    single_pairs = {(row["method"], int(row["n"])) for row in single_source}
+    assert pooled_source_pairs == single_pairs
 
 
 def test_diagnosis_match_substring():
@@ -180,6 +272,44 @@ def test_cdr_and_counterfactual_use_recalled_diagnosis_list_items():
     assert summary["counterfactual_pass_rate"] == 1.0
     assert summary["counterfactual_robustness_score"] == 1.0
     assert summary["counterfactual_robustness_proxy"] == 1.0
+
+
+def test_profile_inapplicable_diagnosis_metrics_are_not_forced_to_zero():
+    case = {
+        "case_id": "wiki_1",
+        "labels": {
+            "primary_diagnosis": (
+                "A long encyclopedic paragraph that should not be scored as a diagnosis label because "
+                "it is far too verbose and descriptive for a clinical entity metric"
+            ),
+            "diagnosis_list": [],
+            "label_aliases": [],
+        },
+        "qa_tasks": [{"type": "CDR", "answer": "same long paragraph"}],
+        "task_profile": "medical_answer_entity",
+        "data_quality_flags": {"diagnosis_metric_applicable": False},
+        "expected_memory_ops": [],
+        "counterfactuals": [],
+    }
+    pred = {
+        "case_id": "wiki_1",
+        "method": "direct_deepseek",
+        "primary_diagnosis": "squamous cell carcinoma",
+        "diagnosis_list": ["squamous cell carcinoma"],
+        "evidence": [],
+        "usage": {"total_tokens": 3},
+    }
+
+    result = evaluate_predictions([case], [pred])
+    row = result["case_rows"][0]
+    summary = result["summary"][0]
+
+    assert diagnosis_metrics_applicable(case) is False
+    assert row["primary_correct"] is None
+    assert row["diagnosis_f1"] is None
+    assert row["cdr_f1"] is None
+    assert summary["diagnosis_metric_coverage"] == 0.0
+    assert summary["primary_diagnosis_top1_accuracy"] is None
 
 
 def test_stale_memory_metrics_reward_revision_and_fact_preservation():
@@ -360,15 +490,79 @@ def test_leakage_audit_and_memory_confusion_are_offline_only():
         "memory_ops": [{"op": "Revise", "target": "poison_1"}],
     }
     assert build_leakage_audit([case], [pred]) == {
+        "critical_leakage_count": 0,
         "runtime_gold_mentions": 0,
+        "runtime_gold_markers": 0,
         "prompt_memory_ops_gold_mentions": 0,
         "counterfactual_runtime_gold_mentions": 0,
+        "leaked_primary_selection_sources": 0,
+        "leaked_prediction_candidate_mentions": 0,
         "poison_expected_op": 0,
         "poison_revised_claim": 0,
         "poison_expected_memory_ops": 0,
         "source_real_false": 0,
     }
     assert build_memory_op_confusion([case], [pred]) == {"Revise->Revise": 1}
+
+
+def test_leakage_audit_flags_gold_candidate_markers():
+    case = {
+        "case_id": "case_1",
+        "labels": {"primary_diagnosis": "mite", "diagnosis_list": ["mite"]},
+        "events": [{"text": "Assessment entity candidate: mite"}],
+        "memory_seed": [],
+        "poison_records": [],
+    }
+    pred = {
+        "case_id": "case_1",
+        "method": "medimem_topk3_round1",
+        "primary_selection_pass": {"source": "assessment_entity_candidate"},
+    }
+    audit = build_leakage_audit([case], [pred])
+    assert audit["runtime_gold_markers"] == 1
+    assert audit["leaked_primary_selection_sources"] == 1
+    assert audit["critical_leakage_count"] == 2
+
+
+def test_detail_leakage_audit_downgrades_short_label_false_positive():
+    case = {
+        "case_id": "medmcqa_0001",
+        "labels": {"primary_diagnosis": "C", "diagnosis_list": ["C"], "label_aliases": ["C"]},
+        "answer_options": [{"label": "C", "text": "Asthma"}],
+        "events": [{"text": "Clinical question with option C visible."}],
+        "memory_seed": [],
+        "poison_records": [],
+        "data_quality_flags": {"source_dataset": "medmcqa", "source_type": "medical_mcqa"},
+    }
+    pred = {
+        "case_id": "medmcqa_0001",
+        "method": "full_medimem_topk3_round1",
+        "prompt_memory_ops": [{"target": "card_C", "op": "Keep"}],
+    }
+    details = build_leakage_audit_details([case], [pred])
+    summary = summarize_leakage_audit_details(details)
+    assert summary["needs_review_count"] == 0
+    assert summary["short_label_false_positive_count"] >= 1
+
+
+def test_detail_leakage_audit_marks_prompt_gold_entity_for_review():
+    case = {
+        "case_id": "medqa_0001",
+        "labels": {"primary_diagnosis": "Nitrofurantoin", "diagnosis_list": ["Nitrofurantoin"]},
+        "events": [{"text": "Clinical question about cystitis with answer options."}],
+        "memory_seed": [],
+        "poison_records": [],
+        "data_quality_flags": {"source_dataset": "medqa", "source_type": "medical_mcqa"},
+    }
+    pred = {
+        "case_id": "medqa_0001",
+        "method": "full_medimem_topk3_round1",
+        "prompt_memory_ops": [{"target": "poison_1", "op": "Revise", "safe_note": "Nitrofurantoin"}],
+    }
+    details = build_leakage_audit_details([case], [pred])
+    summary = summarize_leakage_audit_details(details)
+    assert summary["critical_leakage_count"] == 0
+    assert summary["needs_review_count"] == 1
 
 
 def test_full_ours_merged_aggregates_dynamic_topk_rows():

@@ -11,30 +11,87 @@ import requests
 
 
 DEFAULT_HF_DATASET_SERVER = "https://datasets-server.huggingface.co"
-PMOA_CACHE_NAMES = ["pmoa_tts.json", "pmoa-tts.json", "snoroozi_pmoa-tts.json"]
-PMC_CACHE_NAMES = ["pmc_patients.json", "PMC-Patients.json", "aisc-team-b1_PMC-Patients.json"]
+PMOA_CACHE_NAMES = [
+    "pmoa_tts.json",
+    "pmoa-tts.json",
+    "snoroozi_pmoa-tts.json",
+    "hf_downloads/snoroozi__pmoa-tts/data/train_DSR1-00000-of-00001.parquet",
+]
+PMC_CACHE_NAMES = [
+    "pmc_patients.json",
+    "PMC-Patients.json",
+    "aisc-team-b1_PMC-Patients.json",
+    "hf_downloads/aisc-team-b1__PMC-Patients/data/train-00000-of-00002.parquet",
+    "hf_downloads/aisc-team-b1__PMC-Patients/data/train-00001-of-00002.parquet",
+]
+HF_CACHE_NAMES: dict[str, list[str]] = {
+    "openlifescienceai/medmcqa": [
+        "medmcqa.json",
+        "openlifescienceai_medmcqa.json",
+        "hf_downloads/openlifescienceai__medmcqa/data/train-00000-of-00001.parquet",
+    ],
+    "openlifescienceai/medqa": [
+        "medqa.json",
+        "openlifescienceai_medqa.json",
+        "hf_downloads/openlifescienceai__medqa/data/train-00000-of-00001.parquet",
+    ],
+    "lavita/ChatDoctor-HealthCareMagic-100k": [
+        "chatdoctor_healthcaremagic.json",
+        "ChatDoctor-HealthCareMagic-100k.json",
+        "lavita_ChatDoctor-HealthCareMagic-100k.json",
+        "hf_downloads/lavita__ChatDoctor-HealthCareMagic-100k/data/train-00000-of-00001-5e7cb295b9cff0bf.parquet",
+    ],
+    "medalpaca/medical_meadow_wikidoc": [
+        "medical_meadow_wikidoc.json",
+        "medalpaca_medical_meadow_wikidoc.json",
+        "hf_downloads/medalpaca__medical_meadow_wikidoc/medical_meadow_wikidoc.json",
+    ],
+    "omi-health/medical-dialogue-to-soap-summary": [
+        "medical_dialogue_to_soap.json",
+        "medical-dialogue-to-soap-summary.json",
+        "omi-health_medical-dialogue-to-soap-summary.json",
+        "hf_downloads/omi-health__medical-dialogue-to-soap-summary/train.json",
+    ],
+}
+
+
+def parse_cached_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:  # pragma: no cover - depends on server data runtime
+            raise RuntimeError(f"Parquet cache requires pyarrow: {path}") from exc
+        return [row for row in pq.read_table(path).to_pylist() if isinstance(row, dict)]
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        raw_rows = data["rows"]
+        rows = [item.get("row") if isinstance(item, dict) and "row" in item else item for item in raw_rows]
+    elif isinstance(data, list):
+        rows = [item.get("row") if isinstance(item, dict) and "row" in item else item for item in data]
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def load_cached_rows(cache_dir: str | Path | None, names: list[str], n: int) -> list[dict[str, Any]]:
     if not cache_dir:
         return []
     root = Path(cache_dir)
+    best: list[dict[str, Any]] = []
     for name in names:
         path = root / name
         if not path.exists():
             continue
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if isinstance(data, dict) and isinstance(data.get("rows"), list):
-            raw_rows = data["rows"]
-            rows = [item.get("row") if isinstance(item, dict) and "row" in item else item for item in raw_rows]
-        elif isinstance(data, list):
-            rows = [item.get("row") if isinstance(item, dict) and "row" in item else item for item in data]
-        else:
-            rows = []
-        out = [row for row in rows if isinstance(row, dict)]
-        if out:
+        out = parse_cached_rows(path)
+        if len(out) >= n:
             return out[:n]
-    return []
+        if len(out) > len(best):
+            best = out
+    return best[:n]
 
 
 def hf_json(endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -83,8 +140,13 @@ def fetch_hf_rows(
     preferred_splits: list[str],
     n: int,
     notes: list[str],
+    cache_dir: str | Path | None = None,
     page_size: int = 100,
 ) -> list[dict[str, Any]]:
+    cached = load_cached_rows(cache_dir, HF_CACHE_NAMES.get(dataset, []), n)
+    if cached:
+        notes.append(f"{dataset}: loaded {len(cached)} rows from cache {cache_dir}.")
+        return cached
     discovered = hf_dataset_splits(dataset)
     split_order: list[tuple[str, str]] = []
     for preferred in preferred_splits:

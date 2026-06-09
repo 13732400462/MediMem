@@ -454,7 +454,10 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
     diagnoses = _diagnoses(pmoa_row)
     labs = _synthetic_labs(diagnoses, events)
     task_profile = str(pmoa_row.get("_task_profile") or DEFAULT_TASK_PROFILE)
-    primary = choose_primary_diagnosis(events, diagnoses) if task_profile == LONGITUDINAL_DIAGNOSIS else (diagnoses[0] if diagnoses else "Medical answer entity")
+    if pmoa_row.get("_prefer_explicit_primary"):
+        primary = diagnoses[0] if diagnoses else "Medical answer entity"
+    else:
+        primary = choose_primary_diagnosis(events, diagnoses) if task_profile == LONGITUDINAL_DIAGNOSIS else (diagnoses[0] if diagnoses else "Medical answer entity")
     label_aliases = as_text_list(pmoa_row.get("_label_aliases")) or [primary]
     if primary and not any(normalize_text(primary) == normalize_text(d) for d in diagnoses):
         diagnoses = [primary] + diagnoses
@@ -538,6 +541,7 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
             "label_fragment_like": is_fragment_like_label(primary),
             "species_context": infer_species_context(pmoa_row, events),
             "task_profile": task_profile,
+            "diagnosis_metric_applicable": bool(pmoa_row.get("_diagnosis_metric_applicable", True)),
         },
     }
     return case

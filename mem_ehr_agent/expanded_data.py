@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,18 @@ from typing import Any
 from .data_builder import build_case, write_prefix_slices
 from .data_sources import fetch_hf_rows, fetch_pmc_patient_rows, fetch_pmoa_rows
 from .io_utils import ensure_dir, write_jsonl, write_text
+from .medical_terms import canonicalize_diagnosis
+from .style_policy import learn_source_style_policy
 from .task_profiles import task_profile_for_source
+
+
+GOLD_ONLY_EVIDENCE_PREFIXES = (
+    "Assessment entity candidate",
+    "Reference answer evidence",
+    "Doctor assessment",
+    "Correct answer",
+    "Correct option",
+)
 
 
 @dataclass(frozen=True)
@@ -98,9 +111,43 @@ def stable_source_id(source_name: str, row: dict[str, Any], idx: int) -> str:
     return f"{source_name}-{idx:06d}-{digest}"
 
 
+def source_row_identity(row: dict[str, Any]) -> str:
+    for key in ("id", "case_report_id", "pmc_id", "patient_uid", "patient_id"):
+        value = row.get(key)
+        if value not in {None, ""}:
+            return f"{key}:{value}"
+    return "sha1:" + hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def row_field_value(row: dict[str, Any], key: str) -> Any:
+    if key in row:
+        return row.get(key)
+    data = row.get("data")
+    if not isinstance(data, dict):
+        return None
+    aliases = {
+        "question": ("Question",),
+        "answer": ("Correct Answer", "answer"),
+        "target": ("Correct Answer", "target"),
+        "cop": ("Correct Option",),
+        "answer_idx": ("Correct Option",),
+        "opa": ("A",),
+        "opb": ("B",),
+        "opc": ("C",),
+        "opd": ("D",),
+    }
+    options = data.get("Options") if isinstance(data.get("Options"), dict) else {}
+    for alias in aliases.get(key, (key,)):
+        if alias in data:
+            return data.get(alias)
+        if alias in options:
+            return options.get(alias)
+    return None
+
+
 def text_value(row: dict[str, Any], *keys: str) -> str:
     for key in keys:
-        value = row.get(key)
+        value = row_field_value(row, key)
         if isinstance(value, str) and value.strip():
             return re.sub(r"\s+", " ", value).strip()
         if isinstance(value, (int, float)):
@@ -115,7 +162,7 @@ def option_answer(row: dict[str, Any]) -> str:
         text_value(row, "opc", "C"),
         text_value(row, "opd", "D"),
     ]
-    raw = row.get("cop", row.get("answer_idx", row.get("answer")))
+    raw = row_field_value(row, "cop") or row_field_value(row, "answer_idx") or row_field_value(row, "answer")
     if isinstance(raw, int) and 0 <= raw < len(options) and options[raw]:
         return options[raw]
     if isinstance(raw, str):
@@ -146,7 +193,7 @@ def answer_options(row: dict[str, Any]) -> list[dict[str, str]]:
 def option_aliases(row: dict[str, Any], answer: str) -> list[str]:
     aliases = [answer] if answer else []
     options = answer_options(row)
-    raw = row.get("cop", row.get("answer_idx", row.get("answer")))
+    raw = row_field_value(row, "cop") or row_field_value(row, "answer_idx") or row_field_value(row, "answer")
     label_to_idx = {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "0": 0, "1": 1, "2": 2, "3": 3, "4": 4}
     if isinstance(raw, int) and 0 <= raw < len(options):
         aliases.append(options[raw]["label"])
@@ -194,7 +241,59 @@ def split_sentences(text: str, *, limit: int = 8) -> list[str]:
     return chunks[:limit] if chunks else ([text.strip()] if text.strip() else [])
 
 
-def diagnosis_from_text(text: str, fallback: str) -> list[str]:
+PLACEHOLDER_LABEL_RE = re.compile(
+    r"^(?:"
+    r"(?:medical_)?(?:answer entity|instruction|dialogue|dialogue summary)|"
+    r"(?:medqa|medmcqa|medical_meadow_wikidoc|chatdoctor_healthcaremagic|medical_dialogue_to_soap)\s+sample\s+\d+|"
+    r"(?:this\s+)?question truthfully|medical questions based on the patient|"
+    r"dataset:\s*|source type:"
+    r")",
+    flags=re.I,
+)
+
+
+def compact_entity(text: str, *, max_words: int = 10, max_chars: int = 90) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;\"'")
+    cleaned = re.sub(r"^(?:the|a|an|your|patient'?s)\s+", "", cleaned, flags=re.I)
+    cleaned = re.split(
+        r"\s+(?:because|which|that|when|while|although|however|therefore|with evidence of|may be|can be|is classified|are classified|classified according)\s+",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    cleaned = re.split(
+        r"\s+(?:is used to|are used to|is part of|are part of|is associated with|are associated with|accounting for|should be|needs to be)\s+",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    cleaned = re.sub(r"\s*\([A-Z0-9 -]{2,12}\)\s*$", "", cleaned).strip()
+    words = cleaned.split()
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words])
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rsplit(" ", 1)[0].strip()
+    return canonicalize_diagnosis(cleaned).strip(" .,:;\"'")
+
+
+def is_bad_label(text: str) -> bool:
+    label = str(text or "").strip()
+    if not label:
+        return True
+    if label.lower() in {"there", "this", "that", "these", "those", "it", "hi dr age", "bites"}:
+        return True
+    if PLACEHOLDER_LABEL_RE.search(label):
+        return True
+    if len(label) > 120 or len(label.split()) > 16:
+        return True
+    return False
+
+
+def is_question_like_label(text: str) -> bool:
+    return bool(re.match(r"^\s*(?:what|how|which|when|where|why|can you|could you|provide|describe)\b", str(text or ""), flags=re.I))
+
+
+def diagnosis_from_text(text: str, fallback: str, *, allow_long_fallback: bool = False) -> list[str]:
     cleaned = re.sub(r"\s+", " ", text).strip(" .,:;")
     if not cleaned:
         return [fallback]
@@ -206,39 +305,200 @@ def diagnosis_from_text(text: str, fallback: str) -> list[str]:
     for pattern in patterns:
         match = re.search(pattern, cleaned, flags=re.I)
         if match:
-            candidates.append(match.group(1).strip())
+            candidates.append(compact_entity(match.group(1)))
     if not candidates:
-        candidates.append(cleaned[:120])
-    return [candidate for candidate in candidates if candidate] or [fallback]
+        candidates.append(cleaned[:120] if allow_long_fallback else compact_entity(cleaned))
+    usable = [candidate for candidate in candidates if candidate and not is_bad_label(candidate)]
+    fallback_compact = compact_entity(fallback)
+    return usable or ([fallback_compact] if fallback_compact and not is_bad_label(fallback_compact) else ["Medical answer entity"])
+
+
+def clean_entity_candidate(text: str, *, max_words: int = 10, max_chars: int = 90) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;")
+    cleaned = re.split(
+        r"\b(?:which|that|but|although|while|whereas|and antibiotic|and was|and were|at our|on a|on an|based on)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    cleaned = re.sub(r"^(?:the\s+)?(?:presence of|diagnosis of|diagnosed with|diagnosed as)\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.I)
+    return compact_entity(cleaned, max_words=max_words, max_chars=max_chars)
+
+
+def pmc_diagnosis_entities(title: str, patient: str) -> list[str]:
+    text = re.sub(r"\s+", " ", " ".join(part for part in [title, patient] if part)).strip()
+    patterns = [
+        r"(?:diagnosis of|diagnosed with|diagnosed as|consistent with|compatible with)\s+([^.;]+)",
+        r"(?:secondary to|caused by|due to)\s+([^.;]+)",
+        r"(?:presence of)\s+([^.;]+)",
+        r"\b(wet\s+AMD|dry\s+AMD|low-grade\s+glioma|septic shock|epilepsy)\b",
+    ]
+    out: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            entity = clean_entity_candidate(match.group(1))
+            if entity and not is_bad_label(entity):
+                out.append(entity)
+        if out:
+            break
+    if not out:
+        out.extend(diagnosis_from_text(title, fallback="Complex patient summary diagnosis"))
+    return dedupe_text(out)[:3]
+
+
+def chatdoctor_assessment_entities(response: str, question: str = "") -> list[str]:
+    text = re.sub(r"\s+", " ", str(response or "")).strip()
+    text = re.sub(r"^(?:hi|hello|dear)[,.\s]+(?:thank you[^.]*\.)?", "", text, flags=re.I).strip()
+    patterns = [
+        r"(?:most likely cause|likely cause|probable cause|possible cause)\s+(?:(?:of|for) [^.;]{1,80}?\s+)?(?:is|would be|could be)\s+([^.;]+)",
+        r"(?:diagnosis|impression|assessment)\s+(?:is|would be|could be|:)\s+([^.;]+)",
+        r"(?:seems|appears)\s+(?:that\s+)?(?:you|your child|your kid|the patient|he|she|it)?\s*(?:is|are|may be|might be)?\s*(?:having|suffering from|with)?\s+([^.;]+)",
+        r"(?:suggestive of|consistent with|due to)\s+([^.;]+)",
+        r"(?:may be having|might be having|could be having|having)\s+([^.;]+)",
+    ]
+    out: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            entity = compact_entity(match.group(1), max_words=8, max_chars=80)
+            if entity and not is_bad_label(entity):
+                out.append(entity)
+    if not out:
+        for sentence in split_sentences(text, limit=10):
+            if re.search(r"\b(thank|hello|hi\b|understand|consult|regards)\b", sentence, flags=re.I):
+                continue
+            if not re.search(
+                r"\b(diagnos|lesion|lump|infection|effusion|cancer|metastasis|viral|diarrhea|bronchiolitis|vertigo|syndrome|asthma|ulcer|fracture|tumou?r)\b",
+                sentence,
+                flags=re.I,
+            ):
+                continue
+            entity = compact_entity(sentence, max_words=8, max_chars=80)
+            if entity and not is_bad_label(entity):
+                out.append(entity)
+                break
+    if not out and not is_bad_label(question):
+        out.extend(diagnosis_from_text(question, fallback="clinical assessment"))
+    return dedupe_text(out)[:4]
+
+
+def wikidoc_answer_entities(answer: str, question: str = "", subject: str = "") -> list[str]:
+    text = re.sub(r"\s+", " ", str(answer or "")).strip()
+    patterns = [
+        r"^([A-Z][A-Za-z0-9 -]+(?:cancer|carcinoma|tumou?r|tumors?|disease|syndrome|infection|deficiency|hypotension|vulvovaginitis|asthma|diabetes|hepatitis|anemia|inhibitors?)(?: of the [A-Za-z -]+)?)\b",
+        r"^(?:The\s+)?([^.;]{3,80}?)\s+(?:is|are|may be|can be|refers to|accounting for)\b",
+        r"(?:called|known as|termed)\s+([^.;]{3,80})",
+    ]
+    topic = wikidoc_question_topic_entity(question)
+    out: list[str] = [topic] if topic else []
+    for pattern in patterns:
+        if out:
+            break
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            entity = compact_entity(match.group(1), max_words=10, max_chars=90)
+            if entity and not is_bad_label(entity):
+                out.append(entity)
+                break
+    if not out:
+        topic = wikidoc_question_topic_entity(question)
+        if topic:
+            out.append(topic)
+    if not out and subject and not is_bad_label(subject) and not is_question_like_label(subject):
+        out.append(compact_entity(subject, max_words=8, max_chars=80))
+    if out == ["Medical answer entity"] and text:
+        out = [compact_entity(text, max_words=10, max_chars=90)]
+    cleaned = [item for item in out if item and not is_question_like_label(item)]
+    if not cleaned and text:
+        entity = compact_entity(text, max_words=10, max_chars=90)
+        if entity and not is_question_like_label(entity) and not is_bad_label(entity):
+            cleaned.append(entity)
+    return dedupe_text(cleaned or ["Medical answer entity"])[:3]
+
+
+def wikidoc_question_topic_entity(question: str) -> str:
+    q = re.sub(r"\s+", " ", str(question or "")).strip(" .?")
+    if not q:
+        return ""
+    patterns = [
+        r"(?:how is|how are)\s+(.+?)\s+(?:classified|diagnosed|treated|managed)$",
+        r"(?:meaning|definition|summary|overview|information|history|symptoms|treatment|management|screening|physical examination|medical treatment|recommended medical treatment)\s+(?:of|for|about|on)\s+(.+)$",
+        r"(?:what information (?:is there|is available)|can you provide information|could you provide information)\s+(?:about|on)\s+(.+)$",
+        r"(?:what is|what are|could you explain|can you explain|could you tell me what|what does)\s+(.+?)\s+(?:mean|means|entail|refer to)$",
+        r"(?:what is|what are)\s+(.+)$",
+        r"(?:for|of|about|on)\s+([A-Za-z][A-Za-z0-9' -]{3,120})$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q, flags=re.I)
+        if not match:
+            continue
+        entity = match.group(1)
+        entity = re.sub(r"^(?:the|a|an)\s+", "", entity, flags=re.I)
+        entity = re.split(r"\s+(?:and how|and what|using|in physiology|in medicine|currently accessible)\b", entity, maxsplit=1, flags=re.I)[0]
+        entity = re.sub(r"\s+(?:classified|diagnosed|treated|managed)$", "", entity, flags=re.I)
+        entity = compact_entity(entity, max_words=10, max_chars=90)
+        if entity and not is_bad_label(entity) and not is_question_like_label(entity):
+            return entity
+    return ""
+
+
+def dedupe_text(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        key = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
+        if text and key and key not in seen:
+            out.append(text)
+            seen.add(key)
+    return out
+
+
+def clamp_event_text(text: str, *, max_chars: int = 900) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clipped = cleaned[:max_chars].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..."
 
 
 def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx: int) -> dict[str, Any]:
     source_id = stable_source_id(spec.name, row, idx)
-    title = text_value(row, "title", "question", "instruction", "input", "chief_complaint") or f"{spec.name} sample {idx}"
-    question = text_value(row, "question", "instruction", "input", "dialogue", "dialog")
+    title = text_value(row, "title", "question", "input", "instruction", "chief_complaint") or f"{spec.name} sample {idx}"
+    question = text_value(row, "question", "input", "dialogue", "dialog", "instruction")
     context = text_value(row, "context", "patient", "note", "conversation", "dialogue", "dialog")
     answer = option_answer(row)
     options = answer_options(row)
+    if spec.source_type != "medical_mcqa":
+        answer = text_value(row, "answer", "target")
     explanation = text_value(row, "exp", "explanation", "output", "response", "soap_summary", "summary")
     safe_explanation = scrub_answer_explanation(explanation, answer) if spec.source_type == "medical_mcqa" else explanation
     subject = text_value(row, "subject_name", "topic_name", "category", "department")
-    diagnosis_seed = answer or explanation or subject or title
-    diagnoses = diagnosis_from_text(diagnosis_seed, fallback=subject or "Medical answer entity")
+    if spec.name == "chatdoctor_healthcaremagic":
+        diagnoses = chatdoctor_assessment_entities(explanation or answer, question or context or title)
+    elif spec.name == "medical_meadow_wikidoc":
+        diagnoses = wikidoc_answer_entities(explanation or answer, question or title, subject)
+    elif spec.source_type == "medical_mcqa" and answer:
+        diagnoses = [clamp_event_text(answer, max_chars=140).strip(" .,:;")]
+    else:
+        diagnosis_seed = answer or explanation or subject or title
+        diagnoses = diagnosis_from_text(diagnosis_seed, fallback=subject or "Medical answer entity")
+    diagnosis_metric_applicable = not any(is_bad_label(item) or is_question_like_label(item) for item in diagnoses)
 
     event_texts = []
-    if title:
-        event_texts.append(f"Initial clinical task/source title: {title}")
+    if title and not re.fullmatch(r"(?:answer this question truthfully|if you are a doctor.*)", title, flags=re.I):
+        event_texts.append(clamp_event_text(f"Initial clinical task/source title: {title}"))
     if context and context != question:
-        event_texts.extend(split_sentences(context, limit=4))
+        event_texts.extend(clamp_event_text(item) for item in split_sentences(context, limit=4))
     if question:
-        event_texts.append(f"Clinical question or presentation: {question}")
+        event_texts.append(clamp_event_text(f"Clinical question or presentation: {question}"))
     if options:
         option_text = "; ".join(f"{item['label']}. {item['text']}" for item in options)
-        event_texts.append(f"Answer options: {option_text}")
-    if safe_explanation and safe_explanation != answer:
-        event_texts.extend(split_sentences(safe_explanation, limit=3))
+        event_texts.append(clamp_event_text(f"Answer options: {option_text}"))
+    # Gold/reference answer text is label-only under the no-leak protocol. Keep it
+    # out of runtime events even when it would be useful extraction evidence.
     if len(event_texts) < 3:
-        event_texts.extend([f"Source type: {spec.source_type}", f"Dataset: {spec.name}"])
+        event_texts.extend([f"Source type: {spec.source_type}", "No additional patient-side source text was available."])
 
     return {
         "case_report_id": source_id,
@@ -255,6 +515,13 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
         "_task_profile": task_profile_for_source(spec.name),
         "_answer_options": options,
         "_label_aliases": option_aliases(row, answer),
+        "_diagnosis_metric_applicable": diagnosis_metric_applicable,
+        "_gold_only": {
+            "answer": answer,
+            "explanation": explanation,
+            "safe_explanation": safe_explanation,
+            "diagnoses": diagnoses,
+        },
     }
 
 
@@ -262,8 +529,8 @@ def pmc_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx: int
     source_id = stable_source_id(spec.name, row, idx)
     patient = text_value(row, "patient", "summary", "title") or f"PMC patient sample {idx}"
     title = text_value(row, "title") or patient[:120]
-    diagnoses = diagnosis_from_text(title, fallback="Complex patient summary diagnosis")
-    events = split_sentences(patient, limit=10)
+    diagnoses = pmc_diagnosis_entities(title, patient)
+    events = [clamp_event_text(item) for item in split_sentences(patient, limit=10)]
     if len(events) < 3:
         events.extend([title, "Longitudinal patient summary context"])
     return {
@@ -281,6 +548,7 @@ def pmc_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx: int
         "_task_profile": task_profile_for_source(spec.name),
         "_answer_options": [],
         "_label_aliases": diagnoses,
+        "_prefer_explicit_primary": True,
     }
 
 
@@ -291,21 +559,88 @@ def rows_for_medical_source(
     cache_dir: str | Path | None = None,
     require_real_data: bool = False,
     notes: list[str] | None = None,
+    random_seed: int | None = None,
 ) -> list[dict[str, Any]]:
     notes = notes if notes is not None else []
     spec = MEDICAL_DATASET_SPECS[source_name]
+    pool_multiplier = max(1, int(os.getenv("MEDICAL_SOURCE_SAMPLE_POOL_MULTIPLIER", "5") or 5))
+    request_n = n * pool_multiplier if random_seed is not None else n
     if source_name == "pmoa_tts":
-        rows = fetch_pmoa_rows(n, notes, cache_dir=cache_dir)
+        rows = fetch_pmoa_rows(request_n, notes, cache_dir=cache_dir)
     elif source_name == "pmc_patients":
-        rows = fetch_pmc_patient_rows(n, notes, cache_dir=cache_dir)
+        rows = fetch_pmc_patient_rows(request_n, notes, cache_dir=cache_dir)
     else:
         if not spec.hf_dataset:
             rows = []
         else:
-            rows = fetch_hf_rows(spec.hf_dataset, preferred_splits=list(spec.preferred_splits), n=n, notes=notes)
+            rows = fetch_hf_rows(
+                spec.hf_dataset,
+                preferred_splits=list(spec.preferred_splits),
+                n=request_n,
+                notes=notes,
+                cache_dir=cache_dir,
+            )
     if require_real_data and len(rows) < n:
         raise RuntimeError(f"{source_name} requires {n} real rows but only {len(rows)} were loaded.")
+    if random_seed is not None and len(rows) > n:
+        pool_size = len(rows)
+        rng = random.Random(f"{random_seed}:{source_name}")
+        rows = rng.sample(rows, n)
+        notes.append(f"{source_name}: sampled {n} rows from pool={pool_size} with seed={random_seed}.")
     return rows[:n]
+
+
+def rows_for_medical_source_split(
+    source_name: str,
+    n: int,
+    *,
+    cache_dir: str | Path | None = None,
+    require_real_data: bool = False,
+    notes: list[str] | None = None,
+    random_seed: int | None = None,
+    style_n: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    notes = notes if notes is not None else []
+    spec = MEDICAL_DATASET_SPECS[source_name]
+    pool_multiplier = max(2, int(os.getenv("MEDICAL_SOURCE_SAMPLE_POOL_MULTIPLIER", "5") or 5))
+    style_target = max(0, int(style_n if style_n is not None else min(max(n, 50), 500)))
+    request_n = max(n + style_target, n * pool_multiplier) if random_seed is not None else n + style_target
+    if source_name == "pmoa_tts":
+        pool = fetch_pmoa_rows(request_n, notes, cache_dir=cache_dir)
+    elif source_name == "pmc_patients":
+        pool = fetch_pmc_patient_rows(request_n, notes, cache_dir=cache_dir)
+    else:
+        pool = (
+            fetch_hf_rows(
+                spec.hf_dataset,
+                preferred_splits=list(spec.preferred_splits),
+                n=request_n,
+                notes=notes,
+                cache_dir=cache_dir,
+            )
+            if spec.hf_dataset
+            else []
+        )
+    if require_real_data and len(pool) < n:
+        raise RuntimeError(f"{source_name} requires {n} real rows but only {len(pool)} were loaded.")
+    if random_seed is None:
+        return pool[:n], pool[n : n + style_target]
+    rng = random.Random(f"{random_seed}:{source_name}:noleak_split")
+    indices = list(range(len(pool)))
+    rng.shuffle(indices)
+    test_indices = set(indices[: min(n, len(indices))])
+    test_rows = [pool[i] for i in indices[: min(n, len(indices))]]
+    test_keys = {source_row_identity(row) for row in test_rows}
+    style_rows = [
+        pool[i]
+        for i in indices[min(n, len(indices)) :]
+        if i not in test_indices and source_row_identity(pool[i]) not in test_keys
+    ][:style_target]
+    notes.append(
+        f"{source_name}: sampled test={len(test_rows)} style_train_dev={len(style_rows)} "
+        f"from pool={len(pool)} with seed={random_seed} under no-leak split."
+    )
+    return test_rows, style_rows
 
 
 def source_rows_to_cases(
@@ -314,6 +649,7 @@ def source_rows_to_cases(
     pmc_context_rows: list[dict[str, Any]],
     *,
     start_idx: int = 1,
+    style_policy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     spec = MEDICAL_DATASET_SPECS[source_name]
     cases: list[dict[str, Any]] = []
@@ -359,9 +695,131 @@ def source_rows_to_cases(
         flags["source_id"] = source_id
         flags["source_url"] = spec.url
         flags["task_profile"] = task_profile_for_source(spec.name)
+        flags["diagnosis_metric_applicable"] = bool(pmoa_like.get("_diagnosis_metric_applicable", True))
+        flags["no_leak_protocol"] = True
+        if style_policy:
+            flags["style_policy"] = style_policy
         case["task_profile"] = flags["task_profile"]
         cases.append(case)
     return cases
+
+
+def gold_labels_for_style_learning(source_name: str, rows: list[dict[str, Any]]) -> list[str]:
+    spec = MEDICAL_DATASET_SPECS[source_name]
+    labels: list[str] = []
+    for idx, row in enumerate(rows, start=1):
+        if source_name == "pmoa_tts":
+            raw = row.get("diagnoses") or row.get("diagnosis") or []
+            labels.extend([str(item) for item in raw] if isinstance(raw, list) else [str(raw)])
+        elif source_name == "pmc_patients":
+            labels.extend(pmc_row_to_pmoa_like(row, spec, idx).get("diagnoses") or [])
+        else:
+            labels.extend(generic_row_to_pmoa_like(row, spec, idx).get("diagnoses") or [])
+    return [item for item in labels if str(item or "").strip()]
+
+
+def normalized_leak_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())).strip()
+
+
+def visible_case_payload_for_leakage(case: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "events": [{"type": event.get("type"), "text": event.get("text")} for event in case.get("events", [])],
+        "memory_seed": case.get("memory_seed", []),
+        "poison_records": [
+            {
+                "text": poison.get("text"),
+                "supporting_evidence": poison.get("supporting_evidence", []),
+            }
+            for poison in case.get("poison_records", [])
+        ],
+        "counterfactuals": [
+            {"intervention": item.get("intervention")}
+            for item in case.get("counterfactuals", [])
+        ],
+    }
+
+
+def leakage_findings_for_case(case: dict[str, Any]) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    visible_json = json.dumps(visible_case_payload_for_leakage(case), ensure_ascii=False)
+    visible_norm = normalized_leak_text(visible_json)
+    marker_text = visible_json.lower()
+    for prefix in GOLD_ONLY_EVIDENCE_PREFIXES:
+        if prefix.lower() in marker_text:
+            findings.append({"case_id": str(case.get("case_id")), "kind": "gold_marker_visible", "value": prefix})
+    labels = case.get("labels") or {}
+    aliases = [labels.get("primary_diagnosis")] + list(labels.get("label_aliases") or [])
+    flags = case.get("data_quality_flags") or {}
+    source_type = str(flags.get("source_type") or "").strip()
+    strict_alias_sources = {"medical_mcqa", "medical_instruction", "medical_dialogue", "medical_dialogue_summary"}
+    if source_type not in strict_alias_sources:
+        return findings
+    option_texts = {normalized_leak_text(item.get("text")) for item in case.get("answer_options") or []}
+    option_labels = {normalized_leak_text(item.get("label")) for item in case.get("answer_options") or []}
+    question_or_title_text = " ".join(
+        str(event.get("text") or "")
+        for event in case.get("events", [])
+        if re.search(r"\b(?:Clinical question or presentation|Initial clinical task/source title)\b", str(event.get("text") or ""), flags=re.I)
+    )
+    question_or_title_norm = normalized_leak_text(question_or_title_text)
+    for alias in aliases:
+        alias_text = str(alias or "").strip()
+        alias_norm = normalized_leak_text(alias_text)
+        if len(alias_norm) < 4:
+            continue
+        allowed_option = alias_norm in option_texts or alias_norm in option_labels
+        if allowed_option and (case.get("data_quality_flags") or {}).get("source_type") == "medical_mcqa":
+            continue
+        if source_type == "medical_instruction" and alias_norm in question_or_title_norm:
+            continue
+        if alias_norm in visible_norm:
+            findings.append({"case_id": str(case.get("case_id")), "kind": "gold_alias_visible", "value": alias_text[:120]})
+    return findings
+
+
+def validate_medical_source_cases(source_name: str, cases: list[dict[str, Any]]) -> None:
+    if not cases:
+        raise RuntimeError(f"{source_name}: no cases were built.")
+    bad_labels = []
+    placeholder_answers = []
+    missing_profile = []
+    leakage_findings = []
+    for case in cases:
+        flags = case.get("data_quality_flags") or {}
+        profile = str(case.get("task_profile") or flags.get("task_profile") or "").strip()
+        if not profile:
+            missing_profile.append(case.get("case_id"))
+        primary = str((case.get("labels") or {}).get("primary_diagnosis") or "")
+        diagnosis_applicable = (case.get("data_quality_flags") or {}).get("diagnosis_metric_applicable") is not False
+        if is_bad_label(primary) and (diagnosis_applicable or PLACEHOLDER_LABEL_RE.search(primary)):
+            bad_labels.append({"case_id": case.get("case_id"), "primary_diagnosis": primary[:160]})
+        for qa in case.get("qa_tasks", []):
+            answer = str(qa.get("answer") or "")
+            if re.match(r"^\s*Dataset:\s*", answer, flags=re.I):
+                placeholder_answers.append({"case_id": case.get("case_id"), "qa_id": qa.get("qa_id"), "answer": answer})
+        leakage_findings.extend(
+            finding for finding in leakage_findings_for_case(case) if finding.get("kind") == "gold_marker_visible"
+        )
+    messages = []
+    if missing_profile:
+        messages.append(f"missing task_profile: {missing_profile[:5]}")
+    if placeholder_answers:
+        messages.append(f"placeholder qa answers: {placeholder_answers[:5]}")
+    if bad_labels:
+        messages.append(f"bad primary labels: {bad_labels[:5]}")
+    if leakage_findings:
+        messages.append(f"gold leakage in visible runtime fields: {leakage_findings[:5]}")
+    if messages:
+        raise RuntimeError(f"{source_name} data-quality gate failed; " + " | ".join(messages))
+
+
+def renumber_source_cases(source_name: str, cases: list[dict[str, Any]]) -> None:
+    for offset, case in enumerate(cases):
+        case["case_id"] = f"{source_name}_{offset + 1:04d}"
+        for qa in case.get("qa_tasks", []):
+            qa_type = str(qa.get("type") or "qa").lower()
+            qa["qa_id"] = f"{case['case_id']}_{qa_type}"
 
 
 def build_medical_ehr_pool(
@@ -371,6 +829,7 @@ def build_medical_ehr_pool(
     sources: list[str] | None = None,
     require_real_data: bool = False,
     cache_dir: str | Path | None = None,
+    random_seed: int | None = None,
 ) -> dict[str, Any]:
     source_names = sources or list(DEFAULT_MEDICAL_POOL_SOURCES)
     output = ensure_dir(output_dir)
@@ -379,25 +838,58 @@ def build_medical_ehr_pool(
         f"per_source_n={per_source_n}",
         f"sources={','.join(source_names)}",
     ]
+    if random_seed is not None:
+        notes.append(f"random_seed={random_seed}")
+    strict_no_leak_filter = str(os.getenv("MEDICAL_STRICT_NO_LEAK_FILTER", "0")).lower() in {"1", "true", "yes"}
+    candidate_n = per_source_n
+    if strict_no_leak_filter:
+        candidate_n = int(os.getenv("MEDICAL_STRICT_NO_LEAK_CANDIDATE_N", str(max(per_source_n + 100, per_source_n * 2))))
+        notes.append(f"strict_no_leak_filter=true candidate_n={candidate_n}")
     pmc_context = rows_for_medical_source(
         "pmc_patients",
         per_source_n,
         cache_dir=cache_dir,
         require_real_data=require_real_data,
         notes=notes,
+        random_seed=random_seed,
     )
     all_cases: list[dict[str, Any]] = []
     per_source_counts: dict[str, int] = {}
+    style_policies: dict[str, dict[str, Any]] = {}
     start_idx = 1
     for source_name in source_names:
-        rows = rows_for_medical_source(
+        rows, style_rows = rows_for_medical_source_split(
             source_name,
-            per_source_n,
+            candidate_n,
             cache_dir=cache_dir,
             require_real_data=require_real_data,
             notes=notes,
+            random_seed=random_seed,
+            style_n=min(max(per_source_n, 50), 500),
         )
-        cases = source_rows_to_cases(source_name, rows, pmc_context, start_idx=start_idx)
+        style_policy = learn_source_style_policy(
+            source_name,
+            task_profile_for_source(source_name),
+            gold_labels_for_style_learning(source_name, style_rows),
+            train_dev_count=len(style_rows),
+        )
+        style_policies[source_name] = style_policy
+        cases = source_rows_to_cases(source_name, rows, pmc_context, start_idx=start_idx, style_policy=style_policy)
+        if strict_no_leak_filter:
+            before = len(cases)
+            clean_cases = [case for case in cases if not leakage_findings_for_case(case)]
+            dropped = before - len(clean_cases)
+            notes.append(f"{source_name}: strict no-leak filter dropped={dropped} kept={len(clean_cases)} from candidates={before}.")
+            cases = clean_cases[:per_source_n]
+            if len(cases) < per_source_n:
+                raise RuntimeError(
+                    f"{source_name}: strict no-leak filter kept only {len(cases)} clean cases "
+                    f"from {before} candidates; need {per_source_n}."
+                )
+            renumber_source_cases(source_name, cases)
+        else:
+            cases = cases[:per_source_n]
+        validate_medical_source_cases(source_name, cases)
         start_idx += len(cases)
         per_source_counts[source_name] = len(cases)
         write_jsonl(output / f"{source_name}_{len(cases)}.jsonl", cases)
@@ -410,15 +902,19 @@ def build_medical_ehr_pool(
     manifest = {
         "track": "medical_ehr_pool",
         "per_source_n": per_source_n,
+        "random_seed": random_seed,
         "pooled_path": str(pooled_path),
         "sources": {
             name: {
                 "count": per_source_counts.get(name, 0),
                 "source_type": MEDICAL_DATASET_SPECS[name].source_type,
                 "url": MEDICAL_DATASET_SPECS[name].url,
+                "style_policy": style_policies.get(name, {}),
             }
             for name in source_names
         },
+        "no_leak_protocol": True,
+        "style_policies": style_policies,
         "pooled_prefix_sizes": pooled_sizes,
     }
     write_text(output / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
