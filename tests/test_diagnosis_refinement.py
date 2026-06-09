@@ -1,4 +1,5 @@
 from mem_ehr_agent.agents import (
+    answer_entity_source_candidates,
     evidence_driven_diagnosis_rerank,
     evidence_gated_diagnosis_recall,
     refine_diagnosis_list,
@@ -68,6 +69,9 @@ def test_requested_aliases_are_canonicalized():
     assert canonicalize_diagnosis("non-mucinous BAC") == "bronchioloalveolar carcinoma"
     assert canonicalize_diagnosis("azygos vein anomaly") == "azygos lobe"
     assert canonicalize_diagnosis("K-wire migration") == "k wire migration"
+    assert canonicalize_diagnosis("sHLH") == "hemophagocytic lymphohistiocytosis"
+    assert canonicalize_diagnosis("HCC hemorrhaging/rupture") == "hepatocellular carcinoma"
+    assert canonicalize_diagnosis("lower extremity DVT") == "deep vein thrombosis"
 
 
 def test_evidence_gated_recall_expands_list_without_changing_primary():
@@ -176,6 +180,44 @@ def test_medical_answer_entity_primary_can_be_non_disease_option():
     assert updated["diagnosis_granularity"] == "answer_entity"
 
 
+def test_medical_instruction_primary_uses_visible_question_topic_when_uncertain():
+    case = {
+        "case_id": "wikidoc_demo",
+        "task_profile": "medical_answer_entity",
+        "data_quality_flags": {
+            "source_type": "medical_instruction",
+            "source_dataset": "medical_meadow_wikidoc",
+            "no_leak_protocol": True,
+        },
+        "events": [
+            {
+                "event_id": "ev_title",
+                "time": 0,
+                "type": "clinical",
+                "text": "Initial clinical task/source title: What information is available on secondary hyperparathyroidism?",
+            },
+            {
+                "event_id": "ev_question",
+                "time": 0,
+                "type": "clinical",
+                "text": "Clinical question or presentation: What information is available on secondary hyperparathyroidism?",
+            },
+        ],
+    }
+    pred = {
+        "primary_diagnosis": "uncertain",
+        "diagnosis_list": ["uncertain"],
+        "evidence": ["The provided source is a clinical question."],
+        "reasoning_summary": "The answer entity is uncertain from the sparse prompt.",
+    }
+
+    updated = select_primary_for_task_profile(case, pred, evidence_notes=[], diagnosis_candidates=[])
+
+    assert updated["primary_diagnosis"] == "secondary hyperparathyroidism"
+    assert updated["primary_selection_pass"]["source"] == "visible_instruction_question_topic"
+    assert len(updated["diagnosis_list"]) <= 3
+
+
 def test_longitudinal_primary_selector_keeps_main_diagnosis_over_complication():
     case = {
         "case_id": "pmoa_demo",
@@ -201,6 +243,38 @@ def test_longitudinal_primary_selector_keeps_main_diagnosis_over_complication():
 
     assert updated["primary_diagnosis"] == "non small cell lung cancer"
     assert len(updated["diagnosis_list"]) <= 8
+
+
+def test_pmoa_primary_selector_prefers_disease_entity_over_stage_state():
+    case = {
+        "case_id": "pmoa_stage_demo",
+        "task_profile": "longitudinal_diagnosis",
+        "data_quality_flags": {"source_dataset": "pmoa_tts", "source_type": "longitudinal_case"},
+        "events": [
+            {
+                "event_id": "ev_path",
+                "time": 2,
+                "type": "pathology",
+                "text": "Pathology positive for squamous cell carcinoma and small cell carcinoma.",
+            },
+            {"event_id": "ev_stage", "time": 3, "type": "diagnosis", "text": "Stage IV disease was documented."},
+        ],
+    }
+    pred = {
+        "primary_diagnosis": "stage IV disease",
+        "diagnosis_list": ["stage IV disease", "pathology positive for squamous cell carcinoma", "COPD"],
+        "evidence": ["pathology positive for squamous cell carcinoma"],
+        "reasoning_summary": "Stage and pathology were both mentioned.",
+    }
+
+    updated = select_primary_for_task_profile(
+        case,
+        pred,
+        evidence_notes=[],
+        diagnosis_candidates=[{"event_id": "ev_stage", "time": 3, "text": "Stage IV disease was documented."}],
+    )
+
+    assert updated["primary_diagnosis"] == "squamous cell carcinoma"
 
 
 class CounterfactualClient:
@@ -313,3 +387,164 @@ def test_run_ours_keeps_counterfactual_audit_only_without_high_confidence_contra
     assert pred["primary_diagnosis"] == "pneumonia"
     assert round(pred["counterfactual_verification"]["cpg"], 2) == 0.10
     assert pred["counterfactual_revision_policy"] == "audit_only_unless_high_confidence_contradiction"
+
+
+def test_run_ours_risk_sample_skips_low_risk_counterfactual(tmp_path):
+    case = {
+        "case_id": "case_cf_skip",
+        "demographics": {},
+        "events": [
+            {"event_id": "ev_1", "time": 0, "type": "clinical", "text": "fever and cough"},
+            {"event_id": "ev_2", "time": 1, "type": "imaging", "text": "right lower lobe opacity"},
+            {"event_id": "ev_3", "time": 2, "type": "diagnosis", "text": "diagnosed with pneumonia"},
+        ],
+        "synthetic_labs": [],
+        "memory_seed": [],
+        "poison_records": [],
+        "counterfactuals": [{"intervention": "Remove or negate this evidence: right lower lobe opacity"}],
+    }
+    client = CounterfactualClient(
+        [
+            '{"primary_diagnosis":"pneumonia","diagnosis_list":["pneumonia"],"confidence":0.90,'
+            '"evidence":["right lower lobe opacity","fever and cough"],"reasoning_summary":"evidence supports pneumonia"}',
+            '{"primary_diagnosis":"pneumonia","diagnosis_list":["pneumonia"],"confidence":0.92,'
+            '"evidence":["right lower lobe opacity","fever and cough"],"reasoning_summary":"stable diagnosis"}',
+        ]
+    )
+
+    pred = run_ours(
+        case,
+        client,
+        memory_dir=tmp_path,
+        strategy={
+            "rounds": 1,
+            "temperature": 0.0,
+            "features": {
+                "top_k_is_auto": True,
+                "disable_memory_cleaning": True,
+                "counterfactual_policy": "risk_sample",
+                "counterfactual_sample_rate": 0.0,
+                "counterfactual_risk_threshold": 0.55,
+            },
+        },
+    )
+
+    assert len(client.messages) == 2
+    assert pred["counterfactual_verification"]["enabled"] is False
+    assert pred["counterfactual_verification"]["skip_reasons"] == ["low_risk_not_sampled"]
+    assert pred["counterfactual_revision_triggered"] is False
+
+
+def test_run_ours_medical_answer_entity_skips_second_pass_and_prefers_options(tmp_path):
+    case = {
+        "case_id": "case_mcqa",
+        "task_profile": "medical_answer_entity",
+        "demographics": {},
+        "events": [
+            {"event_id": "ev_1", "time": 0, "type": "clinical", "text": "Scabies is caused by which organism?"},
+            {"event_id": "ev_2", "time": 1, "type": "clinical", "text": "Answer options: A. Mite; B. Fungus; C. Virus; D. Bacterium"},
+        ],
+        "answer_options": [
+            {"label": "A", "text": "Mite"},
+            {"label": "B", "text": "Fungus"},
+            {"label": "C", "text": "Virus"},
+            {"label": "D", "text": "Bacterium"},
+        ],
+        "synthetic_labs": [],
+        "memory_seed": [],
+        "poison_records": [],
+        "counterfactuals": [{"intervention": "Remove or negate this evidence: mite"}],
+    }
+    client = CounterfactualClient(
+        [
+            '{"primary_diagnosis":"parasitic infestation","diagnosis_list":["Mite"],"confidence":0.70,'
+            '"evidence":["Answer options include Mite"],"reasoning_summary":"Mite is the answer entity"}',
+        ]
+    )
+
+    pred = run_ours(
+        case,
+        client,
+        memory_dir=tmp_path,
+        strategy={
+            "rounds": 1,
+            "temperature": 0.0,
+            "features": {
+                "top_k_is_auto": True,
+                "disable_memory_cleaning": True,
+                "disable_counterfactual_verification": True,
+            },
+        },
+    )
+
+    assert len(client.messages) == 1
+    assert pred["method"] == "medimem_topk8_round1"
+    assert pred["primary_diagnosis"] == "Mite"
+    assert pred["primary_selection_pass"]["source"] in {"answer_options", "model_list"}
+    assert pred["source_evidence_note_count"] == 0
+    assert pred["diagnosis_candidate_count"] == 0
+    assert pred["diagnosis_second_pass"] == {"enabled": False, "reason": "medical_answer_entity_option_locked"}
+
+
+def test_run_ours_pmc_patients_full_skips_memory_cleaning_by_default(tmp_path):
+    case = {
+        "case_id": "case_pmc",
+        "task_profile": "longitudinal_diagnosis",
+        "data_quality_flags": {"source_dataset": "pmc_patients"},
+        "demographics": {},
+        "events": [
+            {"event_id": "ev_1", "time": 0, "type": "clinical", "text": "Patient had fever and hypotension."},
+            {"event_id": "ev_2", "time": 1, "type": "diagnosis", "text": "Blood culture confirmed Neisseria meningitidis infection."},
+        ],
+        "synthetic_labs": [],
+        "memory_seed": [
+            {
+                "memory_id": "m1",
+                "summary": "Initial stale impression suggested viral illness.",
+                "status": "active",
+                "tags": ["initial_hypothesis"],
+                "confidence": 0.3,
+                "time_scope": {"start": 0},
+                "evidence_refs": ["ev_1"],
+            }
+        ],
+        "poison_records": [],
+        "counterfactuals": [{"intervention": "Remove culture result"}],
+    }
+    client = CounterfactualClient(
+        [
+            '{"primary_diagnosis":"Neisseria meningitidis infection","diagnosis_list":["Neisseria meningitidis infection"],'
+            '"confidence":0.80,"evidence":["Blood culture confirmed infection"],"reasoning_summary":"culture supported"}',
+        ]
+    )
+
+    pred = run_ours(
+        case,
+        client,
+        memory_dir=tmp_path,
+        strategy={
+            "rounds": 1,
+            "temperature": 0.0,
+            "features": {
+                "top_k_is_auto": True,
+                "disable_counterfactual_verification": True,
+            },
+        },
+    )
+
+    assert pred["memory_ops"] == []
+    assert pred["method"] == "medimem_topk8_round1"
+    assert pred["optimization_features"]["profile_adaptive_memory_cleaning"] is True
+    assert pred["primary_diagnosis"] == "Neisseria meningitidis infection"
+
+
+def test_answer_entity_source_candidates_ignore_gold_candidate_markers():
+    case = {
+        "events": [
+            {
+                "text": "Assessment entity candidate: What information is obtainable regarding bacterial vaginosis?",
+            }
+        ]
+    }
+
+    assert answer_entity_source_candidates(case) == []

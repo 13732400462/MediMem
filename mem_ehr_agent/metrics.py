@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .io_utils import ensure_dir
 from .medical_terms import canonicalize_diagnosis
+from .task_profiles import MEDICAL_ANSWER_ENTITY, case_task_profile
 
 COUNTERFACTUAL_CPG_THRESHOLD = 0.40
 
@@ -25,6 +27,7 @@ def is_medimem_method(method: Any) -> bool:
     )
 
 
+@lru_cache(maxsize=200_000)
 def norm(text: str) -> str:
     text = canonicalize_diagnosis(text)
     text = text.lower()
@@ -408,6 +411,8 @@ def counterfactual_metrics(pred: dict[str, Any]) -> dict[str, float]:
             "counterfactual_pass": 0.0,
             "counterfactual_robustness_score": 0.0,
             "counterfactual_revision": 0.0,
+            "counterfactual_evaluated": 0.0,
+            "counterfactual_skipped": 1.0 if verification.get("policy") == "risk_sample" else 0.0,
         }
     threshold = float(verification.get("threshold") or COUNTERFACTUAL_CPG_THRESHOLD)
     cpg = max(0.0, float(verification.get("cpg") or 0.0))
@@ -417,6 +422,8 @@ def counterfactual_metrics(pred: dict[str, Any]) -> dict[str, float]:
         "counterfactual_pass": 1.0 if verification.get("passed") else 0.0,
         "counterfactual_robustness_score": score,
         "counterfactual_revision": 1.0 if pred.get("counterfactual_revision_triggered") else 0.0,
+        "counterfactual_evaluated": 1.0,
+        "counterfactual_skipped": 0.0,
     }
 
 
@@ -427,6 +434,34 @@ def counterfactual_score(case: dict[str, Any], pred: dict[str, Any]) -> float:
     return counterfactual_metrics(pred)["counterfactual_robustness_score"]
 
 
+def diagnosis_metrics_applicable(case: dict[str, Any]) -> bool:
+    flags = case.get("data_quality_flags") or {}
+    if flags.get("diagnosis_metric_applicable") is False:
+        return False
+    primary = str((case.get("labels") or {}).get("primary_diagnosis") or "").strip()
+    if not primary:
+        return False
+    if len(primary) > 120 or len(primary.split()) > 16:
+        return False
+    return True
+
+
+def answer_entity_f1(case: dict[str, Any], pred: dict[str, Any]) -> float | None:
+    labels = case.get("labels") or {}
+    golds = [str(labels.get("primary_diagnosis", ""))]
+    golds.extend(str(item) for item in labels.get("label_aliases", []) if str(item).strip())
+    golds = [gold for gold in golds if gold.strip()]
+    if not golds:
+        return None
+    items = [str(pred.get("primary_diagnosis") or "")]
+    items.extend(str(item) for item in pred.get("diagnosis_list", []) if str(item).strip())
+    items.extend(str(item) for item in pred.get("evidence", []) if str(item).strip())
+    items = [item for item in items if item.strip()]
+    if not items:
+        return 0.0
+    return max(token_f1(item, gold) for item in items for gold in golds)
+
+
 def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, Any]:
     case_by_id = {case["case_id"]: case for case in cases}
     rows = []
@@ -435,9 +470,14 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
         labels = case["labels"]
         primary_golds = [str(labels.get("primary_diagnosis", ""))]
         primary_golds.extend(str(item) for item in labels.get("label_aliases", []) if str(item).strip())
-        primary_ok = diagnosis_match_any(pred.get("primary_diagnosis", ""), primary_golds)
+        diagnosis_applicable = diagnosis_metrics_applicable(case)
+        primary_ok = diagnosis_match_any(pred.get("primary_diagnosis", ""), primary_golds) if diagnosis_applicable else None
         gold_diagnosis_list = list(labels.get("diagnosis_list", []))
-        diag_f1 = list_f1_with_aliases(pred.get("diagnosis_list", []), gold_diagnosis_list, list(labels.get("label_aliases", [])))
+        diag_f1 = (
+            list_f1_with_aliases(pred.get("diagnosis_list", []), gold_diagnosis_list, list(labels.get("label_aliases", [])))
+            if diagnosis_applicable
+            else None
+        )
         diagnosis_items = [pred.get("primary_diagnosis", "")] + [str(item) for item in pred.get("diagnosis_list", [])]
         cdr_f1s = []
         for qa in case.get("qa_tasks", []):
@@ -445,15 +485,19 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
                 continue
             answer = qa.get("answer", "")
             cdr_f1s.append(max(token_f1(item, answer) for item in diagnosis_items) if diagnosis_items else 0.0)
+        cdr_value = (sum(cdr_f1s) / len(cdr_f1s) if cdr_f1s else 0.0) if diagnosis_applicable else None
         score_memory_ops = memory_op_scoring_applicable(pred)
         cf = counterfactual_metrics(pred)
         rows.append(
             {
                 "case_id": pred["case_id"],
                 "method": pred["method"],
-                "primary_correct": 1.0 if primary_ok else 0.0,
+                "task_profile": case_task_profile(case),
+                "diagnosis_metric_applicable": 1.0 if diagnosis_applicable else 0.0,
+                "primary_correct": (1.0 if primary_ok else 0.0) if primary_ok is not None else None,
                 "diagnosis_f1": diag_f1,
-                "cdr_f1": sum(cdr_f1s) / len(cdr_f1s) if cdr_f1s else 0.0,
+                "cdr_f1": cdr_value,
+                "answer_entity_f1": answer_entity_f1(case, pred) if case_task_profile(case) == MEDICAL_ANSWER_ENTITY else None,
                 "hard_pollution_suppression": hard_pollution_suppression(case, pred) if score_memory_ops else None,
                 "pollution_suppression": pollution_suppression(case, pred) if score_memory_ops else None,
                 "stale_memory_action_accuracy": stale_memory_action_accuracy(case, pred) if score_memory_ops else None,
@@ -470,6 +514,8 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
                 "counterfactual_pass": cf["counterfactual_pass"],
                 "counterfactual_robustness_score": cf["counterfactual_robustness_score"],
                 "counterfactual_revision": cf["counterfactual_revision"],
+                "counterfactual_evaluated": cf["counterfactual_evaluated"],
+                "counterfactual_skipped": cf["counterfactual_skipped"],
                 "tokens": float((pred.get("usage") or {}).get("total_tokens", 0) or 0),
             }
         )
@@ -487,8 +533,10 @@ def summarize_case_rows(method: str, vals: list[dict[str, Any]]) -> dict[str, An
     return {
         "method": method,
         "n": n,
+        "diagnosis_metric_coverage": avg(vals, "diagnosis_metric_applicable"),
         "primary_diagnosis_top1_accuracy": primary_acc,
         "diagnosis_list_f1": diagnosis_f1,
+        "answer_entity_f1": avg(vals, "answer_entity_f1"),
         "primary_diag_objective": (
             0.65 * primary_acc + 0.35 * diagnosis_f1 if primary_acc is not None and diagnosis_f1 is not None else None
         ),
@@ -510,6 +558,8 @@ def summarize_case_rows(method: str, vals: list[dict[str, Any]]) -> dict[str, An
         "counterfactual_robustness_score": avg(vals, "counterfactual_robustness_score"),
         "counterfactual_revision_rate": avg(vals, "counterfactual_revision"),
         "counterfactual_robustness_proxy": avg(vals, "counterfactual_score"),
+        "counterfactual_coverage_rate": avg(vals, "counterfactual_evaluated"),
+        "counterfactual_skipped_rate": avg(vals, "counterfactual_skipped"),
         "avg_tokens": avg(vals, "tokens"),
     }
 
@@ -564,6 +614,56 @@ def add_merged_ours_summaries(
     updated = dict(eval_result)
     updated["summary"] = summaries
     return updated
+
+
+def source_dataset_for_case(case: dict[str, Any]) -> str:
+    flags = case.get("data_quality_flags") or {}
+    source = str(flags.get("source_dataset") or "").strip()
+    if source:
+        return source
+    for ref in case.get("source_refs") or []:
+        if str(ref.get("role") or "") == "primary_source" and ref.get("dataset"):
+            return str(ref.get("dataset"))
+    for ref in case.get("source_refs") or []:
+        if ref.get("dataset"):
+            return str(ref.get("dataset"))
+    return "unknown"
+
+
+def build_source_metrics(
+    cases: list[dict[str, Any]],
+    case_rows: list[dict[str, Any]],
+    *,
+    dataset: str = "medical_pooled",
+    group_names: list[str] | None = None,
+    include_overall: bool = True,
+) -> list[dict[str, Any]]:
+    """Summarize pooled medical rows by their original source_dataset."""
+    case_source = {str(case.get("case_id")): source_dataset_for_case(case) for case in cases}
+    source_order: list[str] = []
+    for case in cases:
+        source = source_dataset_for_case(case)
+        if source not in source_order:
+            source_order.append(source)
+    if include_overall:
+        source_order = ["overall"] + source_order
+
+    rows: list[dict[str, Any]] = []
+    for source in source_order:
+        if source == "overall":
+            vals = list(case_rows)
+        else:
+            vals = [row for row in case_rows if case_source.get(str(row.get("case_id"))) == source]
+        if not vals:
+            continue
+        by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in vals:
+            by_method[str(row.get("method"))].append(row)
+        eval_result = {"case_rows": vals, "summary": [summarize_case_rows(method, rows_) for method, rows_ in sorted(by_method.items())]}
+        eval_result = add_merged_ours_summaries(eval_result, group_names=group_names)
+        for summary in eval_result["summary"]:
+            rows.append({"dataset": dataset, "source": source, **summary})
+    return rows
 
 
 def build_slice_breakdown(
@@ -669,17 +769,99 @@ def _contains(text: Any, needle: str) -> bool:
     return bool(needle) and needle.lower() in str(text).lower()
 
 
-def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, int]:
-    runtime_gold_mentions = 0
-    poison_expected_op = 0
-    poison_revised_claim = 0
-    poison_expected_memory_ops = 0
-    source_real_false = 0
-    prompt_memory_ops_gold_mentions = 0
-    counterfactual_runtime_gold_mentions = 0
+def _audit_norm(text: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())).strip()
+
+
+def _audit_context(text: str, needle: str, *, width: int = 120) -> str:
+    low = text.lower()
+    idx = low.find(needle.lower())
+    if idx < 0:
+        return str(text or "")[: width * 2]
+    start = max(0, idx - width)
+    end = min(len(text), idx + len(needle) + width)
+    return text[start:end]
+
+
+def _audit_aliases(case: dict[str, Any]) -> list[str]:
+    labels = case.get("labels") or {}
+    aliases = [labels.get("primary_diagnosis")] + list(labels.get("label_aliases") or [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        text = str(alias or "").strip()
+        key = _audit_norm(text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def _audit_source_type(case: dict[str, Any]) -> str:
+    flags = case.get("data_quality_flags") or {}
+    return str(flags.get("source_type") or "").strip()
+
+
+def _audit_source_dataset(case: dict[str, Any]) -> str:
+    return source_dataset_for_case(case)
+
+
+def _audit_option_norms(case: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for item in case.get("answer_options") or []:
+        out.add(_audit_norm(item.get("label")))
+        out.add(_audit_norm(item.get("text")))
+    return {item for item in out if item}
+
+
+def _audit_verdict(case: dict[str, Any], field: str, alias: str, kind: str) -> str:
+    alias_norm = _audit_norm(alias)
+    source_type = _audit_source_type(case)
+    if kind in {"runtime_gold_marker", "primary_selection_source", "source_real_false"}:
+        return "critical"
+    if len(alias_norm) < 4:
+        return "short_label_false_positive"
+    if source_type == "medical_mcqa" and alias_norm in _audit_option_norms(case):
+        return "benign_visible_option"
+    if field in {"runtime_visible", "counterfactual_intervention"} and source_type == "medical_instruction":
+        question_or_title_text = " ".join(
+            str(event.get("text") or "")
+            for event in case.get("events", [])
+            if re.search(
+                r"\b(?:Clinical question or presentation|Initial clinical task/source title)\b",
+                str(event.get("text") or ""),
+                flags=re.I,
+            )
+        )
+        if alias_norm in _audit_norm(question_or_title_text):
+            return "benign_visible_question_topic"
+    if field == "runtime_visible" and source_type in {"longitudinal_case", "patient_summary"}:
+        return "benign_visible_source_text"
+    if field == "counterfactual_intervention" and source_type in {"longitudinal_case", "patient_summary"}:
+        return "benign_visible_source_text"
+    if kind == "prediction_marker" and _audit_norm(alias) in {"correct answer", "correct option"}:
+        return "benign_model_answer_phrase"
+    if kind == "prediction_marker":
+        return "needs_review"
+    if field == "prompt_memory_ops":
+        return "needs_review"
+    if field in {"runtime_visible", "counterfactual_intervention"}:
+        return "needs_review"
+    return "benign_visible_text"
+
+
+def build_leakage_audit_details(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    case_by_id = {str(case.get("case_id")): case for case in cases}
+    details: list[dict[str, Any]] = []
+    marker_re = re.compile(
+        r"\b(?:assessment entity candidate|reference answer evidence|correct answer|correct option|doctor assessment)\b",
+        flags=re.I,
+    )
     for case in cases:
-        primary = str(case.get("labels", {}).get("primary_diagnosis") or "")
+        case_id = str(case.get("case_id"))
+        source = _audit_source_dataset(case)
         runtime_visible = {
+            "events": [{"type": event.get("type"), "text": event.get("text")} for event in case.get("events", [])],
             "memory_seed": case.get("memory_seed", []),
             "poison_records": [
                 {
@@ -689,8 +871,182 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
                 for poison in case.get("poison_records", [])
             ],
         }
-        if _contains(json.dumps(runtime_visible, ensure_ascii=False), primary):
+        runtime_text = json.dumps(runtime_visible, ensure_ascii=False)
+        marker_match = marker_re.search(runtime_text)
+        if marker_match:
+            details.append(
+                {
+                    "case_id": case_id,
+                    "source": source,
+                    "method": "",
+                    "field": "runtime_visible",
+                    "kind": "runtime_gold_marker",
+                    "alias": marker_match.group(0),
+                    "verdict": "critical",
+                    "context": _audit_context(runtime_text, marker_match.group(0)),
+                }
+            )
+        if str(case.get("source_real", True)).lower() == "false":
+            details.append(
+                {
+                    "case_id": case_id,
+                    "source": source,
+                    "method": "",
+                    "field": "source_real",
+                    "kind": "source_real_false",
+                    "alias": "source_real=false",
+                    "verdict": "critical",
+                    "context": "",
+                }
+            )
+        for alias in _audit_aliases(case):
+            if _contains(runtime_text, alias):
+                details.append(
+                    {
+                        "case_id": case_id,
+                        "source": source,
+                        "method": "",
+                        "field": "runtime_visible",
+                        "kind": "runtime_gold_mention",
+                        "alias": alias,
+                        "verdict": _audit_verdict(case, "runtime_visible", alias, "runtime_gold_mention"),
+                        "context": _audit_context(runtime_text, alias),
+                    }
+                )
+    for pred in predictions:
+        case = case_by_id.get(str(pred.get("case_id")))
+        if not case:
+            continue
+        case_id = str(case.get("case_id"))
+        source = _audit_source_dataset(case)
+        method = str(pred.get("method") or "")
+        selection_source = str((pred.get("primary_selection_pass") or {}).get("source") or "")
+        if selection_source in {"assessment_entity_candidate", "reference_answer_evidence"}:
+            details.append(
+                {
+                    "case_id": case_id,
+                    "source": source,
+                    "method": method,
+                    "field": "primary_selection_pass.source",
+                    "kind": "primary_selection_source",
+                    "alias": selection_source,
+                    "verdict": "critical",
+                    "context": json.dumps(pred.get("primary_selection_pass") or {}, ensure_ascii=False)[:240],
+                }
+            )
+        pred_visible = json.dumps(
+            {
+                "diagnosis_candidates": pred.get("diagnosis_candidates"),
+                "evidence": pred.get("evidence"),
+                "reasoning_summary": pred.get("reasoning_summary"),
+            },
+            ensure_ascii=False,
+        )
+        marker_match = marker_re.search(pred_visible)
+        if marker_match:
+            details.append(
+                {
+                    "case_id": case_id,
+                    "source": source,
+                    "method": method,
+                    "field": "prediction_visible",
+                    "kind": "prediction_marker",
+                    "alias": marker_match.group(0),
+                    "verdict": _audit_verdict(case, "prediction_visible", marker_match.group(0), "prediction_marker"),
+                    "context": _audit_context(pred_visible, marker_match.group(0)),
+                }
+            )
+        prompt_ops = pred.get("prompt_memory_ops")
+        prompt_text = json.dumps(prompt_ops, ensure_ascii=False) if prompt_ops is not None else ""
+        verification = pred.get("counterfactual_verification") or {}
+        counterfactual_text = json.dumps({"intervention": verification.get("intervention")}, ensure_ascii=False)
+        for alias in _audit_aliases(case):
+            if prompt_text and _contains(prompt_text, alias):
+                details.append(
+                    {
+                        "case_id": case_id,
+                        "source": source,
+                        "method": method,
+                        "field": "prompt_memory_ops",
+                        "kind": "prompt_memory_ops_gold_mention",
+                        "alias": alias,
+                        "verdict": _audit_verdict(case, "prompt_memory_ops", alias, "prompt_memory_ops_gold_mention"),
+                        "context": _audit_context(prompt_text, alias),
+                    }
+                )
+            if _contains(counterfactual_text, alias):
+                details.append(
+                    {
+                        "case_id": case_id,
+                        "source": source,
+                        "method": method,
+                        "field": "counterfactual_intervention",
+                        "kind": "counterfactual_runtime_gold_mention",
+                        "alias": alias,
+                        "verdict": _audit_verdict(case, "counterfactual_intervention", alias, "counterfactual_runtime_gold_mention"),
+                        "context": _audit_context(counterfactual_text, alias),
+                    }
+                )
+    return details
+
+
+def summarize_leakage_audit_details(details: list[dict[str, Any]]) -> dict[str, int]:
+    verdict_counts = Counter(str(item.get("verdict") or "unknown") for item in details)
+    kind_counts = Counter(str(item.get("kind") or "unknown") for item in details)
+    return {
+        "detail_count": len(details),
+        "critical_leakage_count": int(verdict_counts.get("critical", 0)),
+        "needs_review_count": int(verdict_counts.get("needs_review", 0)),
+        "benign_visible_text_count": int(verdict_counts.get("benign_visible_text", 0)),
+        "benign_visible_source_text_count": int(verdict_counts.get("benign_visible_source_text", 0)),
+        "benign_visible_question_topic_count": int(verdict_counts.get("benign_visible_question_topic", 0)),
+        "benign_visible_option_count": int(verdict_counts.get("benign_visible_option", 0)),
+        "benign_model_answer_phrase_count": int(verdict_counts.get("benign_model_answer_phrase", 0)),
+        "short_label_false_positive_count": int(verdict_counts.get("short_label_false_positive", 0)),
+        "runtime_gold_mentions": int(kind_counts.get("runtime_gold_mention", 0)),
+        "runtime_gold_markers": int(kind_counts.get("runtime_gold_marker", 0)),
+        "prompt_memory_ops_gold_mentions": int(kind_counts.get("prompt_memory_ops_gold_mention", 0)),
+        "counterfactual_runtime_gold_mentions": int(kind_counts.get("counterfactual_runtime_gold_mention", 0)),
+        "leaked_primary_selection_sources": int(kind_counts.get("primary_selection_source", 0)),
+        "leaked_prediction_candidate_mentions": int(kind_counts.get("prediction_marker", 0)),
+        "source_real_false": int(kind_counts.get("source_real_false", 0)),
+    }
+
+
+def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, int]:
+    case_by_id = {case.get("case_id"): case for case in cases}
+    runtime_gold_mentions = 0
+    runtime_gold_markers = 0
+    poison_expected_op = 0
+    poison_revised_claim = 0
+    poison_expected_memory_ops = 0
+    source_real_false = 0
+    prompt_memory_ops_gold_mentions = 0
+    counterfactual_runtime_gold_mentions = 0
+    leaked_primary_selection_sources = 0
+    leaked_prediction_candidate_mentions = 0
+    marker_re = re.compile(
+        r"\b(?:assessment entity candidate|reference answer evidence|correct answer|correct option|doctor assessment)\b",
+        flags=re.I,
+    )
+    for case in cases:
+        primary = str(case.get("labels", {}).get("primary_diagnosis") or "")
+        runtime_visible = {
+            "events": [{"type": event.get("type"), "text": event.get("text")} for event in case.get("events", [])],
+            "memory_seed": case.get("memory_seed", []),
+            "poison_records": [
+                {
+                    "text": poison.get("text"),
+                    "supporting_evidence": poison.get("supporting_evidence", []),
+                }
+                for poison in case.get("poison_records", [])
+            ],
+        }
+        runtime_text = json.dumps(runtime_visible, ensure_ascii=False)
+        if _contains(runtime_text, primary):
             runtime_gold_mentions += 1
+        if marker_re.search(runtime_text):
+            runtime_gold_markers += 1
         if str(case.get("source_real", True)).lower() == "false":
             source_real_false += 1
         for poison in case.get("poison_records", []):
@@ -698,10 +1054,23 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
             poison_revised_claim += int("revised_claim" in poison)
             poison_expected_memory_ops += int("expected_memory_ops" in poison)
     for pred in predictions:
+        selection_source = str((pred.get("primary_selection_pass") or {}).get("source") or "")
+        if selection_source in {"assessment_entity_candidate", "reference_answer_evidence"}:
+            leaked_primary_selection_sources += 1
+        pred_visible = json.dumps(
+            {
+                "diagnosis_candidates": pred.get("diagnosis_candidates"),
+                "evidence": pred.get("evidence"),
+                "reasoning_summary": pred.get("reasoning_summary"),
+            },
+            ensure_ascii=False,
+        )
+        if marker_re.search(pred_visible):
+            leaked_prediction_candidate_mentions += 1
         prompt_ops = pred.get("prompt_memory_ops")
         if prompt_ops is None:
             continue
-        case = next((c for c in cases if c.get("case_id") == pred.get("case_id")), None)
+        case = case_by_id.get(pred.get("case_id"))
         if not case:
             continue
         primary = str(case.get("labels", {}).get("primary_diagnosis") or "")
@@ -713,10 +1082,15 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
         }
         if _contains(json.dumps(runtime_counterfactual, ensure_ascii=False), primary):
             counterfactual_runtime_gold_mentions += 1
+    critical_leakage_count = runtime_gold_markers + leaked_primary_selection_sources
     return {
+        "critical_leakage_count": critical_leakage_count,
         "runtime_gold_mentions": runtime_gold_mentions,
+        "runtime_gold_markers": runtime_gold_markers,
         "prompt_memory_ops_gold_mentions": prompt_memory_ops_gold_mentions,
         "counterfactual_runtime_gold_mentions": counterfactual_runtime_gold_mentions,
+        "leaked_primary_selection_sources": leaked_primary_selection_sources,
+        "leaked_prediction_candidate_mentions": leaked_prediction_candidate_mentions,
         "poison_expected_op": poison_expected_op,
         "poison_revised_claim": poison_revised_claim,
         "poison_expected_memory_ops": poison_expected_memory_ops,
@@ -796,14 +1170,14 @@ def best_baseline_accuracy(summaries: list[dict[str, Any]]) -> float:
     polluted_vals = [
         float(s["primary_diagnosis_top1_accuracy"])
         for s in summaries
-        if str(s["method"]).startswith("baseline_polluted_")
+        if str(s["method"]).startswith("baseline_polluted_") and s.get("primary_diagnosis_top1_accuracy") is not None
     ]
     if polluted_vals:
         return max(polluted_vals)
     vals = [
         float(s["primary_diagnosis_top1_accuracy"])
         for s in summaries
-        if str(s["method"]).startswith("baseline_")
+        if str(s["method"]).startswith("baseline_") and s.get("primary_diagnosis_top1_accuracy") is not None
     ]
     return max(vals) if vals else 0.0
 

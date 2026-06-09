@@ -50,8 +50,8 @@ def render_report(
         "```",
         "",
         "## Baseline 设置与口径",
-        "- 当前医疗源实验主表采用 focused baseline 集合：A-MEM、Polluted A-MEM、Direct、Polluted Direct。",
-        "- 因此结论只能表述为相对当前 focused baseline 集合的阶段性比较，不表述为完整横向 baseline 或先进性结论。",
+        "- 当前医疗源实验主表的 baseline 集合由运行参数决定；fast-formal 默认包含 Direct、Single-agent CoT、A-MEM、DDO、ColaCare。",
+        "- 若未运行完整官方复现或污染版全套 baseline，结论只能表述为相对当前同任务 pipeline 集合的阶段性比较。",
         f"- A-MEM：{BASELINE_SOURCES['amem']['paper']}；官方 repo：{BASELINE_SOURCES['amem']['repo']}。",
         (
             f"- DDO：{BASELINE_SOURCES['ddo']['paper']}；官方 repo：{BASELINE_SOURCES['ddo']['repo']}。"
@@ -67,7 +67,7 @@ def render_report(
         "- Direct DeepSeek：截断上下文、无长期记忆。",
         "- 原始 baseline：不接触污染记忆，用于诊断能力参考。",
         "- Polluted baseline：接触同样污染记忆，但没有 proposed cleaning module，用于污染鲁棒性主比较。",
-        "- Ours：JSONL 动态记忆、LLM Critic 记忆清洗、动态 top_k 与反事实 proxy。",
+        "- Ours：JSONL 动态记忆、LLM Critic 记忆清洗、动态 top_k 与按策略触发的反事实验证。",
         "",
         "## 当前渲染轮特性状态",
         "- 本节描述当前渲染轮的 feature flags；指标汇总可能同时包含 Full Ours 与多个 ablation merged rows。",
@@ -87,13 +87,13 @@ def render_report(
         [
             "",
             "## 指标汇总",
-            "| Method | N | Primary Acc | Diagnosis F1 | CDR F1 | MPCS | CPG | CF Pass | Avg Tokens |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Method | N | Primary Acc | Diagnosis F1 | CDR F1 | MPCS | CPG | CF Pass | CF Coverage | Avg Tokens |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in summaries:
         lines.append(
-            "| {method} | {n} | {acc} | {f1} | {cdr} | {mpcs} | {cpg} | {cfpass} | {tok} |".format(
+            "| {method} | {n} | {acc} | {f1} | {cdr} | {mpcs} | {cpg} | {cfpass} | {cfcov} | {tok} |".format(
                 method=row["method"],
                 n=row["n"],
                 acc=metric_cell(row.get("primary_diagnosis_top1_accuracy")),
@@ -102,6 +102,7 @@ def render_report(
                 mpcs=metric_cell(row.get("memory_pollution_control_score")),
                 cpg=metric_cell(row.get("counterfactual_probability_gap")),
                 cfpass=metric_cell(row.get("counterfactual_pass_rate")),
+                cfcov=metric_cell(row.get("counterfactual_coverage_rate")),
                 tok=metric_cell(row.get("avg_tokens"), digits=1),
             )
         )

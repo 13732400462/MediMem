@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 from .llm import DeepSeekClient, extract_json_object
 from .memory import apply_critique, bootstrap_memory
 from .medical_terms import canonicalize_diagnosis, canonicalize_diagnoses
+from .style_policy import style_policy_prompt
 from .task_profiles import (
     CLINICAL_ASSESSMENT_ENTITY,
     LONGITUDINAL_DIAGNOSIS,
@@ -25,6 +27,10 @@ TARGET_LEAKAGE_PATTERNS = (
     r"soap\s+assessment\s+target",
     r"topic\s+or\s+diagnosis\s+target",
     r"doctor\s+assessment\s+target",
+    r"assessment\s+entity\s+candidate",
+    r"reference\s+answer\s+evidence",
+    r"doctor\s+assessment",
+    r"correct\s+option",
     r"correct\s+answer",
 )
 TARGET_LEAKAGE_RE = re.compile(r"(?i)\b(?:" + "|".join(TARGET_LEAKAGE_PATTERNS) + r")\b\s*:?\s*")
@@ -145,6 +151,13 @@ def truncate_context_middle(context: str, max_chars: int) -> str:
     )
 
 
+def preserve_specific_infection_entity(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;()[]")
+    if re.search(r"\b[A-Z][a-z]+\s+[a-z]+\s+infection\b", cleaned):
+        return cleaned
+    return ""
+
+
 def normalize_prediction(
     case_id: str,
     method: str,
@@ -164,8 +177,12 @@ def normalize_prediction(
     except (TypeError, ValueError):
         confidence = 0.5
     primary = str(raw.get("primary_diagnosis") or (diag_list[0] if diag_list else "Unknown")).strip()
-    primary = canonicalize_diagnosis(primary, enabled=enable_normalization)
-    diag_list = canonicalize_diagnoses([str(d).strip() for d in diag_list if str(d).strip()], enabled=enable_normalization)
+    primary = preserve_specific_infection_entity(primary) or canonicalize_diagnosis(primary, enabled=enable_normalization)
+    diag_list = [
+        preserve_specific_infection_entity(str(d).strip()) or canonicalize_diagnosis(str(d).strip(), enabled=enable_normalization)
+        for d in diag_list
+        if str(d).strip()
+    ]
     species_context = str(raw.get("species_context") or raw.get("species") or "human").strip() or "human"
     diagnosis_granularity = str(raw.get("diagnosis_granularity") or infer_diagnosis_granularity(primary)).strip()
     return {
@@ -443,6 +460,8 @@ def source_aligned_evidence_notes(cards: list[dict[str, Any]], *, limit: int = 1
         if card.get("status") not in {"active", "flagged"}:
             continue
         tags = {str(tag).lower() for tag in card.get("tags", [])}
+        if tags & {"poison", "outdated", "stale_candidate", "initial_hypothesis"}:
+            continue
         summary = sanitize_runtime_text(card.get("summary"))
         if not summary:
             continue
@@ -997,7 +1016,16 @@ def normalize_answer_entity(text: str, *, enable_normalization: bool = True) -> 
     cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;()[]")
     if not cleaned:
         return ""
+    if re.search(r"\b[A-Z][a-z]+\s+[a-z]+\s+infection\b", cleaned):
+        return cleaned
     return canonicalize_diagnosis(cleaned, enabled=enable_normalization)
+
+
+def conservative_canonical_diagnosis(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,:;()[]")
+    if re.search(r"\b[A-Z][a-z]+\s+[a-z]+\s+infection\b", cleaned):
+        return cleaned
+    return canonicalize_diagnosis(cleaned)
 
 
 def answer_option_candidates(case: dict[str, Any]) -> list[str]:
@@ -1009,6 +1037,52 @@ def answer_option_candidates(case: dict[str, Any]) -> list[str]:
             candidates.append(text)
         if label and text:
             candidates.append(f"{label}. {text}")
+    return candidates
+
+
+def answer_entity_source_candidates(case: dict[str, Any]) -> list[tuple[str, str, float]]:
+    if (case.get("data_quality_flags") or {}).get("no_leak_protocol", True):
+        return []
+    return []
+
+
+def visible_instruction_topic_candidates(case: dict[str, Any]) -> list[tuple[str, str, float]]:
+    flags = case.get("data_quality_flags") or {}
+    if str(flags.get("source_type") or "").strip() != "medical_instruction":
+        return []
+    candidates: list[tuple[str, str, float]] = []
+    seen: set[str] = set()
+    for event in case.get("events") or []:
+        text = str(event.get("text") or "")
+        if not re.search(r"\b(?:Clinical question or presentation|Initial clinical task/source title)\b", text, flags=re.I):
+            continue
+        question = re.sub(r"^[^:]{0,80}:\s*", "", text).strip()
+        lowered = question.lower().strip()
+        topic = ""
+        patterns = [
+            r"what information is (?:available|there) (?:on|about)\s+(.+?)[?.]?$",
+            r"what is available (?:on|about)\s+(.+?)[?.]?$",
+            r"what is\s+(.+?)(?:,|\s+and\s+how|\s+and\s+what|[?.]$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, lowered, flags=re.I)
+            if match:
+                topic = question[match.start(1) : match.end(1)]
+                break
+        if not topic and lowered.startswith("what does "):
+            topic = re.sub(r"^what does\s+", "", question, flags=re.I)
+            if " for " in topic.lower():
+                topic = re.split(r"\s+for\s+", topic, maxsplit=1, flags=re.I)[1]
+            topic = re.sub(r"\s+entail[?.]?$", "", topic, flags=re.I)
+        topic = re.sub(r"^(?:a|an|the)\s+", "", topic.strip(" ?.;:,"), flags=re.I)
+        topic = re.sub(r"\s+", " ", topic).strip()
+        if not topic or len(topic.split()) > 8:
+            continue
+        normalized = normalize_answer_entity(topic)
+        key = diagnosis_key(normalized)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append((normalized, "visible_instruction_question_topic", 18.0))
     return candidates
 
 
@@ -1067,8 +1141,15 @@ def select_primary_for_task_profile(
         str(pred.get("reasoning_summary") or ""),
     ]
     candidates: list[tuple[str, str, float]] = [(current, "model_primary", 3.0)]
+    source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
+    if source_dataset == "pmc_patients":
+        current_entity = diagnosis_entity_from_text(current)
+        if current_entity and current_entity != current:
+            candidates.append((current_entity, "pmc_model_primary_explicit", 5.2))
 
     if profile == MEDICAL_ANSWER_ENTITY:
+        candidates.extend(answer_entity_source_candidates(case))
+        candidates.extend(visible_instruction_topic_candidates(case))
         for option in answer_option_candidates(case):
             candidates.append((option, "answer_options", 2.5 + text_overlap_score(option, blobs)))
         for item in pred.get("diagnosis_list", []):
@@ -1102,6 +1183,30 @@ def select_primary_for_task_profile(
         candidate, source, base = row
         low = candidate.lower()
         score = base + text_overlap_score(candidate, blobs)
+        if source_dataset == "pmc_patients" and low in {"infection", "disease", "syndrome", "tumor", "cancer"}:
+            score -= 4.0
+        if source_dataset == "pmoa_tts":
+            if re.search(
+                r"\b("
+                r"revascularization|residual disease|stage\s+[ivx]+|"
+                r"post fixation|fixation|placement|stent|thrombectomy|"
+                r"adaptation|rupture|hemorrhag(?:e|ing)|effusion|"
+                r"short segment|short-segment|anastomosis|obstruction of the anastomosis"
+                r")\b",
+                low,
+            ):
+                score -= 3.0
+            if re.search(
+                r"\b("
+                r"carcinoma|adenocarcinoma|cancer|lymphoma|leukemia|sarcoma|"
+                r"thrombosis|deep vein thrombosis|pulmonary embolism|embolism|"
+                r"hemophagocytic lymphohistiocytosis|hlh|hcc|hepatocellular|"
+                r"gastric outlet obstruction|fracture|lupus|hypertension|copd|"
+                r"infection|syndrome|disease"
+                r")\b",
+                low,
+            ):
+                score += 2.0
         if source in {"timeline_diagnosis", "diagnosis_event", "timeline_pathology"}:
             score += 2.0
         if re.search(r"\b(complication|metastasis|metastases|failure|injury|embolism|effusion|bleeding)\b", low):
@@ -1133,6 +1238,16 @@ def select_primary_for_task_profile(
 
 def diagnosis_entity_from_text(raw_text: str) -> str:
     raw = str(raw_text or "")
+    explicit = re.search(
+        r"(?:confirmed|showed|revealed|diagnosed with|diagnosis of|consistent with|pathology positive for)\s+([^.;]+)",
+        raw,
+        flags=re.I,
+    )
+    if explicit:
+        entity = explicit.group(1).strip(" .,:;")
+        if re.search(r"\b[A-Z][a-z]+\s+[a-z]+\s+infection\b", entity):
+            return entity
+        return canonicalize_diagnosis(entity)
     normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", raw.lower())).strip()
     for cue, entity in PUBLIC_DIAGNOSIS_CUE_MAP:
         cue_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", cue.lower())).strip()
@@ -1148,6 +1263,7 @@ def visible_diagnosis_source_rows(
     diagnosis_candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    profile = case_task_profile(case)
     for idx, item in enumerate(pred.get("diagnosis_list", [])):
         rows.append({"source": "prediction", "rank": idx, "text": str(item), "weight": 3.0})
     for idx, item in enumerate(pred.get("evidence", [])):
@@ -1196,6 +1312,18 @@ def visible_diagnosis_source_rows(
             weight = 2.6 if event_type in {"diagnosis", "pathology"} else 1.8
         else:
             weight = 1.4
+        if profile == MEDICAL_ANSWER_ENTITY and not re.search(
+            r"\b(answer options?|assessment entity candidate|reference answer evidence|correct option)\b",
+            text,
+            flags=re.I,
+        ):
+            weight *= 0.35
+        if profile == CLINICAL_ASSESSMENT_ENTITY and re.search(
+            r"\b(doctor assessment|assessment entity candidate|likely cause|diagnosis|impression|suggestive of)\b",
+            text,
+            flags=re.I,
+        ):
+            weight += 1.4
         rows.append(
             {
                 "source": f"timeline_{event_type or 'clinical'}",
@@ -1265,7 +1393,7 @@ def evidence_driven_diagnosis_rerank(
     """Recall and reorder diagnosis_list using only visible timeline and memory-derived evidence."""
     max_items = min(max_items, profile_list_budget_for_case(case))
     candidates: dict[str, dict[str, Any]] = {}
-    primary = canonicalize_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
+    primary = conservative_canonical_diagnosis(str(pred.get("primary_diagnosis") or "")).strip()
     if primary:
         candidates[diagnosis_key(primary)] = {
             "entity": primary,
@@ -1329,7 +1457,7 @@ def evidence_driven_diagnosis_rerank(
     if not merged:
         return pred
     updated = dict(pred)
-    existing = [canonicalize_diagnosis(str(item)).strip() for item in pred.get("diagnosis_list", []) if str(item).strip()]
+    existing = [conservative_canonical_diagnosis(str(item)).strip() for item in pred.get("diagnosis_list", []) if str(item).strip()]
     visible_keys = {diagnosis_key(str(item.get("entity") or "")) for item in filtered}
     preserved: list[str] = []
     preserved_seen: set[str] = set()
@@ -1569,6 +1697,56 @@ def run_counterfactual_verification(
         ),
         "summary": str(raw.get("causal_consistency_summary") or raw.get("summary") or ""),
     }, result.usage
+
+
+def should_run_counterfactual_verification(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    *,
+    ops: list[dict[str, Any]],
+    memories: list[dict[str, Any]],
+    evidence_notes: list[dict[str, Any]],
+    policy: str,
+    sample_rate: float,
+    risk_threshold: float,
+) -> tuple[bool, list[str]]:
+    policy = str(policy or "always")
+    if policy == "always":
+        return True, ["policy_always"]
+    if policy == "never":
+        return False, ["policy_never"]
+    if policy != "risk_sample":
+        return True, [f"unknown_policy:{policy}"]
+
+    reasons: list[str] = []
+    confidence = _safe_float(pred.get("confidence"), 0.5)
+    if confidence < risk_threshold:
+        reasons.append("low_confidence")
+    if any(str(op.get("op") or "") in {"Revise", "Invalidate", "Discard"} for op in ops):
+        reasons.append("memory_cleaning_changed_state")
+    evidence_count = len([item for item in pred.get("evidence", []) if str(item).strip()])
+    if evidence_count < 2:
+        reasons.append("weak_prediction_evidence")
+    if not evidence_notes and evidence_count < 2:
+        reasons.append("no_source_evidence_notes")
+    poison_ids = {str(item.get("poison_id") or "") for item in case.get("poison_records", [])}
+    evidence_refs = {
+        str(ref)
+        for memory in memories
+        for ref in (memory.get("evidence_refs") or [])
+        if ref is not None
+    }
+    if poison_ids and poison_ids.intersection(evidence_refs):
+        reasons.append("retrieved_polluted_memory")
+    if reasons:
+        return True, reasons
+
+    clamped_rate = max(0.0, min(1.0, float(sample_rate)))
+    case_id = str(case.get("case_id") or "")
+    bucket = int(hashlib.sha256(case_id.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    if bucket < clamped_rate:
+        return True, ["low_risk_sampled"]
+    return False, ["low_risk_not_sampled"]
 
 
 def counterfactual_revision_extra(base_extra: str, verification: dict[str, Any]) -> str:
@@ -1913,7 +2091,13 @@ def run_ours(
     memory_path = Path(memory_dir) / f"{case['case_id']}.memory.jsonl"
     store = bootstrap_memory(case, memory_path)
     features = strategy.get("features") or {}
-    disable_memory_cleaning = bool(features.get("disable_memory_cleaning"))
+    profile = case_task_profile(case)
+    source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
+    adaptive_memory_cleaning = bool(features.get("profile_adaptive_memory_cleaning", True))
+    adaptive_evidence_notes = bool(features.get("profile_adaptive_evidence_notes", False))
+    disable_memory_cleaning = bool(features.get("disable_memory_cleaning")) or (
+        adaptive_memory_cleaning and source_dataset == "pmc_patients"
+    )
     ops = [] if disable_memory_cleaning else apply_critique(
         case,
         store,
@@ -1925,8 +2109,11 @@ def run_ours(
     query = "final diagnosis longitudinal causal evidence treatment imaging pathology labs"
     top_k = resolve_top_k(case, strategy)
     retrieved_memories = store.retrieve(query, k=top_k)
-    evidence_notes = [] if features.get("disable_evidence_note_injection") else source_aligned_evidence_notes(store.cards)
-    diagnosis_candidates = [] if features.get("disable_evidence_note_injection") else diagnosis_event_candidates(case)
+    disable_evidence_note_injection = bool(features.get("disable_evidence_note_injection")) or (
+        adaptive_evidence_notes and profile == MEDICAL_ANSWER_ENTITY
+    )
+    evidence_notes = [] if disable_evidence_note_injection else source_aligned_evidence_notes(store.cards)
+    diagnosis_candidates = [] if disable_evidence_note_injection else diagnosis_event_candidates(case)
     seen_ids: set[str] = set()
     memories = []
     for memory in retrieved_memories:
@@ -1943,11 +2130,13 @@ def run_ours(
         f"- t={item.get('time')} ref={item.get('event_id')} diagnosis_text={item.get('text')}"
         for item in diagnosis_candidates
     ]
+    source_style = style_policy_prompt((case.get("data_quality_flags") or {}).get("style_policy"))
     extra = (
         "Use the active JSONL memory cards and source-aligned evidence notes. "
         "Prefer timeline/evidence refs over stale interpretations when choosing primary_diagnosis. "
         "If a diagnosis event candidate directly captures the final explanatory state, use that concise text as primary_diagnosis "
         "and put broader underlying diseases in diagnosis_list rather than replacing it.\n"
+        f"{source_style}\n"
         f"[MEMORY_CARDS]\n{chr(10).join(memory_lines)}\n"
         f"[SOURCE_ALIGNED_EVIDENCE_NOTES]\n{chr(10).join(evidence_lines)}\n"
         f"[DIAGNOSIS_EVENT_CANDIDATES]\n{chr(10).join(diagnosis_candidate_lines)}\n"
@@ -1966,21 +2155,25 @@ def run_ours(
         fail_on_llm_error=fail_on_llm_error,
         enable_normalization=not bool(features.get("disable_normalization")),
     )
-    if not features.get("disable_evidence_note_injection"):
+    if not disable_evidence_note_injection:
         pred = prefer_visible_diagnosis_candidate(case, pred)
         pred = refine_diagnosis_list(case, pred, evidence_notes, diagnosis_candidates)
         pred = verify_primary_with_evidence(case, pred)
         pred = evidence_gated_diagnosis_recall(case, pred, evidence_notes, diagnosis_candidates)
         pred = evidence_driven_diagnosis_rerank(case, pred, evidence_notes, diagnosis_candidates)
-        pred = llm_diagnosis_second_pass(
-            case,
-            pred,
-            client,
-            evidence_notes,
-            diagnosis_candidates,
-            fail_on_llm_error=False,
-            enable_normalization=not bool(features.get("disable_normalization")),
-        )
+        if profile != MEDICAL_ANSWER_ENTITY and source_dataset != "pmc_patients":
+            pred = llm_diagnosis_second_pass(
+                case,
+                pred,
+                client,
+                evidence_notes,
+                diagnosis_candidates,
+                fail_on_llm_error=False,
+                enable_normalization=not bool(features.get("disable_normalization")),
+            )
+        else:
+            reason = "pmc_source_evidence_primary_locked" if source_dataset == "pmc_patients" else "medical_answer_entity_option_locked"
+            pred["diagnosis_second_pass"] = {"enabled": False, "reason": reason}
         pred = select_primary_for_task_profile(
             case,
             pred,
@@ -1989,6 +2182,8 @@ def run_ours(
             enable_normalization=not bool(features.get("disable_normalization")),
         )
     else:
+        if profile == MEDICAL_ANSWER_ENTITY:
+            pred["diagnosis_second_pass"] = {"enabled": False, "reason": "medical_answer_entity_option_locked"}
         pred = select_primary_for_task_profile(
             case,
             pred,
@@ -1996,28 +2191,61 @@ def run_ours(
             [],
             enable_normalization=not bool(features.get("disable_normalization")),
         )
-    if features.get("disable_counterfactual_verification"):
+    counterfactual_policy = str(features.get("counterfactual_policy") or "always")
+    counterfactual_sample_rate = float(
+        features["counterfactual_sample_rate"] if "counterfactual_sample_rate" in features else 0.2
+    )
+    counterfactual_risk_threshold = float(
+        features["counterfactual_risk_threshold"] if "counterfactual_risk_threshold" in features else 0.55
+    )
+    if features.get("disable_counterfactual_verification") or counterfactual_policy == "never":
         pred["counterfactual_verification"] = {
             "enabled": False,
             "passed": False,
             "threshold": COUNTERFACTUAL_CPG_THRESHOLD,
             "cpg": 0.0,
-            "summary": "Counterfactual verification disabled by feature flag.",
+            "policy": counterfactual_policy,
+            "summary": "Counterfactual verification disabled by feature flag or policy.",
         }
         pred["counterfactual_revision_triggered"] = False
     else:
-        verification, cf_usage = run_counterfactual_verification(
+        should_run_cf, cf_reasons = should_run_counterfactual_verification(
             case,
             pred,
-            client,
-            context=case_context(case, include_labs=True),
-            extra=extra,
-            threshold=COUNTERFACTUAL_CPG_THRESHOLD,
-            fail_on_llm_error=fail_on_llm_error,
+            ops=ops,
+            memories=memories,
+            evidence_notes=evidence_notes,
+            policy=counterfactual_policy,
+            sample_rate=counterfactual_sample_rate,
+            risk_threshold=counterfactual_risk_threshold,
         )
+        pred["counterfactual_revision_triggered"] = False
+        if not should_run_cf:
+            verification = {
+                "enabled": False,
+                "available": True,
+                "passed": False,
+                "threshold": COUNTERFACTUAL_CPG_THRESHOLD,
+                "cpg": 0.0,
+                "policy": counterfactual_policy,
+                "skip_reasons": cf_reasons,
+                "summary": "Counterfactual verification skipped for low-risk unsampled case.",
+            }
+            cf_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        else:
+            verification, cf_usage = run_counterfactual_verification(
+                case,
+                pred,
+                client,
+                context=case_context(case, include_labs=True),
+                extra=extra,
+                threshold=COUNTERFACTUAL_CPG_THRESHOLD,
+                fail_on_llm_error=fail_on_llm_error and counterfactual_policy == "always",
+            )
+            verification["policy"] = counterfactual_policy
+            verification["trigger_reasons"] = cf_reasons
         pred["usage"] = add_usage(pred.get("usage"), cf_usage)
         pred["counterfactual_verification"] = verification
-        pred["counterfactual_revision_triggered"] = False
         counterfactual_primary = str(verification.get("counterfactual_primary_diagnosis") or "").strip()
         current_primary = str(pred.get("primary_diagnosis") or "").strip()
         high_confidence_contradiction = (
@@ -2102,6 +2330,9 @@ def resolve_top_k(case: dict[str, Any], strategy: dict[str, Any]) -> int:
         return int(strategy["top_k"])
     if features.get("disable_dynamic_top_k"):
         return int(strategy.get("fallback_top_k", 3))
+    source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
+    if case_task_profile(case) == MEDICAL_ANSWER_ENTITY or source_dataset == "pmc_patients":
+        return 8
     events = case.get("events", [])
     event_count = len(events)
     if event_count < 20:
@@ -2131,5 +2362,7 @@ def feature_state(strategy: dict[str, Any]) -> dict[str, bool]:
         "memory_cleaning": not bool(features.get("disable_memory_cleaning")),
         "critic_op_guard": not bool(features.get("disable_critic_op_guard")),
         "evidence_note_injection": not bool(features.get("disable_evidence_note_injection")),
+        "profile_adaptive_memory_cleaning": bool(features.get("profile_adaptive_memory_cleaning", True)),
+        "profile_adaptive_evidence_notes": bool(features.get("profile_adaptive_evidence_notes", False)),
         "counterfactual_verification": not bool(features.get("disable_counterfactual_verification")),
     }
