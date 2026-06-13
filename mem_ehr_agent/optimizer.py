@@ -38,6 +38,7 @@ FAST_FORMAL_ABLATION_GROUPS = (
     "full",
     "ablate_no_memory_cleaning",
     "ablate_no_evidence_note_injection",
+    "ablate_with_polluted_memory",
 )
 
 
@@ -61,6 +62,7 @@ def strategy_for_round(
             "disable_dynamic_top_k": bool((features or {}).get("disable_dynamic_top_k")),
             "disable_normalization": bool((features or {}).get("disable_normalization")),
             "disable_memory_cleaning": bool((features or {}).get("disable_memory_cleaning")),
+            "enable_polluted_memory": bool((features or {}).get("enable_polluted_memory")),
             "disable_critic_op_guard": bool((features or {}).get("disable_critic_op_guard")),
             "disable_evidence_note_injection": bool((features or {}).get("disable_evidence_note_injection")),
             "disable_counterfactual_verification": bool((features or {}).get("disable_counterfactual_verification")),
@@ -175,6 +177,7 @@ FAST_FORMAL_MEDIMEM_METHODS = {
     "full_medimem_merged",
     "ablate_no_memory_cleaning_medimem_merged",
     "ablate_no_evidence_note_injection_medimem_merged",
+    "ablate_with_polluted_memory_medimem_merged",
 }
 
 
@@ -209,6 +212,7 @@ def write_fast_formal_comparison_outputs(run_dir: Path, summaries: list[dict[str
             "full_medimem_merged",
             "ablate_no_memory_cleaning_medimem_merged",
             "ablate_no_evidence_note_injection_medimem_merged",
+            "ablate_with_polluted_memory_medimem_merged",
         ]:
             row = methods.get(method)
             if not row:
@@ -490,6 +494,7 @@ def ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
         ("ablate_no_dynamic_top_k", {"disable_dynamic_top_k": True}),
         ("ablate_no_normalization", {"disable_normalization": True}),
         ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_critic_op_guard", {"disable_critic_op_guard": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
         ("ablate_no_counterfactual_verification", {"disable_counterfactual_verification": True}),
@@ -500,6 +505,7 @@ def focused_ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
     return [
         ("full", {}),
         ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
         ("ablate_no_counterfactual_verification", {"disable_counterfactual_verification": True}),
     ]
@@ -509,6 +515,7 @@ def fast_formal_ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
     return [
         ("full", {}),
         ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
     ]
 
@@ -519,6 +526,8 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
     known = {name: features for name, features in ablation_feature_sets()}
     aliases = {
         "no_memory_cleaning": "ablate_no_memory_cleaning",
+        "with_polluted_memory": "ablate_with_polluted_memory",
+        "polluted_memory": "ablate_with_polluted_memory",
         "no_evidence_note_injection": "ablate_no_evidence_note_injection",
         "no_counterfactual_verification": "ablate_no_counterfactual_verification",
         "no_dynamic_top_k": "ablate_no_dynamic_top_k",

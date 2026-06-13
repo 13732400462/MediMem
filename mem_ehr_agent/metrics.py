@@ -783,6 +783,21 @@ def _audit_context(text: str, needle: str, *, width: int = 120) -> str:
     return text[start:end]
 
 
+def _is_prompt_guard_language_false_positive(alias: str, context: str) -> bool:
+    alias_norm = _audit_norm(alias)
+    if alias_norm not in {"diagnosis", "diagnoses", "diagnostic", "interpretation"}:
+        return False
+    context_norm = _audit_norm(context)
+    guard_patterns = (
+        r"\bdo not use (?:the )?prior interpretation as (?:a )?diagnosis\b",
+        r"\bdo not treat (?:a )?prior interpretation as (?:a )?diagnosis\b",
+        r"\bunsafe for direct diagnosis\b",
+        r"\bprior interpretation as (?:a )?diagnosis\b",
+        r"\bstale interpretation as (?:a )?diagnosis\b",
+    )
+    return any(re.search(pattern, context_norm) for pattern in guard_patterns)
+
+
 def _audit_aliases(case: dict[str, Any]) -> list[str]:
     labels = case.get("labels") or {}
     aliases = [labels.get("primary_diagnosis")] + list(labels.get("label_aliases") or [])
@@ -814,7 +829,7 @@ def _audit_option_norms(case: dict[str, Any]) -> set[str]:
     return {item for item in out if item}
 
 
-def _audit_verdict(case: dict[str, Any], field: str, alias: str, kind: str) -> str:
+def _audit_verdict(case: dict[str, Any], field: str, alias: str, kind: str, context: str = "") -> str:
     alias_norm = _audit_norm(alias)
     source_type = _audit_source_type(case)
     if kind in {"runtime_gold_marker", "primary_selection_source", "source_real_false"}:
@@ -844,6 +859,8 @@ def _audit_verdict(case: dict[str, Any], field: str, alias: str, kind: str) -> s
     if kind == "prediction_marker":
         return "needs_review"
     if field == "prompt_memory_ops":
+        if _is_prompt_guard_language_false_positive(alias, context):
+            return "benign_prompt_guard_language"
         return "needs_review"
     if field in {"runtime_visible", "counterfactual_intervention"}:
         return "needs_review"
@@ -962,6 +979,7 @@ def build_leakage_audit_details(cases: list[dict[str, Any]], predictions: list[d
         counterfactual_text = json.dumps({"intervention": verification.get("intervention")}, ensure_ascii=False)
         for alias in _audit_aliases(case):
             if prompt_text and _contains(prompt_text, alias):
+                context = _audit_context(prompt_text, alias)
                 details.append(
                     {
                         "case_id": case_id,
@@ -970,8 +988,14 @@ def build_leakage_audit_details(cases: list[dict[str, Any]], predictions: list[d
                         "field": "prompt_memory_ops",
                         "kind": "prompt_memory_ops_gold_mention",
                         "alias": alias,
-                        "verdict": _audit_verdict(case, "prompt_memory_ops", alias, "prompt_memory_ops_gold_mention"),
-                        "context": _audit_context(prompt_text, alias),
+                        "verdict": _audit_verdict(
+                            case,
+                            "prompt_memory_ops",
+                            alias,
+                            "prompt_memory_ops_gold_mention",
+                            context,
+                        ),
+                        "context": context,
                     }
                 )
             if _contains(counterfactual_text, alias):
@@ -1002,6 +1026,7 @@ def summarize_leakage_audit_details(details: list[dict[str, Any]]) -> dict[str, 
         "benign_visible_question_topic_count": int(verdict_counts.get("benign_visible_question_topic", 0)),
         "benign_visible_option_count": int(verdict_counts.get("benign_visible_option", 0)),
         "benign_model_answer_phrase_count": int(verdict_counts.get("benign_model_answer_phrase", 0)),
+        "benign_prompt_guard_language_count": int(verdict_counts.get("benign_prompt_guard_language", 0)),
         "short_label_false_positive_count": int(verdict_counts.get("short_label_false_positive", 0)),
         "runtime_gold_mentions": int(kind_counts.get("runtime_gold_mention", 0)),
         "runtime_gold_markers": int(kind_counts.get("runtime_gold_marker", 0)),

@@ -454,6 +454,7 @@ def test_run_ours_medical_answer_entity_skips_second_pass_and_prefers_options(tm
         "memory_seed": [],
         "poison_records": [],
         "counterfactuals": [{"intervention": "Remove or negate this evidence: mite"}],
+        "data_quality_flags": {"source_dataset": "medmcqa", "source_type": "medical_mcqa"},
     }
     client = CounterfactualClient(
         [
@@ -480,7 +481,8 @@ def test_run_ours_medical_answer_entity_skips_second_pass_and_prefers_options(tm
     assert len(client.messages) == 1
     assert pred["method"] == "medimem_topk8_round1"
     assert pred["primary_diagnosis"] == "Mite"
-    assert pred["primary_selection_pass"]["source"] in {"answer_options", "model_list"}
+    assert pred["primary_selection_pass"]["source"] == "answer_options"
+    assert pred["primary_selection_pass"]["constraint"] == "visible_medical_mcqa_options"
     assert pred["source_evidence_note_count"] == 0
     assert pred["diagnosis_candidate_count"] == 0
     assert pred["diagnosis_second_pass"] == {"enabled": False, "reason": "medical_answer_entity_option_locked"}

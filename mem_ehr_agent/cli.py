@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .benchmark import benchmark_status, parse_int_list, parse_methods, run_native_benchmark
+from .benchmark import benchmark_status, parse_int_list, parse_method_queue, parse_methods, run_locomo_parallel_benchmark, run_native_benchmark
 from .data_builder import build_dataset, write_prefix_slices
 from .expanded_data import build_medical_ehr_pool, parse_source_names
 from .io_utils import ensure_dir, read_jsonl, write_jsonl
@@ -120,6 +120,24 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         locomo_top_k=args.locomo_top_k,
         locomo_coarse_k=args.locomo_coarse_k,
         top_k_sweep=parse_int_list(args.top_k_sweep),
+    )
+    print(f"run_dir={run_dir}")
+
+
+def cmd_benchmark_run_locomo_parallel(args: argparse.Namespace) -> None:
+    run_dir = run_locomo_parallel_benchmark(
+        methods_a=parse_method_queue(args.methods_a),
+        methods_b=parse_method_queue(args.methods_b),
+        base_url_a=args.base_url_a,
+        base_url_b=args.base_url_b,
+        dataset_path=args.dataset_path,
+        sample_n=args.sample_n,
+        random_seed=args.random_seed,
+        max_workers_per_queue=args.max_workers_per_queue,
+        output_root=args.output_root,
+        require_api=args.require_api,
+        locomo_top_k=args.locomo_top_k,
+        locomo_coarse_k=args.locomo_coarse_k,
     )
     print(f"run_dir={run_dir}")
 
@@ -284,6 +302,20 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_run.add_argument("--locomo-coarse-k", type=int, default=32, help="Coarse LoCoMo retrieval pool before reranking.")
     benchmark_run.add_argument("--top-k-sweep", default=None, help="Comma-separated LoCoMo ours top-k sweep, e.g. 8,16,32.")
     benchmark_run.set_defaults(func=cmd_benchmark_run)
+    locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")
+    locomo_parallel.add_argument("--methods-a", default="direct,amem,memoryos,medimem")
+    locomo_parallel.add_argument("--methods-b", default="meminsight,gmemory,ddo")
+    locomo_parallel.add_argument("--base-url-a", default=None)
+    locomo_parallel.add_argument("--base-url-b", default=None)
+    locomo_parallel.add_argument("--dataset-path", default=None)
+    locomo_parallel.add_argument("--sample-n", type=int, default=1000)
+    locomo_parallel.add_argument("--random-seed", type=int, default=20260606)
+    locomo_parallel.add_argument("--max-workers-per-queue", type=int, default=48)
+    locomo_parallel.add_argument("--output-root", default="runs")
+    locomo_parallel.add_argument("--require-api", action="store_true")
+    locomo_parallel.add_argument("--locomo-top-k", type=int, default=8)
+    locomo_parallel.add_argument("--locomo-coarse-k", type=int, default=32)
+    locomo_parallel.set_defaults(func=cmd_benchmark_run_locomo_parallel)
     benchmark_status_parser = benchmark_sub.add_parser("status")
     benchmark_status_parser.set_defaults(func=cmd_benchmark_status)
     return parser
@@ -293,3 +325,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
+
+
+if __name__ == "__main__":
+    main()

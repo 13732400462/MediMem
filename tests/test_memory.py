@@ -1,5 +1,5 @@
 from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.memory import MemoryStore, apply_critique
+from mem_ehr_agent.memory import MemoryStore, apply_critique, bootstrap_memory
 from mem_ehr_agent.agents import (
     case_context,
     compact_case_context,
@@ -61,12 +61,31 @@ def test_ablation_feature_state_and_fixed_top_k():
         "diagnosis_normalization": False,
         "dynamic_top_k": False,
         "memory_cleaning": False,
+        "polluted_memory": False,
         "critic_op_guard": True,
         "evidence_note_injection": True,
         "profile_adaptive_memory_cleaning": True,
         "profile_adaptive_evidence_notes": False,
         "counterfactual_verification": True,
     }
+
+
+def test_enable_polluted_memory_feature_state():
+    strategy = {"features": {"enable_polluted_memory": True}}
+    assert feature_state(strategy)["polluted_memory"] is True
+
+
+def test_bootstrap_memory_omits_poison_by_default(tmp_path):
+    case = {
+        "case_id": "case_clean_memory",
+        "events": [{"event_id": "ev1", "text": "Confirmed pneumonia.", "type": "diagnosis", "time": 1}],
+        "memory_seed": [],
+        "poison_records": [{"poison_id": "p1", "text": "Stale incorrect diagnosis.", "pollution_type": "stale"}],
+    }
+    clean = bootstrap_memory(case, tmp_path / "clean.memory.jsonl")
+    polluted = bootstrap_memory(case, tmp_path / "polluted.memory.jsonl", include_poison=True)
+    assert all("poison" not in card.get("tags", []) for card in clean.cards)
+    assert any("poison" in card.get("tags", []) for card in polluted.cards)
 
 
 def test_revise_marks_old_memory_superseded_and_writes_replacement(tmp_path):
@@ -474,17 +493,18 @@ def test_required_baseline_set_runs_required_unpolluted_pipelines(tmp_path, monk
     }
 
 
-def test_fast_formal_ablation_group_parser_selects_three_groups():
+def test_fast_formal_ablation_group_parser_selects_pollution_ablation():
     from mem_ehr_agent.optimizer import parse_ablation_groups
 
     groups = parse_ablation_groups(
-        "full,no_memory_cleaning,no_evidence_note_injection",
+        "full,no_memory_cleaning,no_evidence_note_injection,with_polluted_memory",
         default=[],
     )
     assert [name for name, _ in groups] == [
         "full",
         "ablate_no_memory_cleaning",
         "ablate_no_evidence_note_injection",
+        "ablate_with_polluted_memory",
     ]
 
 

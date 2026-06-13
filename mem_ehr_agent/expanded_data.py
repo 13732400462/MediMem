@@ -382,6 +382,45 @@ def chatdoctor_assessment_entities(response: str, question: str = "") -> list[st
     return dedupe_text(out)[:4]
 
 
+def soap_assessment_entities(summary: str, dialogue: str = "") -> list[str]:
+    text = str(summary or "")
+    if not text.strip():
+        return []
+    section_patterns = [
+        r"\b(?:assessment\s*/\s*plan|assessment\s+and\s+plan|assessment|diagnosis|diagnoses|impression)\s*[:\-]\s*(.+?)(?=\s+(?:subjective|objective|plan|assessment|diagnosis|diagnoses|impression)\s*[:\-]|\Z)",
+        r"(?:^|\n)\s*(?:assessment\s*/\s*plan|assessment\s+and\s+plan|assessment|diagnosis|diagnoses|impression)\s*[:\-]\s*(.+?)(?=\n\s*(?:subjective|objective|plan|assessment|diagnosis|diagnoses|impression)\s*[:\-]|\Z)",
+        r"\b(?:assessment|diagnosis|impression)\s+(?:is|was|:)\s+([^.\n;]+)",
+    ]
+    candidates: list[str] = []
+    for pattern in section_patterns:
+        for match in re.finditer(pattern, text, flags=re.I | re.S):
+            section = re.sub(r"\s+", " ", match.group(1)).strip()
+            for part in re.split(r"\s*(?:;|\||, and |\band\b|\d+\.)\s*", section):
+                part = re.sub(
+                    r"^(?:the\s+)?(?:patient\s+)?(?:has|with|is|was|likely|probably|possible|suspected|assessment of|diagnosis of)\s+",
+                    "",
+                    part.strip(" .,:;-"),
+                    flags=re.I,
+                )
+                entity = compact_entity(part, max_words=8, max_chars=80)
+                if entity and not is_bad_label(entity) and not is_question_like_label(entity):
+                    candidates.append(entity)
+            if candidates:
+                return dedupe_text(candidates)[:4]
+    combined = " ".join(part for part in [text, dialogue] if part)
+    for pattern in (
+        r"\b(?:consistent with|suggestive of|concerning for|due to|secondary to)\s+([^.;\n]+)",
+        r"\b(?:acute|chronic|recurrent)\s+([A-Za-z][A-Za-z -]{3,80}(?:infection|syndrome|disease|pain|injury|failure|exacerbation))\b",
+    ):
+        for match in re.finditer(pattern, combined, flags=re.I):
+            entity = compact_entity(match.group(1), max_words=8, max_chars=80)
+            if entity and not is_bad_label(entity) and not is_question_like_label(entity):
+                candidates.append(entity)
+        if candidates:
+            break
+    return dedupe_text(candidates)[:4]
+
+
 def wikidoc_answer_entities(answer: str, question: str = "", subject: str = "") -> list[str]:
     text = re.sub(r"\s+", " ", str(answer or "")).strip()
     patterns = [
@@ -476,6 +515,10 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
     subject = text_value(row, "subject_name", "topic_name", "category", "department")
     if spec.name == "chatdoctor_healthcaremagic":
         diagnoses = chatdoctor_assessment_entities(explanation or answer, question or context or title)
+    elif spec.name == "medical_dialogue_to_soap":
+        diagnoses = soap_assessment_entities(explanation or answer, question or context or title)
+        if not diagnoses:
+            diagnoses = ["Medical dialogue SOAP assessment unavailable"]
     elif spec.name == "medical_meadow_wikidoc":
         diagnoses = wikidoc_answer_entities(explanation or answer, question or title, subject)
     elif spec.source_type == "medical_mcqa" and answer:
@@ -484,6 +527,8 @@ def generic_row_to_pmoa_like(row: dict[str, Any], spec: MedicalDatasetSpec, idx:
         diagnosis_seed = answer or explanation or subject or title
         diagnoses = diagnosis_from_text(diagnosis_seed, fallback=subject or "Medical answer entity")
     diagnosis_metric_applicable = not any(is_bad_label(item) or is_question_like_label(item) for item in diagnoses)
+    if spec.name == "medical_dialogue_to_soap" and diagnoses == ["Medical dialogue SOAP assessment unavailable"]:
+        diagnosis_metric_applicable = False
 
     event_texts = []
     if title and not re.fullmatch(r"(?:answer this question truthfully|if you are a doctor.*)", title, flags=re.I):
