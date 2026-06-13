@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +16,7 @@ from threading import Lock
 from typing import Any
 
 from .amem_baseline import SourceAlignedAMEMSystem
-from .config import get_deepseek_config
+from .config import DeepSeekConfig, get_deepseek_config
 from .io_utils import ensure_dir, read_jsonl, write_jsonl, write_text
 from .llm import DeepSeekClient, extract_json_object
 from .memory import MemoryStore, text_similarity
@@ -210,6 +212,27 @@ def build_client(require_api: bool = False) -> tuple[DeepSeekClient | None, str 
     if require_api:
         raise RuntimeError(f"DeepSeek API unavailable: {msg}")
     return None, f"DeepSeek API unavailable, using deterministic QA fallback: {msg}"
+
+
+def build_client_for_base_url(base_url: str | None, *, require_api: bool = False) -> tuple[DeepSeekClient | None, str | None]:
+    base_config = get_deepseek_config()
+    if base_url:
+        config = DeepSeekConfig(
+            base_url=base_url.rstrip("/"),
+            api_key=base_config.api_key,
+            model=base_config.model,
+            timeout=base_config.timeout,
+            max_tokens=base_config.max_tokens,
+        )
+    else:
+        config = base_config
+    client = DeepSeekClient(config)
+    ok, message = client.healthcheck()
+    if ok:
+        return client, None
+    if require_api:
+        raise RuntimeError(f"Benchmark API healthcheck failed: {message}")
+    return None, message
 
 
 def normalize_answer(value: Any) -> str:
@@ -605,6 +628,8 @@ def answer_with_context(
     fail_on_llm_error: bool = False,
 ) -> dict[str, Any]:
     if client is None:
+        if fail_on_llm_error:
+            raise RuntimeError(f"Benchmark QA client unavailable for {sample['sample_id']} ({method}).")
         return deterministic_qa_fallback(sample, method, context=context)
     try:
         result = client.chat(qa_prompt(sample, method, context), temperature=0.0, max_tokens=900)
@@ -628,6 +653,8 @@ def answer_with_context(
             "usage": result.usage,
         }
     except Exception as exc:  # noqa: BLE001
+        if fail_on_llm_error:
+            raise RuntimeError(f"Benchmark QA returned malformed JSON for {sample['sample_id']} ({method}): {exc}") from exc
         answer_match = re.search(r'"answer"\s*:\s*"([^"]*)"', result.text)
         recovered_answer = answer_match.group(1) if answer_match else result.text.strip()
         return {
@@ -646,6 +673,72 @@ def answer_with_context(
 def locomo_memory_path(run_dir: str | Path, conversation_id: str) -> Path:
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", conversation_id).strip("_") or "conversation"
     return Path(run_dir) / "memory" / "ours" / f"{safe_id}.memory.jsonl"
+
+
+def locomo_cache_key(sample: dict[str, Any], *, dataset_hash: str, top_k: int, coarse_k: int) -> str:
+    raw_id = str(sample.get("sample_id") or sample.get("conversation_id") or "")
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
+    return f"{safe_id}__{dataset_hash[:12]}__top{top_k}__coarse{coarse_k}"
+
+
+def locomo_dataset_hash(samples: list[dict[str, Any]]) -> str:
+    h = hashlib.sha256()
+    for sample in samples:
+        payload = {
+            "sample_id": sample.get("sample_id"),
+            "conversation_id": sample.get("conversation_id"),
+            "question": sample.get("question"),
+            "answer": sample.get("answer"),
+            "turn_count": len(sample.get("turns") or []),
+        }
+        h.update(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def locomo_cached_memory_path(
+    cache_dir: str | Path,
+    sample: dict[str, Any],
+    *,
+    dataset_hash: str,
+    top_k: int,
+    coarse_k: int,
+) -> Path:
+    return Path(cache_dir) / "locomo_memory_store" / f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k)}.memory.jsonl"
+
+
+def build_cached_locomo_memory_store(
+    sample: dict[str, Any],
+    cache_dir: str | Path | None,
+    *,
+    dataset_hash: str,
+    top_k: int,
+    coarse_k: int,
+    fallback_path: str | Path,
+) -> MemoryStore:
+    if cache_dir is None:
+        return build_locomo_memory_store(sample, fallback_path)
+    memory_path = locomo_cached_memory_path(cache_dir, sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k)
+    ensure_dir(memory_path.parent)
+    lock_path = memory_path.with_suffix(memory_path.suffix + ".lock")
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if memory_path.exists():
+                store = MemoryStore.load(str(sample.get("conversation_id") or sample["sample_id"]), memory_path)
+                if store.cards:
+                    return store
+            time.sleep(0.05)
+    try:
+        return build_locomo_memory_store(sample, memory_path)
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def build_locomo_memory_store(sample: dict[str, Any], memory_path: str | Path) -> MemoryStore:
@@ -916,13 +1009,22 @@ def run_locomo_ours_memory_pipeline(
     top_k: int = 8,
     coarse_k: int = 32,
     require_api: bool,
+    memory_cache_dir: str | Path | None = None,
+    dataset_hash: str = "",
 ) -> dict[str, Any]:
     if sample.get("dataset") != "locomo":
         raise ValueError("run_locomo_ours_memory_pipeline only supports LoCoMo samples.")
     conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
     memory_id = f"{conversation_id}_{sample['sample_id']}"
     memory_path = locomo_memory_path(run_dir, memory_id)
-    store = build_locomo_memory_store(sample, memory_path)
+    store = build_cached_locomo_memory_store(
+        sample,
+        memory_cache_dir,
+        dataset_hash=dataset_hash,
+        top_k=top_k,
+        coarse_k=coarse_k,
+        fallback_path=memory_path,
+    )
     retrieved = retrieve_locomo_memories(store, sample, top_k=top_k, coarse_k=coarse_k)
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
     prompt_context = (
@@ -942,7 +1044,7 @@ def run_locomo_ours_memory_pipeline(
     pred = answer_with_context(sample, "medimem_locomo_memory_pipeline", prompt_context, client, fail_on_llm_error=require_api)
     pred["retrieved_memory_count"] = len(retrieved)
     pred["memory_card_count"] = len(store.cards)
-    pred["memory_path"] = str(memory_path)
+    pred["memory_path"] = str(store.path)
     pred["memory_ops"] = []
     pred["guard_passed"] = True
     pred["locomo_top_k"] = top_k
@@ -1034,12 +1136,21 @@ def run_locomo_official_wrapper(
     top_k: int = 8,
     coarse_k: int = 32,
     require_api: bool,
+    memory_cache_dir: str | Path | None = None,
+    dataset_hash: str = "",
 ) -> dict[str, Any]:
     if sample.get("dataset") != "locomo":
         raise ValueError(f"{method} official wrapper currently supports only LoCoMo samples.")
     repo, python = ensure_official_wrapper_ready(method)
     memory_path = locomo_memory_path(Path(run_dir) / "official_wrappers" / method, str(sample["sample_id"]))
-    store = build_locomo_memory_store(sample, memory_path)
+    store = build_cached_locomo_memory_store(
+        sample,
+        memory_cache_dir,
+        dataset_hash=dataset_hash,
+        top_k=top_k,
+        coarse_k=coarse_k,
+        fallback_path=memory_path,
+    )
     retrieved = retrieve_locomo_memories(store, sample, top_k=top_k, coarse_k=coarse_k)
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
     prompt_context = (
@@ -1063,7 +1174,7 @@ def run_locomo_official_wrapper(
     pred = answer_with_context(sample, BASELINE_METHOD_LABELS[method], prompt_context, client, fail_on_llm_error=require_api)
     pred["retrieved_memory_count"] = len(retrieved)
     pred["memory_card_count"] = len(store.cards)
-    pred["memory_path"] = str(memory_path)
+    pred["memory_path"] = str(store.path)
     pred["guard_passed"] = True
     pred["baseline_reproduction_level"] = BASELINE_REPRODUCTION_LEVELS[method]
     pred["official_repo"] = METHOD_OFFICIAL_REPOS[method]
@@ -1086,6 +1197,8 @@ def run_local_method(
     locomo_top_k: int = 8,
     locomo_coarse_k: int = 32,
     method_label: str | None = None,
+    memory_cache_dir: str | Path | None = None,
+    dataset_hash: str = "",
 ) -> dict[str, Any]:
     if method == "direct":
         pred = answer_with_context(
@@ -1112,6 +1225,8 @@ def run_local_method(
             top_k=locomo_top_k,
             coarse_k=locomo_coarse_k,
             require_api=require_api,
+            memory_cache_dir=memory_cache_dir,
+            dataset_hash=dataset_hash,
         )
         if method_label:
             pred["method"] = method_label
@@ -1550,6 +1665,297 @@ def run_native_benchmark(
     }
     write_text(run_dir / "benchmark_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     render_benchmark_report(run_dir, dataset, metrics, manifest)
+    return run_dir
+
+
+def parse_method_queue(raw: str) -> list[str]:
+    return parse_methods(raw)
+
+
+def append_stage_status(path: str | Path, row: dict[str, Any]) -> None:
+    p = Path(path)
+    ensure_dir(p.parent)
+    payload = {"time": datetime.now().isoformat(timespec="seconds"), **row}
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def prepare_locomo_memory_cache(
+    samples: list[dict[str, Any]],
+    *,
+    cache_dir: str | Path,
+    dataset_hash: str,
+    top_k: int,
+    coarse_k: int,
+    max_workers: int,
+    status_path: str | Path,
+) -> None:
+    started = time.time()
+    append_stage_status(status_path, {"stage": "cache_prepare", "status": "started", "sample_count": len(samples)})
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+        futures = [
+            pool.submit(
+                build_cached_locomo_memory_store,
+                sample,
+                cache_dir,
+                dataset_hash=dataset_hash,
+                top_k=top_k,
+                coarse_k=coarse_k,
+                fallback_path=locomo_memory_path(Path(cache_dir) / "fallback", str(sample["sample_id"])),
+            )
+            for sample in samples
+        ]
+        completed = 0
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            if completed % 100 == 0 or completed == len(samples):
+                append_stage_status(
+                    status_path,
+                    {"stage": "cache_prepare", "status": "progress", "completed": completed, "sample_count": len(samples)},
+                )
+    append_stage_status(
+        status_path,
+        {"stage": "cache_prepare", "status": "finished", "elapsed_s": round(time.time() - started, 3)},
+    )
+
+
+def build_locomo_amem_runtimes(samples: list[dict[str, Any]]) -> dict[str, LocomoAMEMRuntime]:
+    runtimes: dict[str, LocomoAMEMRuntime] = {}
+    seen_conversations: set[str] = set()
+    for sample in samples:
+        conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
+        if conversation_id in seen_conversations:
+            continue
+        runtimes[conversation_id] = LocomoAMEMRuntime(system=build_locomo_amem_system(sample), lock=Lock())
+        seen_conversations.add(conversation_id)
+    return runtimes
+
+
+def run_locomo_method_batch(
+    *,
+    method: str,
+    samples: list[dict[str, Any]],
+    client: DeepSeekClient | None,
+    run_dir: Path,
+    require_api: bool,
+    max_workers: int,
+    locomo_top_k: int,
+    locomo_coarse_k: int,
+    memory_cache_dir: Path,
+    dataset_hash: str,
+    amem_runtimes: dict[str, LocomoAMEMRuntime],
+    status_path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    started = time.time()
+    append_stage_status(status_path, {"stage": "method", "method": method, "status": "started", "sample_count": len(samples)})
+    predictions: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    if method in LOCAL_METHODS:
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+            futures = {
+                pool.submit(
+                    run_local_method,
+                    sample,
+                    method,
+                    client,
+                    require_api=require_api,
+                    run_dir=run_dir,
+                    amem_runtimes=amem_runtimes,
+                    locomo_top_k=locomo_top_k,
+                    locomo_coarse_k=locomo_coarse_k,
+                    memory_cache_dir=memory_cache_dir,
+                    dataset_hash=dataset_hash,
+                ): sample["sample_id"]
+                for sample in samples
+            }
+            completed = 0
+            for future in as_completed(futures):
+                predictions.append(future.result())
+                completed += 1
+                if completed % 100 == 0 or completed == len(samples):
+                    append_stage_status(
+                        status_path,
+                        {"stage": "method", "method": method, "status": "progress", "completed": completed, "sample_count": len(samples)},
+                    )
+    elif method in OFFICIAL_WRAPPER_METHODS:
+        status = official_method_status(method, "locomo")
+        if status.get("status") != "official_wrapper_configured":
+            blocked.append(status)
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+                futures = {
+                    pool.submit(
+                        run_locomo_official_wrapper,
+                        sample,
+                        method,
+                        client,
+                        run_dir=run_dir,
+                        top_k=locomo_top_k,
+                        coarse_k=locomo_coarse_k,
+                        require_api=require_api,
+                        memory_cache_dir=memory_cache_dir,
+                        dataset_hash=dataset_hash,
+                    ): sample["sample_id"]
+                    for sample in samples
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    predictions.append(future.result())
+                    completed += 1
+                    if completed % 100 == 0 or completed == len(samples):
+                        append_stage_status(
+                            status_path,
+                            {"stage": "method", "method": method, "status": "progress", "completed": completed, "sample_count": len(samples)},
+                        )
+    else:
+        blocked.append(official_method_status(method, "locomo"))
+    write_jsonl(run_dir / "method_predictions" / f"{method}.jsonl", predictions)
+    append_stage_status(
+        status_path,
+        {
+            "stage": "method",
+            "method": method,
+            "status": "finished",
+            "prediction_count": len(predictions),
+            "blocked_count": len(blocked),
+            "elapsed_s": round(time.time() - started, 3),
+        },
+    )
+    return predictions, blocked
+
+
+def run_locomo_parallel_benchmark(
+    *,
+    methods_a: list[str],
+    methods_b: list[str],
+    base_url_a: str | None,
+    base_url_b: str | None,
+    dataset_path: str | Path | None = None,
+    sample_n: int | None = None,
+    random_seed: int | None = None,
+    max_workers_per_queue: int = 48,
+    output_root: str | Path = "runs",
+    require_api: bool = False,
+    locomo_top_k: int = 8,
+    locomo_coarse_k: int = 32,
+) -> Path:
+    loaded_samples = load_native_samples("locomo", dataset_path, limit=None)
+    samples = sample_benchmark_rows(loaded_samples, sample_n=sample_n, random_seed=random_seed)
+    prefix = f"locomo_parallel_random{sample_n}" if sample_n else "locomo_parallel"
+    run_dir = make_benchmark_run_dir(output_root, prefix=prefix)
+    status_path = run_dir / "stage_status.jsonl"
+    ensure_dir(run_dir / "method_predictions")
+    dataset_hash = locomo_dataset_hash(samples)
+    memory_cache_dir = run_dir / "shared_cache"
+    started = time.time()
+    append_stage_status(
+        status_path,
+        {
+            "stage": "run",
+            "status": "started",
+            "sample_count": len(samples),
+            "methods_a": methods_a,
+            "methods_b": methods_b,
+            "max_workers_per_queue": max_workers_per_queue,
+        },
+    )
+    client_a, blocker_a = build_client_for_base_url(base_url_a, require_api=require_api)
+    client_b, blocker_b = build_client_for_base_url(base_url_b or base_url_a, require_api=require_api)
+    prepare_locomo_memory_cache(
+        samples,
+        cache_dir=memory_cache_dir,
+        dataset_hash=dataset_hash,
+        top_k=locomo_top_k,
+        coarse_k=locomo_coarse_k,
+        max_workers=max_workers_per_queue * 2,
+        status_path=status_path,
+    )
+    all_methods = list(dict.fromkeys(methods_a + methods_b))
+    amem_runtimes = build_locomo_amem_runtimes(samples) if "amem" in all_methods else {}
+
+    def run_queue(label: str, methods: list[str], client: DeepSeekClient | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        queue_predictions: list[dict[str, Any]] = []
+        queue_blocked: list[dict[str, Any]] = []
+        append_stage_status(status_path, {"stage": "queue", "queue": label, "status": "started", "methods": methods})
+        for method in methods:
+            preds, blocked = run_locomo_method_batch(
+                method=method,
+                samples=samples,
+                client=client,
+                run_dir=run_dir,
+                require_api=require_api,
+                max_workers=max_workers_per_queue,
+                locomo_top_k=locomo_top_k,
+                locomo_coarse_k=locomo_coarse_k,
+                memory_cache_dir=memory_cache_dir,
+                dataset_hash=dataset_hash,
+                amem_runtimes=amem_runtimes,
+                status_path=status_path,
+            )
+            queue_predictions.extend(preds)
+            queue_blocked.extend(blocked)
+        append_stage_status(status_path, {"stage": "queue", "queue": label, "status": "finished"})
+        return queue_predictions, queue_blocked
+
+    predictions: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(run_queue, "A", methods_a, client_a),
+            pool.submit(run_queue, "B", methods_b, client_b),
+        ]
+        for future in as_completed(futures):
+            preds, items = future.result()
+            predictions.extend(preds)
+            blocked.extend(items)
+    write_jsonl(run_dir / "samples.jsonl", samples)
+    write_jsonl(run_dir / "predictions" / "locomo.jsonl", predictions)
+    write_jsonl(run_dir / "blocked_methods.jsonl", blocked)
+    metrics = evaluate_benchmark_predictions(samples, predictions)
+    write_csv(run_dir / "locomo_metrics.csv", metrics)
+    locomo_metrics = evaluate_locomo_benchmark_predictions(samples, predictions)
+    write_csv(run_dir / "locomo_metrics_overall.csv", locomo_metrics["overall"])
+    write_csv(run_dir / "locomo_metrics_by_category.csv", locomo_metrics["by_category"])
+    write_csv(run_dir / "locomo_metrics_auxiliary.csv", locomo_metrics["auxiliary"])
+    write_csv(run_dir / "locomo_metrics_official_style.csv", locomo_metrics["official_style"])
+    write_jsonl(run_dir / "locomo_metrics_per_sample.jsonl", locomo_metrics["per_sample"])
+    validation = validate_horizontal_run(samples, predictions) if predictions else {"passed": False, "failures": ["no predictions"]}
+    manifest = {
+        "dataset": "locomo",
+        "dataset_path": str(dataset_path or NATIVE_BENCHMARKS["locomo"].default_path),
+        "methods": all_methods,
+        "methods_a": methods_a,
+        "methods_b": methods_b,
+        "sample_n": sample_n,
+        "random_seed": random_seed,
+        "max_workers_per_queue": max_workers_per_queue,
+        "base_url_a": base_url_a,
+        "base_url_b": base_url_b,
+        "client_blockers": {"A": blocker_a, "B": blocker_b},
+        "locomo_top_k": locomo_top_k,
+        "locomo_coarse_k": locomo_coarse_k,
+        "dataset_hash": dataset_hash,
+        "memory_cache_dir": str(memory_cache_dir),
+        "total_available_qa_samples": len(loaded_samples),
+        "local_methods": sorted({str(pred.get("method")) for pred in predictions}),
+        "blocked_methods": blocked,
+        "validation": validation,
+        "official_repo": NATIVE_BENCHMARKS["locomo"].official_repo,
+        "model": get_deepseek_config().model,
+        "elapsed_s": round(time.time() - started, 3),
+        "metric_policy": {
+            "benchmark_compatible_primary": list(LOCOMO_MAIN_METRICS),
+            "locomo_category_breakdown": True,
+            "auxiliary_audit_only": list(LOCOMO_AUXILIARY_METRICS),
+            "official_style_additional": list(LOCOMO_OFFICIAL_STYLE_METRICS),
+            "skipped_metrics": locomo_metrics.get("skipped_metrics", {}),
+            "scale": "0-1",
+        },
+    }
+    write_text(run_dir / "benchmark_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    render_benchmark_report(run_dir, "locomo", metrics, manifest)
+    append_stage_status(status_path, {"stage": "run", "status": "finished", "elapsed_s": round(time.time() - started, 3)})
     return run_dir
 
 

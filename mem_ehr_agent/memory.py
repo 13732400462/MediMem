@@ -127,7 +127,7 @@ class MemoryStore:
         return [card | {"retrieval_score": score} for score, card in scored[:k] if score > 0 or include_inactive]
 
 
-def bootstrap_memory(case: dict[str, Any], path: str | Path) -> MemoryStore:
+def bootstrap_memory(case: dict[str, Any], path: str | Path, *, include_poison: bool = False) -> MemoryStore:
     store = MemoryStore.load(case["case_id"], path)
     if store.cards:
         return store
@@ -151,16 +151,17 @@ def bootstrap_memory(case: dict[str, Any], path: str | Path) -> MemoryStore:
                 tags=[str(event.get("type"))],
                 op="Write",
             )
-    for poison in case.get("poison_records", []):
-        store.write_card(
-            summary=str(poison.get("text")),
-            evidence_refs=[str(poison.get("poison_id"))],
-            time_scope={},
-            confidence=0.2,
-            tags=["poison", "outdated"],
-            status="active",
-            op="Write",
-        )
+    if include_poison:
+        for poison in case.get("poison_records", []):
+            store.write_card(
+                summary=str(poison.get("text")),
+                evidence_refs=[str(poison.get("poison_id"))],
+                time_scope={},
+                confidence=0.2,
+                tags=["poison", "outdated"],
+                status="active",
+                op="Write",
+            )
     return store
 
 

@@ -545,6 +545,32 @@ def test_detail_leakage_audit_downgrades_short_label_false_positive():
     assert summary["short_label_false_positive_count"] >= 1
 
 
+def test_detail_leakage_audit_downgrades_prompt_guard_language_false_positive():
+    case = {
+        "case_id": "pmoa_tts_0001",
+        "labels": {"primary_diagnosis": "diagnosis", "diagnosis_list": ["diagnosis"]},
+        "events": [{"text": "Longitudinal source text."}],
+        "memory_seed": [],
+        "poison_records": [],
+        "data_quality_flags": {"source_dataset": "pmoa_tts", "source_type": "longitudinal_case"},
+    }
+    pred = {
+        "case_id": "pmoa_tts_0001",
+        "method": "full_medimem_topk8_round1",
+        "prompt_memory_ops": [
+            {
+                "target": "poison_1",
+                "op": "Revise",
+                "revision_note": "Preserve source-grounded evidence by reference only; do not use the prior interpretation as a diagnosis.",
+            }
+        ],
+    }
+    details = build_leakage_audit_details([case], [pred])
+    summary = summarize_leakage_audit_details(details)
+    assert summary["needs_review_count"] == 0
+    assert summary["benign_prompt_guard_language_count"] == 1
+
+
 def test_detail_leakage_audit_marks_prompt_gold_entity_for_review():
     case = {
         "case_id": "medqa_0001",

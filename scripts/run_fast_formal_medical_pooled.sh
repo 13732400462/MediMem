@@ -105,7 +105,7 @@ PY
       --max-workers "$MAX_WORKERS" \
       --suite-profile fast-formal \
       --baseline-set required \
-      --ablation-groups full,no_memory_cleaning,no_evidence_note_injection \
+      --ablation-groups full,no_memory_cleaning,no_evidence_note_injection,with_polluted_memory \
       --counterfactual-policy risk_sample \
       --counterfactual-sample-rate "$COUNTERFACTUAL_SAMPLE_RATE" \
       --counterfactual-risk-threshold "$COUNTERFACTUAL_RISK_THRESHOLD" \
@@ -186,6 +186,8 @@ leakage = []
 for item in completed:
     run_dir = pathlib.Path(item.get("run_dir") or "")
     metrics_path = run_dir / "source_metrics.csv" if item.get("kind") == "medical_pooled" else run_dir / "locomo_metrics.csv"
+    if item.get("kind") == "benchmark" and not metrics_path.exists():
+        metrics_path = run_dir / "locomo_metrics_overall.csv"
     if not metrics_path.exists():
         metrics_path = run_dir / "metrics.csv"
     if metrics_path.exists():
@@ -214,6 +216,73 @@ if rows:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
+baseline_methods = {
+    "direct_deepseek",
+    "baseline_single_cot_agent",
+    "baseline_amem_adapter",
+    "baseline_ddo_adapter",
+    "baseline_colacare_adapter",
+}
+win_rows = []
+medical_sources = sorted({row.get("source") for row in rows if row.get("kind") == "medical_pooled" and row.get("source") not in {"", None, "overall"}})
+for source in medical_sources:
+    source_rows = [row for row in rows if row.get("kind") == "medical_pooled" and row.get("source") == source]
+    full = next((row for row in source_rows if row.get("method") == "full_medimem_merged"), None)
+    baselines = [row for row in source_rows if row.get("method") in baseline_methods]
+    if not full or not baselines:
+        continue
+    best = max(baselines, key=lambda row: float(row.get("primary_diag_objective") or 0))
+    full_value = float(full.get("primary_diag_objective") or 0)
+    best_value = float(best.get("primary_diag_objective") or 0)
+    win_rows.append({
+        "source": source,
+        "kind": "medical",
+        "metric": "primary_diag_objective",
+        "medimem_method": "full_medimem_merged",
+        "medimem_value": full_value,
+        "best_baseline_method": best.get("method"),
+        "best_baseline_value": best_value,
+        "delta": full_value - best_value,
+        "won": full_value >= best_value,
+    })
+locomo_rows = [row for row in rows if row.get("kind") == "benchmark"]
+if locomo_rows:
+    medimem = max(
+        [row for row in locomo_rows if str(row.get("method", "")).startswith(("medimem_locomo_memory_pipeline", "ours_locomo_memory_pipeline"))],
+        key=lambda row: float(row.get("qa_f1") or 0),
+        default=None,
+    )
+    baselines = [
+        row for row in locomo_rows
+        if not str(row.get("method", "")).startswith(("medimem_locomo_memory_pipeline", "ours_locomo_memory_pipeline"))
+    ]
+    if medimem and baselines:
+        best = max(baselines, key=lambda row: float(row.get("qa_f1") or 0))
+        medimem_value = float(medimem.get("qa_f1") or 0)
+        best_value = float(best.get("qa_f1") or 0)
+        win_rows.append({
+            "source": "locomo",
+            "kind": "benchmark",
+            "metric": "qa_f1",
+            "medimem_method": medimem.get("method"),
+            "medimem_value": medimem_value,
+            "best_baseline_method": best.get("method"),
+            "best_baseline_value": best_value,
+            "delta": medimem_value - best_value,
+            "won": medimem_value >= best_value,
+        })
+if win_rows:
+    with (run_root / "eight_source_win_summary.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(win_rows[0]))
+        writer.writeheader()
+        writer.writerows(win_rows)
+eight_source_gate = {
+    "source_count": len(win_rows),
+    "win_count": sum(1 for row in win_rows if row["won"]),
+    "required_win_count": 5,
+    "passed": len(win_rows) == 8 and sum(1 for row in win_rows if row["won"]) >= 5,
+    "summary_csv": str(run_root / "eight_source_win_summary.csv"),
+}
 medical_manifest = json.loads(medical_manifest_path.read_text(encoding="utf-8")) if medical_manifest_path.exists() else {}
 (run_root / "fast_formal_medical_pooled_manifest.json").write_text(json.dumps({
     "track": "fast_formal_medical_pooled",
@@ -234,11 +303,14 @@ medical_manifest = json.loads(medical_manifest_path.read_text(encoding="utf-8"))
     "critical_leakage_count": critical,
     "needs_review_count": needs_review,
     "comparison_csv": str(run_root / "fast_formal_medical_pooled_comparison.csv"),
+    "eight_source_gate": eight_source_gate,
 }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 if critical:
     raise SystemExit(f"critical leakage count is non-zero: {critical}")
 if needs_review:
     raise SystemExit(f"needs-review leakage count is non-zero: {needs_review}")
+if len(win_rows) == 8 and eight_source_gate["win_count"] < eight_source_gate["required_win_count"]:
+    raise SystemExit(f"eight-source gate failed: {eight_source_gate['win_count']}/8 wins")
 PY
 }
 

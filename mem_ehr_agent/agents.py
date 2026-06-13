@@ -330,6 +330,8 @@ def run_llm_prediction(
 ) -> dict[str, Any]:
     task_profile = case_task_profile(case)
     if client is None:
+        if fail_on_llm_error:
+            raise RuntimeError(f"LLM client unavailable for {case['case_id']} ({method}).")
         return heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
     context_attempts = [context]
     for max_chars in (24000, 18000, 12000):
@@ -362,6 +364,8 @@ def run_llm_prediction(
         raw = extract_json_object(result.text)
         return normalize_prediction(case["case_id"], method, raw, result.usage, enable_normalization=enable_normalization)
     except Exception as exc:  # noqa: BLE001 - prediction should degrade to fallback, not crash the run
+        if fail_on_llm_error:
+            raise RuntimeError(f"LLM prediction returned malformed JSON for {case['case_id']} ({method}): {exc}") from exc
         pred = heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
         pred["reasoning_summary"] += f" LLM fallback reason: {exc}"
         pred["llm_error"] = str(exc)
@@ -1141,7 +1145,9 @@ def select_primary_for_task_profile(
         str(pred.get("reasoning_summary") or ""),
     ]
     candidates: list[tuple[str, str, float]] = [(current, "model_primary", 3.0)]
-    source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
+    flags = case.get("data_quality_flags") or {}
+    source_dataset = str(flags.get("source_dataset") or "").strip()
+    source_type = str(flags.get("source_type") or "").strip()
     if source_dataset == "pmc_patients":
         current_entity = diagnosis_entity_from_text(current)
         if current_entity and current_entity != current:
@@ -1150,8 +1156,27 @@ def select_primary_for_task_profile(
     if profile == MEDICAL_ANSWER_ENTITY:
         candidates.extend(answer_entity_source_candidates(case))
         candidates.extend(visible_instruction_topic_candidates(case))
+        option_rows = []
         for option in answer_option_candidates(case):
-            candidates.append((option, "answer_options", 2.5 + text_overlap_score(option, blobs)))
+            option_rows.append((option, "answer_options", 2.5 + text_overlap_score(option, blobs)))
+        if source_type == "medical_mcqa" and option_rows:
+            best = max(option_rows, key=lambda row: (row[2], -len(row[0])))
+            selected = re.sub(r"^[A-E]\.\s*", "", best[0]).strip()
+            selected = normalize_answer_entity(selected, enable_normalization=enable_normalization)
+            if selected:
+                updated = dict(pred)
+                updated["primary_diagnosis"] = selected
+                updated["diagnosis_granularity"] = "answer_entity"
+                updated["primary_selection_pass"] = {
+                    "enabled": True,
+                    "task_profile": profile,
+                    "source": "answer_options",
+                    "score": best[2],
+                    "previous_primary": current,
+                    "constraint": "visible_medical_mcqa_options",
+                }
+                return apply_profile_diagnosis_list_budget(case, updated, enable_normalization=enable_normalization)
+        candidates.extend(option_rows)
         for item in pred.get("diagnosis_list", []):
             candidates.append((str(item), "model_list", 1.5 + text_overlap_score(str(item), blobs)))
         best = max(candidates, key=lambda row: (row[2], -len(row[0]))) if candidates else ("", "none", 0.0)
@@ -2089,8 +2114,8 @@ def run_ours(
     fail_on_llm_error: bool = False,
 ) -> dict[str, Any]:
     memory_path = Path(memory_dir) / f"{case['case_id']}.memory.jsonl"
-    store = bootstrap_memory(case, memory_path)
     features = strategy.get("features") or {}
+    store = bootstrap_memory(case, memory_path, include_poison=bool(features.get("enable_polluted_memory")))
     profile = case_task_profile(case)
     source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
     adaptive_memory_cleaning = bool(features.get("profile_adaptive_memory_cleaning", True))
@@ -2331,6 +2356,8 @@ def resolve_top_k(case: dict[str, Any], strategy: dict[str, Any]) -> int:
     if features.get("disable_dynamic_top_k"):
         return int(strategy.get("fallback_top_k", 3))
     source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
+    if source_dataset == "medical_meadow_wikidoc":
+        return 3
     if case_task_profile(case) == MEDICAL_ANSWER_ENTITY or source_dataset == "pmc_patients":
         return 8
     events = case.get("events", [])
@@ -2360,6 +2387,7 @@ def feature_state(strategy: dict[str, Any]) -> dict[str, bool]:
         "diagnosis_normalization": not bool(features.get("disable_normalization")),
         "dynamic_top_k": not bool(features.get("disable_dynamic_top_k")),
         "memory_cleaning": not bool(features.get("disable_memory_cleaning")),
+        "polluted_memory": bool(features.get("enable_polluted_memory")),
         "critic_op_guard": not bool(features.get("disable_critic_op_guard")),
         "evidence_note_injection": not bool(features.get("disable_evidence_note_injection")),
         "profile_adaptive_memory_cleaning": bool(features.get("profile_adaptive_memory_cleaning", True)),

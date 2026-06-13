@@ -227,3 +227,30 @@ def test_medqa_nested_data_schema_uses_correct_answer_and_options():
     validate_medical_source_cases("medqa", cases)
     assert cases[0]["labels"]["primary_diagnosis"] == "Nitrofurantoin"
     assert "D" in cases[0]["labels"]["label_aliases"]
+
+
+def test_soap_summary_assessment_or_diagnosis_becomes_label_entity():
+    row = {
+        "id": "soap-demo-1",
+        "dialogue": "Patient reports cough, fever, and pleuritic pain.",
+        "soap_summary": (
+            "Subjective: cough and fever.\n"
+            "Objective: right lower lobe crackles.\n"
+            "Assessment: community acquired pneumonia.\n"
+            "Plan: antibiotics and follow up."
+        ),
+    }
+    pmoa_like = generic_row_to_pmoa_like(row, MEDICAL_DATASET_SPECS["medical_dialogue_to_soap"], 1)
+    assert pmoa_like["diagnoses"][0] == "community acquired pneumonia"
+    assert pmoa_like["_diagnosis_metric_applicable"] is True
+
+
+def test_soap_summary_without_assessment_entity_disables_diagnosis_metric():
+    row = {
+        "id": "soap-demo-2",
+        "dialogue": "Patient asks for general advice.",
+        "soap_summary": "Subjective: general discussion. Objective: none. Plan: return as needed.",
+    }
+    pmoa_like = generic_row_to_pmoa_like(row, MEDICAL_DATASET_SPECS["medical_dialogue_to_soap"], 2)
+    assert pmoa_like["diagnoses"] == ["Medical dialogue SOAP assessment unavailable"]
+    assert pmoa_like["_diagnosis_metric_applicable"] is False
