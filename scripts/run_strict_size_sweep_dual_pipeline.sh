@@ -103,7 +103,6 @@ start_vllm() {
       --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
       --enforce-eager \
       --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
-      --guided-decoding-backend auto \
       > "$model_root/vllm.log" 2>&1 &
   local pid=$!
   echo "$pid" > "$model_root/vllm.pid"
