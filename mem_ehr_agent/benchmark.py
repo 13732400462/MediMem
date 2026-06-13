@@ -642,6 +642,13 @@ def answer_with_context(
         evidence = raw.get("evidence") or []
         if isinstance(evidence, str):
             evidence = [evidence]
+        try:
+            confidence = float(raw.get("confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            confidence = {"low": 0.25, "medium": 0.5, "moderate": 0.5, "high": 0.75}.get(
+                str(raw.get("confidence", "")).strip().lower(),
+                0.5,
+            )
         return {
             "sample_id": sample["sample_id"],
             "dataset": sample["dataset"],
@@ -649,7 +656,7 @@ def answer_with_context(
             "method": method,
             "answer": normalize_answer(raw.get("answer")),
             "evidence": [str(item) for item in evidence],
-            "confidence": float(raw.get("confidence", 0.5) or 0.5),
+            "confidence": confidence,
             "usage": result.usage,
         }
     except Exception as exc:  # noqa: BLE001
