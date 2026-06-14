@@ -579,11 +579,10 @@ def qa_prompt(sample: dict[str, Any], method: str, context: str) -> list[dict[st
             "role": "system",
             "content": (
                 "You answer long-term memory benchmark questions. Use only the provided context. "
-                "Return one compact JSON object with keys answer, evidence, confidence. "
-                "answer must be concise. evidence must be an array of at most 3 strings, "
-                "and each evidence string must be no longer than 80 characters. "
-                "confidence must be a number from 0 to 1. Do not quote long dialogue spans. "
-                "Always close the JSON object."
+                "Return exactly one minified JSON object with keys answer and confidence. "
+                "answer must be concise and no longer than 12 words. "
+                "confidence must be a number from 0 to 1. Always close the JSON object. "
+                "Do not include evidence, markdown, or prose outside the JSON."
             ),
         },
         {
@@ -636,7 +635,7 @@ def answer_with_context(
         result = client.chat(
             qa_prompt(sample, method, context),
             temperature=0.0,
-            max_tokens=int(os.getenv("BENCHMARK_MAX_TOKENS", "1600")),
+            max_tokens=int(os.getenv("BENCHMARK_MAX_TOKENS", "256")),
         )
     except Exception as exc:  # noqa: BLE001
         if fail_on_llm_error:
