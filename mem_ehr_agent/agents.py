@@ -106,6 +106,24 @@ def compact_case_context(case: dict[str, Any], *, max_events: int = 24, include_
     return f"{context}\nshown_events={len(compact_events)}/{len(events)}"
 
 
+def primary_only_task_profile_policy(profile: str) -> str:
+    if profile == MEDICAL_ANSWER_ENTITY:
+        return (
+            "Task profile: medical_answer_entity. primary_diagnosis should be the short answer entity "
+            "at the same granularity as the option or label. It may be a drug, organism, vitamin, "
+            "mechanism, sign, test finding, or disease."
+        )
+    if profile == CLINICAL_ASSESSMENT_ENTITY:
+        return (
+            "Task profile: clinical_assessment_entity. primary_diagnosis should be the doctor's assessment "
+            "or diagnosis entity, not a broad symptom dump."
+        )
+    return (
+        "Task profile: longitudinal_diagnosis. primary_diagnosis should be the main disease, admission "
+        "diagnosis, or case-title diagnosis supported by the visible timeline."
+    )
+
+
 def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_profile: str = LONGITUDINAL_DIAGNOSIS) -> list[dict[str, str]]:
     is_ours_method = "ours" in method or "medimem" in method
     min_items, max_items = diagnosis_list_budget(task_profile)
@@ -120,7 +138,8 @@ def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_p
         "Use only the provided case evidence. Return exactly one minified JSON object with keys: "
         "primary_diagnosis, confidence. "
         "confidence must be a number from 0 to 1. Do not include diagnosis_list, evidence, or reasoning fields. "
-        f"{task_profile_prompt_policy(task_profile)} {list_policy}"
+        f"{primary_only_task_profile_policy(task_profile)} {list_policy}"
+        "primary_diagnosis must be under 8 words and must not repeat the same token or phrase. "
         "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
         "priors to animal cases unless the provided evidence supports them. "
         "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
@@ -344,7 +363,7 @@ def run_llm_prediction(
                 result = client.chat(
                     prediction_json_prompt(method, attempt_context, extra, task_profile=task_profile),
                     temperature=temperature,
-                    max_tokens=int(os.environ.get("MEDICAL_PREDICTION_MAX_TOKENS", "512")),
+                    max_tokens=int(os.environ.get("MEDICAL_PREDICTION_MAX_TOKENS", "128")),
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
@@ -360,9 +379,40 @@ def run_llm_prediction(
         pred["reasoning_summary"] += f" LLM fallback reason: {exc}"
         pred["llm_error"] = str(exc)
         return pred
+    parse_retries = int(os.environ.get("MEDICAL_JSON_PARSE_RETRIES", "2")) if fail_on_llm_error else 0
+    parse_exc: Exception | None = None
+    for parse_attempt in range(parse_retries + 1):
+        try:
+            raw = extract_json_object(result.text)
+            return normalize_prediction(case["case_id"], method, raw, result.usage, enable_normalization=enable_normalization)
+        except Exception as exc:  # noqa: BLE001 - strict mode may retry the same LLM with a tighter schema
+            parse_exc = exc
+            if parse_attempt >= parse_retries:
+                break
+            result = client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return exactly one valid minified JSON object with keys primary_diagnosis and confidence. "
+                            "primary_diagnosis must be a short non-repeated phrase under 8 words. "
+                            "Do not include diagnosis_list, evidence, reasoning, markdown, or any extra text."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[METHOD]\n{method}\n\n[CASE]\n{attempt_context}\n\n{extra}\n\n"
+                            "The previous response was invalid JSON or an unfinished repeated string. Return valid JSON only."
+                        ),
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=128,
+            )
+    exc = parse_exc or RuntimeError("LLM JSON parsing failed without an exception.")
     try:
-        raw = extract_json_object(result.text)
-        return normalize_prediction(case["case_id"], method, raw, result.usage, enable_normalization=enable_normalization)
+        raise exc
     except Exception as exc:  # noqa: BLE001 - prediction should degrade to fallback, not crash the run
         if fail_on_llm_error:
             raise RuntimeError(f"LLM prediction returned malformed JSON for {case['case_id']} ({method}): {exc}") from exc
