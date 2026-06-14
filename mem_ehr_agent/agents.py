@@ -110,18 +110,17 @@ def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_p
     is_ours_method = "ours" in method or "medimem" in method
     min_items, max_items = diagnosis_list_budget(task_profile)
     list_policy = (
-        f"The downstream profile budget is {min_items} to {max_items}, but this strict JSON pass must keep "
-        "diagnosis_list to 1 to 3 unique short entities; later evidence-aware stages may expand it. "
+        f"The downstream profile budget is {min_items} to {max_items}; later evidence-aware stages may expand "
+        "diagnosis_list from primary_diagnosis. "
         if is_ours_method
-        else "diagnosis_list must contain 1 to 3 unique short entities. "
+        else "Do not output diagnosis_list; the evaluator will derive it from primary_diagnosis. "
     )
     system = (
         "You are a clinical research diagnosis evaluator. This is not medical advice. "
         "Use only the provided case evidence. Return exactly one minified JSON object with keys: "
-        "primary_diagnosis, diagnosis_list, confidence. "
-        "confidence must be a number from 0 to 1. Do not include evidence or reasoning fields. "
+        "primary_diagnosis, confidence. "
+        "confidence must be a number from 0 to 1. Do not include diagnosis_list, evidence, or reasoning fields. "
         f"{task_profile_prompt_policy(task_profile)} {list_policy}"
-        "Each diagnosis_list item must be under 6 words. Do not repeat items. "
         "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
         "priors to animal cases unless the provided evidence supports them. "
         "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
