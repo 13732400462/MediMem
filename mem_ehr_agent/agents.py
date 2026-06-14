@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -117,15 +118,14 @@ def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_p
     system = (
         "You are a clinical research diagnosis evaluator. This is not medical advice. "
         "Use only the provided case evidence. Return exactly one minified JSON object with keys: "
-        "primary_diagnosis, diagnosis_list, confidence, reasoning_summary, species_context, diagnosis_granularity. "
-        "confidence must be a number from 0 to 1. Do not include an evidence key. "
+        "primary_diagnosis, diagnosis_list, confidence. "
+        "confidence must be a number from 0 to 1. Do not include evidence or reasoning fields. "
         f"{task_profile_prompt_policy(task_profile)} {list_policy}"
         "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
         "priors to animal cases unless the provided evidence supports them. "
         "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
         "procedure, broad organ finding, or unrelated complication. diagnosis_granularity must be one of "
         "final_disease, etiology, complication, anatomy_finding, pathology_entity, symptom_or_state, uncertain. "
-        "reasoning_summary must be one short sentence under 120 characters. "
         "Do not include markdown, prose, or code fences outside the JSON object. Always close the JSON object."
     )
     user = f"[METHOD]\n{method}\n\n[CASE]\n{context}\n\n{extra}\n\nReturn JSON only."
@@ -344,6 +344,7 @@ def run_llm_prediction(
                 result = client.chat(
                     prediction_json_prompt(method, attempt_context, extra, task_profile=task_profile),
                     temperature=temperature,
+                    max_tokens=int(os.environ.get("MEDICAL_PREDICTION_MAX_TOKENS", "256")),
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
