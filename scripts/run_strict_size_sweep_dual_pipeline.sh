@@ -12,6 +12,7 @@ PER_SOURCE_N="${PER_SOURCE_N:-1000}"
 LOCOMO_SAMPLE_N="${LOCOMO_SAMPLE_N:-1000}"
 RANDOM_SEED="${RANDOM_SEED:-20260606}"
 PIPELINE_WORKERS="${PIPELINE_WORKERS:-48}"
+EXCLUSIVE_PIPELINE_WORKERS="${EXCLUSIVE_PIPELINE_WORKERS:-96}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-96}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
@@ -129,17 +130,28 @@ stop_vllm() {
   fi
 }
 
+terminate_tree() {
+  local pid="$1"
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 3
+  pkill -KILL -P "$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 run_medical_pipeline() {
   local served_name="$1"
   local base_url="$2"
   local model_root="$3"
+  local workers="$4"
+  local phase="$5"
   local data_dir="$DATA_ROOT/$served_name/medical_pooled"
-  local run_dir="$model_root/medical_pooled"
+  local run_dir="$model_root/medical_pooled_${phase}"
   mkdir -p "$data_dir" "$run_dir"
   export DEEPSEEK_BASE_URL="$base_url"
   export DEEPSEEK_MODEL="$served_name"
 
-  log "START medical model=$served_name workers=$PIPELINE_WORKERS per_source_n=$PER_SOURCE_N"
+  log "START medical model=$served_name phase=$phase workers=$workers per_source_n=$PER_SOURCE_N"
   "$PY" -m mem_ehr_agent data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources "$MEDICAL_SOURCES" \
@@ -160,7 +172,7 @@ PY
   "$PY" -u -m mem_ehr_agent experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
-    --max-workers "$PIPELINE_WORKERS" \
+    --max-workers "$workers" \
     --suite-profile fast-formal \
     --baseline-set required \
     --ablation-groups "$MEDICAL_ABLATION_GROUPS" \
@@ -171,32 +183,34 @@ PY
     2>&1 | tee "$run_dir/experiment.log"
   local experiment_run_dir
   experiment_run_dir="$(grep -E '^run_dir=' "$run_dir/experiment.log" | tail -1 | cut -d= -f2-)"
-  append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"status\":\"finished\",\"dataset_path\":\"$dataset_path\",\"run_dir\":\"$experiment_run_dir\",\"base_url\":\"$base_url\",\"workers\":$PIPELINE_WORKERS}"
+  append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"finished\",\"dataset_path\":\"$dataset_path\",\"run_dir\":\"$experiment_run_dir\",\"base_url\":\"$base_url\",\"workers\":$workers}"
 }
 
 run_locomo_pipeline() {
   local served_name="$1"
   local base_url="$2"
   local model_root="$3"
-  local run_dir="$model_root/locomo"
+  local workers="$4"
+  local phase="$5"
+  local run_dir="$model_root/locomo_${phase}"
   mkdir -p "$run_dir"
   export DEEPSEEK_BASE_URL="$base_url"
   export DEEPSEEK_MODEL="$served_name"
 
-  log "START locomo model=$served_name workers=$PIPELINE_WORKERS sample_n=$LOCOMO_SAMPLE_N"
+  log "START locomo model=$served_name phase=$phase workers=$workers sample_n=$LOCOMO_SAMPLE_N"
   "$PY" -u -m mem_ehr_agent benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
     --sample-n "$LOCOMO_SAMPLE_N" \
     --random-seed "$RANDOM_SEED" \
-    --max-workers "$PIPELINE_WORKERS" \
+    --max-workers "$workers" \
     --require-api \
     --output-root "$run_dir" \
     2>&1 | tee "$run_dir/benchmark.log"
   local benchmark_run_dir
   benchmark_run_dir="$(grep -E '^run_dir=' "$run_dir/benchmark.log" | tail -1 | cut -d= -f2-)"
-  append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"status\":\"finished\",\"dataset_path\":\"$LOCOMO_DATASET_PATH\",\"run_dir\":\"$benchmark_run_dir\",\"base_url\":\"$base_url\",\"workers\":$PIPELINE_WORKERS}"
+  append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"$phase\",\"status\":\"finished\",\"dataset_path\":\"$LOCOMO_DATASET_PATH\",\"run_dir\":\"$benchmark_run_dir\",\"base_url\":\"$base_url\",\"workers\":$workers}"
 }
 
 run_model() {
@@ -208,13 +222,55 @@ run_model() {
   local base_url="http://127.0.0.1:${port}/v1"
   mkdir -p "$model_root"
   start_vllm "$gpu" "$port" "$model_path" "$served_name" "$model_root"
-  run_medical_pipeline "$served_name" "$base_url" "$model_root" &
+  local medical_status="$model_root/medical_shared.exit"
+  local locomo_status="$model_root/locomo_shared.exit"
+  rm -f "$medical_status" "$locomo_status"
+  (run_medical_pipeline "$served_name" "$base_url" "$model_root" "$PIPELINE_WORKERS" "shared"; echo $? > "$medical_status") &
   local medical_pid=$!
-  run_locomo_pipeline "$served_name" "$base_url" "$model_root" &
+  (run_locomo_pipeline "$served_name" "$base_url" "$model_root" "$PIPELINE_WORKERS" "shared"; echo $? > "$locomo_status") &
   local locomo_pid=$!
   local status=0
-  wait "$medical_pid" || status=$?
-  wait "$locomo_pid" || status=$?
+  local first=""
+  while true; do
+    if [ -s "$medical_status" ]; then
+      first="medical"
+      break
+    fi
+    if [ -s "$locomo_status" ]; then
+      first="locomo"
+      break
+    fi
+    sleep 5
+  done
+  if [ "$first" = "medical" ]; then
+    status="$(cat "$medical_status")"
+    if [ "$status" -ne 0 ]; then
+      terminate_tree "$locomo_pid"
+      wait "$locomo_pid" 2>/dev/null || true
+    elif [ ! -s "$locomo_status" ]; then
+      log "PROMOTE locomo model=$served_name from workers=$PIPELINE_WORKERS to workers=$EXCLUSIVE_PIPELINE_WORKERS after medical finished"
+      append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"shared\",\"status\":\"superseded\",\"workers\":$PIPELINE_WORKERS,\"reason\":\"medical_finished_first_promote_to_exclusive\"}"
+      terminate_tree "$locomo_pid"
+      wait "$locomo_pid" 2>/dev/null || true
+      run_locomo_pipeline "$served_name" "$base_url" "$model_root" "$EXCLUSIVE_PIPELINE_WORKERS" "exclusive" || status=$?
+    else
+      wait "$locomo_pid" || status=$?
+    fi
+  else
+    status="$(cat "$locomo_status")"
+    if [ "$status" -ne 0 ]; then
+      terminate_tree "$medical_pid"
+      wait "$medical_pid" 2>/dev/null || true
+    elif [ ! -s "$medical_status" ]; then
+      log "PROMOTE medical model=$served_name from workers=$PIPELINE_WORKERS to workers=$EXCLUSIVE_PIPELINE_WORKERS after locomo finished"
+      append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"shared\",\"status\":\"superseded\",\"workers\":$PIPELINE_WORKERS,\"reason\":\"locomo_finished_first_promote_to_exclusive\"}"
+      terminate_tree "$medical_pid"
+      wait "$medical_pid" 2>/dev/null || true
+      run_medical_pipeline "$served_name" "$base_url" "$model_root" "$EXCLUSIVE_PIPELINE_WORKERS" "exclusive" || status=$?
+    else
+      wait "$medical_pid" || status=$?
+    fi
+  fi
   stop_vllm "$model_root"
   if [ "$status" -ne 0 ]; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"stage\":\"pipeline\",\"error\":\"one or more pipelines failed\"}"
@@ -262,6 +318,8 @@ baseline_methods = {
 rows = []
 failures = []
 for item in completed:
+    if item.get("status") != "finished":
+        continue
     if item.get("pipeline") not in {"medical_pooled", "locomo"}:
         continue
     model = item.get("model")
