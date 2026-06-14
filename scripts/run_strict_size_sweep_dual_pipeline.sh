@@ -13,6 +13,7 @@ LOCOMO_SAMPLE_N="${LOCOMO_SAMPLE_N:-1000}"
 RANDOM_SEED="${RANDOM_SEED:-20260606}"
 PIPELINE_WORKERS="${PIPELINE_WORKERS:-48}"
 EXCLUSIVE_PIPELINE_WORKERS="${EXCLUSIVE_PIPELINE_WORKERS:-96}"
+PIPELINE_SCHEDULE="${PIPELINE_SCHEDULE:-promote}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-96}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
@@ -311,6 +312,48 @@ run_wave() {
   return "$status"
 }
 
+run_wave_pool_then_locomo() {
+  local left_model_path="$1"
+  local left_name="$2"
+  local right_model_path="$3"
+  local right_name="$4"
+  local left_root="$RUN_ROOT/$left_name"
+  local right_root="$RUN_ROOT/$right_name"
+  local left_base_url="http://127.0.0.1:8000/v1"
+  local right_base_url="http://127.0.0.1:8001/v1"
+  local status=0
+  mkdir -p "$left_root" "$right_root"
+  log "START wave pool-then-locomo left=$left_name right=$right_name workers=$EXCLUSIVE_PIPELINE_WORKERS"
+  start_vllm 0 8000 "$left_model_path" "$left_name" "$left_root"
+  start_vllm 1 8001 "$right_model_path" "$right_name" "$right_root"
+
+  log "START medical stage wave left=$left_name right=$right_name workers=$EXCLUSIVE_PIPELINE_WORKERS"
+  run_medical_pipeline "$left_name" "$left_base_url" "$left_root" "$EXCLUSIVE_PIPELINE_WORKERS" "pool_first" &
+  local left_medical_pid=$!
+  run_medical_pipeline "$right_name" "$right_base_url" "$right_root" "$EXCLUSIVE_PIPELINE_WORKERS" "pool_first" &
+  local right_medical_pid=$!
+  wait "$left_medical_pid" || status=$?
+  wait "$right_medical_pid" || status=$?
+  if [ "$status" -ne 0 ]; then
+    stop_vllm "$left_root"
+    stop_vllm "$right_root"
+    log "DONE wave pool-then-locomo left=$left_name right=$right_name status=$status"
+    return "$status"
+  fi
+
+  log "START locomo stage wave left=$left_name right=$right_name workers=$EXCLUSIVE_PIPELINE_WORKERS"
+  run_locomo_pipeline "$left_name" "$left_base_url" "$left_root" "$EXCLUSIVE_PIPELINE_WORKERS" "locomo_after_pool" &
+  local left_locomo_pid=$!
+  run_locomo_pipeline "$right_name" "$right_base_url" "$right_root" "$EXCLUSIVE_PIPELINE_WORKERS" "locomo_after_pool" &
+  local right_locomo_pid=$!
+  wait "$left_locomo_pid" || status=$?
+  wait "$right_locomo_pid" || status=$?
+  stop_vllm "$left_root"
+  stop_vllm "$right_root"
+  log "DONE wave pool-then-locomo left=$left_name right=$right_name status=$status"
+  return "$status"
+}
+
 summarize_and_gate() {
   "$PY" - "$RUN_ROOT" "$STATUS_JSONL" "$BLOCKED_JSONL" "$SUMMARY_JSON" <<'PY'
 import csv
@@ -418,8 +461,13 @@ if not summary["passed"]:
 PY
 }
 
-log "strict size sweep started run_root=$RUN_ROOT data_root=$DATA_ROOT workers_per_pipeline=$PIPELINE_WORKERS"
-run_wave "/root/models/qwen_vl_size_sweep/0_8b" "qwen3-vl-0_8b" "/root/models/qwen_vl_size_sweep/2b" "qwen3-vl-2b"
-run_wave "/root/models/qwen_vl_size_sweep/4b" "qwen3-vl-4b" "/root/models/qwen_vl_size_sweep/8b" "qwen3-vl-8b"
+log "strict size sweep started run_root=$RUN_ROOT data_root=$DATA_ROOT workers_per_pipeline=$PIPELINE_WORKERS exclusive_workers=$EXCLUSIVE_PIPELINE_WORKERS schedule=$PIPELINE_SCHEDULE"
+if [ "$PIPELINE_SCHEDULE" = "pool_then_locomo" ]; then
+  run_wave_pool_then_locomo "/root/models/qwen_vl_size_sweep/0_8b" "qwen3-vl-0_8b" "/root/models/qwen_vl_size_sweep/2b" "qwen3-vl-2b"
+  run_wave_pool_then_locomo "/root/models/qwen_vl_size_sweep/4b" "qwen3-vl-4b" "/root/models/qwen_vl_size_sweep/8b" "qwen3-vl-8b"
+else
+  run_wave "/root/models/qwen_vl_size_sweep/0_8b" "qwen3-vl-0_8b" "/root/models/qwen_vl_size_sweep/2b" "qwen3-vl-2b"
+  run_wave "/root/models/qwen_vl_size_sweep/4b" "qwen3-vl-4b" "/root/models/qwen_vl_size_sweep/8b" "qwen3-vl-8b"
+fi
 summarize_and_gate
 log "FINISHED strict size sweep summary=$SUMMARY_JSON"
