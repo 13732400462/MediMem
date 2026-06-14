@@ -582,7 +582,8 @@ def qa_prompt(sample: dict[str, Any], method: str, context: str) -> list[dict[st
                 "Return one compact JSON object with keys answer, evidence, confidence. "
                 "answer must be concise. evidence must be an array of at most 3 strings, "
                 "and each evidence string must be no longer than 80 characters. "
-                "Do not quote long dialogue spans."
+                "confidence must be a number from 0 to 1. Do not quote long dialogue spans. "
+                "Always close the JSON object."
             ),
         },
         {
@@ -632,7 +633,11 @@ def answer_with_context(
             raise RuntimeError(f"Benchmark QA client unavailable for {sample['sample_id']} ({method}).")
         return deterministic_qa_fallback(sample, method, context=context)
     try:
-        result = client.chat(qa_prompt(sample, method, context), temperature=0.0, max_tokens=900)
+        result = client.chat(
+            qa_prompt(sample, method, context),
+            temperature=0.0,
+            max_tokens=int(os.getenv("BENCHMARK_MAX_TOKENS", "1600")),
+        )
     except Exception as exc:  # noqa: BLE001
         if fail_on_llm_error:
             raise RuntimeError(f"Benchmark QA failed for {sample['sample_id']} ({method}): {exc}") from exc

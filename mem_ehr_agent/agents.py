@@ -120,14 +120,15 @@ def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_p
         "primary_diagnosis, diagnosis_list, confidence, evidence, reasoning_summary, "
         "species_context, diagnosis_granularity. "
         "confidence must be a number from 0 to 1. evidence must be an array of strings. "
-        f"{task_profile_prompt_policy(task_profile)} {list_policy}evidence must contain at most 5 concise strings. "
+        f"{task_profile_prompt_policy(task_profile)} {list_policy}"
+        "evidence must contain at most 3 concise strings, each under 120 characters. "
         "First infer whether the patient is human or a non-human species. Do not transfer human-only disease "
         "priors to animal cases unless the provided evidence supports them. "
         "primary_diagnosis should be the final main disease/entity at the label-like granularity, not a symptom, "
         "procedure, broad organ finding, or unrelated complication. diagnosis_granularity must be one of "
         "final_disease, etiology, complication, anatomy_finding, pathology_entity, symptom_or_state, uncertain. "
         "reasoning_summary must be one short sentence. "
-        "Do not include markdown, prose, or code fences outside the JSON object."
+        "Do not include markdown, prose, or code fences outside the JSON object. Always close the JSON object."
     )
     user = f"[METHOD]\n{method}\n\n[CASE]\n{context}\n\n{extra}\n\nReturn JSON only."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
