@@ -19,6 +19,7 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 DEEPSEEK_TIMEOUT="${DEEPSEEK_TIMEOUT:-600}"
 DEEPSEEK_MAX_TOKENS="${DEEPSEEK_MAX_TOKENS:-1800}"
 BENCHMARK_MAX_TOKENS="${BENCHMARK_MAX_TOKENS:-256}"
+MEDICAL_PREDICTION_MAX_TOKENS="${MEDICAL_PREDICTION_MAX_TOKENS:-256}"
 LOCOMO_DATASET_PATH="${LOCOMO_DATASET_PATH:-datasets/amem_original/locomo/locomo10.official.json}"
 LOCOMO_METHODS="${LOCOMO_METHODS:-direct,amem,medimem}"
 MEDICAL_ABLATION_GROUPS="${MEDICAL_ABLATION_GROUPS:-full,no_memory_cleaning,no_evidence_note_injection,ablate_with_polluted_memory}"
@@ -30,6 +31,7 @@ export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-local-qwen3}"
 export DEEPSEEK_TIMEOUT
 export DEEPSEEK_MAX_TOKENS
 export BENCHMARK_MAX_TOKENS
+export MEDICAL_PREDICTION_MAX_TOKENS
 export FAST_FORMAL_EARLY_STOP_ON_WIN=0
 export MEDICAL_SOURCE_SAMPLE_POOL_MULTIPLIER="${MEDICAL_SOURCE_SAMPLE_POOL_MULTIPLIER:-5}"
 export MEDICAL_STRICT_NO_LEAK_FILTER=1
@@ -169,7 +171,7 @@ print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
   "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$run_dir/validate.log" 2>&1
-  "$PY" -u -m mem_ehr_agent experiment-suite \
+  if ! "$PY" -u -m mem_ehr_agent experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -180,9 +182,16 @@ PY
     --counterfactual-sample-rate "${COUNTERFACTUAL_SAMPLE_RATE:-0.20}" \
     --counterfactual-risk-threshold "${COUNTERFACTUAL_RISK_THRESHOLD:-0.55}" \
     --defer-reports \
-    2>&1 | tee "$run_dir/experiment.log"
+    2>&1 | tee "$run_dir/experiment.log"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"log\":\"$run_dir/experiment.log\"}"
+    return 1
+  fi
   local experiment_run_dir
   experiment_run_dir="$(grep -E '^run_dir=' "$run_dir/experiment.log" | tail -1 | cut -d= -f2-)"
+  if [ -z "$experiment_run_dir" ] || [ ! -d "$experiment_run_dir" ]; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"error\":\"run_dir_missing_after_success\",\"log\":\"$run_dir/experiment.log\"}"
+    return 1
+  fi
   append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"finished\",\"dataset_path\":\"$dataset_path\",\"run_dir\":\"$experiment_run_dir\",\"base_url\":\"$base_url\",\"workers\":$workers}"
 }
 
@@ -198,7 +207,7 @@ run_locomo_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START locomo model=$served_name phase=$phase workers=$workers sample_n=$LOCOMO_SAMPLE_N"
-  "$PY" -u -m mem_ehr_agent benchmark run \
+  if ! "$PY" -u -m mem_ehr_agent benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -207,9 +216,16 @@ run_locomo_pipeline() {
     --max-workers "$workers" \
     --require-api \
     --output-root "$run_dir" \
-    2>&1 | tee "$run_dir/benchmark.log"
+    2>&1 | tee "$run_dir/benchmark.log"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"log\":\"$run_dir/benchmark.log\"}"
+    return 1
+  fi
   local benchmark_run_dir
   benchmark_run_dir="$(grep -E '^run_dir=' "$run_dir/benchmark.log" | tail -1 | cut -d= -f2-)"
+  if [ -z "$benchmark_run_dir" ] || [ ! -d "$benchmark_run_dir" ]; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"error\":\"run_dir_missing_after_success\",\"log\":\"$run_dir/benchmark.log\"}"
+    return 1
+  fi
   append_json "$STATUS_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"$phase\",\"status\":\"finished\",\"dataset_path\":\"$LOCOMO_DATASET_PATH\",\"run_dir\":\"$benchmark_run_dir\",\"base_url\":\"$base_url\",\"workers\":$workers}"
 }
 
