@@ -2,6 +2,14 @@
 
 The formal MediMem pipeline treats clean memory as the main line: `full` does not bootstrap `poison_records` into the memory store. Polluted memory is available only as the `ablate_with_polluted_memory` ablation group, so it is reported as an ablation delta rather than a main pipeline.
 
+Formal experiment alignment:
+
+- All four vLLM sizes must run the same no-pollution MediMem implementation and the same strict no-fallback/no-leakage checks.
+- Medical main comparison uses the full 7-source pool for required baselines plus `full` MediMem only. This is the only Medical result used for overall/per-source full-vs-baseline ranking.
+- Medical ablations are MediMem-only and must be run only on the `pmoa_tts` source. Do not run `no_memory_cleaning`, `no_evidence_note_injection`, or `ablate_with_polluted_memory` across the full 7-source pool.
+- Required baselines never run ablations. Polluted memory is reported only as the MediMem `ablate_with_polluted_memory` delta on `pmoa_tts`, not as a main method.
+- LoCoMo remains a full 1000-QA run for each model size, with MediMem compared against A-MEM under the same strict API/no-fallback rules.
+
 Server-side strict four-size sweep:
 
 ```bash
