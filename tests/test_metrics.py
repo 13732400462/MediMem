@@ -24,6 +24,30 @@ from mem_ehr_agent.metrics import (
     token_f1,
 )
 from mem_ehr_agent.medical_terms import canonicalize_diagnosis
+from mem_ehr_agent.agents import case_context
+from mem_ehr_agent.optimizer import ablation_feature_sets, parse_ablation_groups
+
+
+def test_case_context_can_hide_explicit_time_signal():
+    case = {
+        "case_id": "pmoa_tts_0001",
+        "demographics": {},
+        "events": [{"time": 12, "type": "diagnosis", "text": "Diagnosed with asthma."}],
+        "synthetic_labs": [{"time": 13, "name": "CRP", "value": "1.0", "unit": "mg/L", "flag": "normal"}],
+    }
+
+    context = case_context(case, include_labs=True, include_time=False)
+
+    assert "t=" not in context
+    assert "[diagnosis] Diagnosed with asthma." in context
+    assert "CRP=1.0 mg/L" in context
+
+
+def test_parse_ablation_groups_accepts_temporal_signal_alias():
+    groups = parse_ablation_groups("full,no_temporal_signal", default=ablation_feature_sets())
+
+    assert groups[0] == ("full", {})
+    assert groups[1] == ("ablate_no_temporal_signal", {"disable_temporal_signal": True})
 
 
 def test_token_f1_overlap():

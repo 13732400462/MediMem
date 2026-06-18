@@ -255,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument(
         "--ablation-groups",
         default=None,
-        help="Comma-separated groups, e.g. full,no_memory_cleaning,no_evidence_note_injection.",
+        help="Comma-separated groups, e.g. full,no_memory_cleaning,no_evidence_note_injection,no_temporal_signal.",
     )
     suite.add_argument(
         "--counterfactual-policy",
