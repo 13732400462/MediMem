@@ -39,6 +39,7 @@ FAST_FORMAL_ABLATION_GROUPS = (
     "ablate_no_memory_cleaning",
     "ablate_no_evidence_note_injection",
     "ablate_with_polluted_memory",
+    "ablate_no_temporal_signal",
 )
 
 
@@ -66,6 +67,7 @@ def strategy_for_round(
             "disable_critic_op_guard": bool((features or {}).get("disable_critic_op_guard")),
             "disable_evidence_note_injection": bool((features or {}).get("disable_evidence_note_injection")),
             "disable_counterfactual_verification": bool((features or {}).get("disable_counterfactual_verification")),
+            "disable_temporal_signal": bool((features or {}).get("disable_temporal_signal")),
             "counterfactual_policy": str((features or {}).get("counterfactual_policy") or counterfactual_policy),
             "counterfactual_sample_rate": float(
                 (features or {}).get("counterfactual_sample_rate", counterfactual_sample_rate)
@@ -178,6 +180,7 @@ FAST_FORMAL_MEDIMEM_METHODS = {
     "ablate_no_memory_cleaning_medimem_merged",
     "ablate_no_evidence_note_injection_medimem_merged",
     "ablate_with_polluted_memory_medimem_merged",
+    "ablate_no_temporal_signal_medimem_merged",
 }
 
 
@@ -213,6 +216,7 @@ def write_fast_formal_comparison_outputs(run_dir: Path, summaries: list[dict[str
             "ablate_no_memory_cleaning_medimem_merged",
             "ablate_no_evidence_note_injection_medimem_merged",
             "ablate_with_polluted_memory_medimem_merged",
+            "ablate_no_temporal_signal_medimem_merged",
         ]:
             row = methods.get(method)
             if not row:
@@ -524,6 +528,7 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
     if not groups:
         return default
     known = {name: features for name, features in ablation_feature_sets()}
+    known["ablate_no_temporal_signal"] = {"disable_temporal_signal": True}
     aliases = {
         "no_memory_cleaning": "ablate_no_memory_cleaning",
         "with_polluted_memory": "ablate_with_polluted_memory",
@@ -533,6 +538,9 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
         "no_dynamic_top_k": "ablate_no_dynamic_top_k",
         "no_normalization": "ablate_no_normalization",
         "no_critic_op_guard": "ablate_no_critic_op_guard",
+        "no_temporal_signal": "ablate_no_temporal_signal",
+        "temporal_signal": "ablate_no_temporal_signal",
+        "no_time_signal": "ablate_no_temporal_signal",
     }
     selected: list[tuple[str, dict[str, bool]]] = []
     for raw in str(groups).split(","):

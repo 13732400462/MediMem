@@ -57,7 +57,13 @@ def runtime_leakage_filtered_count(items: list[Any]) -> int:
     return sum(1 for item in items if contains_target_leakage(item))
 
 
-def case_context(case: dict[str, Any], *, max_events: int | None = None, include_labs: bool = True) -> str:
+def case_context(
+    case: dict[str, Any],
+    *,
+    max_events: int | None = None,
+    include_labs: bool = True,
+    include_time: bool = True,
+) -> str:
     events = case.get("events", [])
     if max_events is not None:
         events = events[:max_events]
@@ -70,11 +76,13 @@ def case_context(case: dict[str, Any], *, max_events: int | None = None, include
         text = sanitize_runtime_text(event.get("text"))
         if not text:
             continue
-        lines.append(f"- t={event.get('time')} [{event.get('type')}] {text}")
+        prefix = f"- t={event.get('time')} [{event.get('type')}]" if include_time else f"- [{event.get('type')}]"
+        lines.append(f"{prefix} {text}")
     if include_labs:
         lines.append("labs:")
         for lab in case.get("synthetic_labs", [])[:12]:
-            lines.append(f"- t={lab.get('time')} {lab.get('name')}={lab.get('value')} {lab.get('unit')} ({lab.get('flag')})")
+            prefix = f"- t={lab.get('time')}" if include_time else "-"
+            lines.append(f"{prefix} {lab.get('name')}={lab.get('value')} {lab.get('unit')} ({lab.get('flag')})")
     return "\n".join(lines)
 
 
@@ -2125,6 +2133,28 @@ def format_memory_line(card: dict[str, Any]) -> str:
     )
 
 
+def strip_temporal_signal_from_memory_store(store: Any) -> None:
+    for card in store.cards:
+        card["time_scope"] = {}
+        temporal_tags = {"temporal", "time", "timeline"}
+        card["tags"] = [tag for tag in list(card.get("tags") or []) if str(tag).lower() not in temporal_tags]
+    store.save()
+
+
+def temporal_blind_evidence_notes(cards: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    notes = source_aligned_evidence_notes(cards, limit=limit)
+    for note in notes:
+        note["time"] = None
+    return notes
+
+
+def temporal_blind_diagnosis_event_candidates(case: dict[str, Any], *, limit: int = 10) -> list[dict[str, Any]]:
+    candidates = diagnosis_event_candidates(case, limit=limit)
+    for item in candidates:
+        item["time"] = None
+    return candidates
+
+
 def run_direct_polluted(
     case: dict[str, Any],
     client: DeepSeekClient | None,
@@ -2166,6 +2196,9 @@ def run_ours(
     memory_path = Path(memory_dir) / f"{case['case_id']}.memory.jsonl"
     features = strategy.get("features") or {}
     store = bootstrap_memory(case, memory_path, include_poison=bool(features.get("enable_polluted_memory")))
+    disable_temporal_signal = bool(features.get("disable_temporal_signal"))
+    if disable_temporal_signal:
+        strip_temporal_signal_from_memory_store(store)
     profile = case_task_profile(case)
     source_dataset = str((case.get("data_quality_flags") or {}).get("source_dataset") or "").strip()
     adaptive_memory_cleaning = bool(features.get("profile_adaptive_memory_cleaning", True))
@@ -2187,8 +2220,12 @@ def run_ours(
     disable_evidence_note_injection = bool(features.get("disable_evidence_note_injection")) or (
         adaptive_evidence_notes and profile == MEDICAL_ANSWER_ENTITY
     )
-    evidence_notes = [] if disable_evidence_note_injection else source_aligned_evidence_notes(store.cards)
-    diagnosis_candidates = [] if disable_evidence_note_injection else diagnosis_event_candidates(case)
+    evidence_notes = [] if disable_evidence_note_injection else (
+        temporal_blind_evidence_notes(store.cards) if disable_temporal_signal else source_aligned_evidence_notes(store.cards)
+    )
+    diagnosis_candidates = [] if disable_evidence_note_injection else (
+        temporal_blind_diagnosis_event_candidates(case) if disable_temporal_signal else diagnosis_event_candidates(case)
+    )
     seen_ids: set[str] = set()
     memories = []
     for memory in retrieved_memories:
@@ -2197,33 +2234,57 @@ def run_ours(
             memories.append(memory)
             seen_ids.add(memory_id)
     memory_lines = [line for line in (format_memory_line(m) for m in memories) if line]
-    evidence_lines = [
-        f"- t={note.get('time')} refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
-        for note in evidence_notes
-    ]
-    diagnosis_candidate_lines = [
-        f"- t={item.get('time')} ref={item.get('event_id')} diagnosis_text={item.get('text')}"
-        for item in diagnosis_candidates
-    ]
+    if disable_temporal_signal:
+        evidence_lines = [
+            f"- refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
+            for note in evidence_notes
+        ]
+        diagnosis_candidate_lines = [
+            f"- ref={item.get('event_id')} diagnosis_text={item.get('text')}"
+            for item in diagnosis_candidates
+        ]
+    else:
+        evidence_lines = [
+            f"- t={note.get('time')} refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
+            for note in evidence_notes
+        ]
+        diagnosis_candidate_lines = [
+            f"- t={item.get('time')} ref={item.get('event_id')} diagnosis_text={item.get('text')}"
+            for item in diagnosis_candidates
+        ]
     source_style = style_policy_prompt((case.get("data_quality_flags") or {}).get("style_policy"))
+    if disable_temporal_signal:
+        extra_intro = (
+            "Use the active JSONL memory cards and source-aligned evidence notes. "
+            "This ablation hides explicit temporal indices and time scopes; choose primary_diagnosis from visible clinical content "
+            "without relying on event timestamps or chronological hints. "
+        )
+        final_check = "Before finalizing, check whether the visible clinical evidence supports the diagnosis."
+    else:
+        extra_intro = (
+            "Use the active JSONL memory cards and source-aligned evidence notes. "
+            "Prefer timeline/evidence refs over stale interpretations when choosing primary_diagnosis. "
+            "If a diagnosis event candidate directly captures the final explanatory state, use that concise text as primary_diagnosis "
+            "and put broader underlying diseases in diagnosis_list rather than replacing it. "
+        )
+        final_check = (
+            "Before finalizing, check whether longitudinal evidence contradicts the initial hypothesis. "
+            "Do not treat a prior interpretation as a diagnosis unless timeline evidence supports it."
+        )
     extra = (
-        "Use the active JSONL memory cards and source-aligned evidence notes. "
-        "Prefer timeline/evidence refs over stale interpretations when choosing primary_diagnosis. "
-        "If a diagnosis event candidate directly captures the final explanatory state, use that concise text as primary_diagnosis "
-        "and put broader underlying diseases in diagnosis_list rather than replacing it.\n"
+        f"{extra_intro}\n"
         f"{source_style}\n"
         f"[MEMORY_CARDS]\n{chr(10).join(memory_lines)}\n"
         f"[SOURCE_ALIGNED_EVIDENCE_NOTES]\n{chr(10).join(evidence_lines)}\n"
         f"[DIAGNOSIS_EVENT_CANDIDATES]\n{chr(10).join(diagnosis_candidate_lines)}\n"
         f"[MEMORY_OPS]\n{prompt_ops}\n"
-        "Before finalizing, check whether longitudinal evidence contradicts the initial hypothesis. "
-        "Do not treat a prior interpretation as a diagnosis unless timeline evidence supports it."
+        f"{final_check}"
     )
     pred = run_llm_prediction(
         case,
         method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
         client=client,
-        context=case_context(case, include_labs=True),
+        context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
         extra=extra,
         fallback_max_events=None,
         temperature=float(strategy.get("temperature", 0.05)),
@@ -2312,7 +2373,7 @@ def run_ours(
                 case,
                 pred,
                 client,
-                context=case_context(case, include_labs=True),
+                context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
                 extra=extra,
                 threshold=COUNTERFACTUAL_CPG_THRESHOLD,
                 fail_on_llm_error=fail_on_llm_error and counterfactual_policy == "always",
@@ -2349,7 +2410,7 @@ def run_ours(
                 case,
                 method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
                 client=client,
-                context=case_context(case, include_labs=True),
+                context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
                 extra=counterfactual_revision_extra(extra, verification),
                 fallback_max_events=None,
                 temperature=0.0,
@@ -2443,4 +2504,5 @@ def feature_state(strategy: dict[str, Any]) -> dict[str, bool]:
         "profile_adaptive_memory_cleaning": bool(features.get("profile_adaptive_memory_cleaning", True)),
         "profile_adaptive_evidence_notes": bool(features.get("profile_adaptive_evidence_notes", False)),
         "counterfactual_verification": not bool(features.get("disable_counterfactual_verification")),
+        "temporal_signal": not bool(features.get("disable_temporal_signal")),
     }
