@@ -66,6 +66,7 @@ def test_ablation_feature_state_and_fixed_top_k():
         "evidence_note_injection": True,
         "profile_adaptive_memory_cleaning": True,
         "profile_adaptive_evidence_notes": False,
+        "temporal_signal": True,
         "counterfactual_verification": True,
     }
 
@@ -166,6 +167,112 @@ def test_apply_critique_discards_cross_patient_memory(tmp_path):
     )
     ops = apply_critique(case, store)
     assert ops[0]["op"] == "Discard"
+
+
+def test_apply_critique_reviews_clean_memory_without_poison_records(tmp_path):
+    case = {
+        "case_id": "case_clean",
+        "events": [{"event_id": "ev_001", "type": "diagnosis", "text": "Confirmed pneumonia."}],
+        "poison_records": [],
+    }
+    store = MemoryStore.load("case_clean", tmp_path / "memory.jsonl")
+    card = store.write_card(
+        summary="Confirmed pneumonia on chest imaging.",
+        evidence_refs=["ev_001"],
+        time_scope={"start": 1, "end": 1},
+        confidence=0.72,
+        tags=["diagnosis"],
+    )
+    ops = apply_critique(case, store)
+    assert ops == [
+        {
+            "op": "Keep",
+            "raw_op": None,
+            "guarded_op": None,
+            "guard_applied": False,
+            "target": card["memory_id"],
+            "touched_memory_ids": [card["memory_id"]],
+            "revised_memory_id": None,
+            "preserved_facts": [],
+            "revised_claim": card["summary"],
+            "reason": "Memory candidate reviewed against visible timeline evidence.",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    ]
+
+
+def test_clean_memory_card_can_be_revised_by_critic_without_pollution_guard(tmp_path):
+    case = {
+        "case_id": "case_clean_revise",
+        "events": [
+            {"event_id": "ev_001", "type": "diagnosis", "text": "Early diagnosis considered viral syndrome."},
+            {"event_id": "ev_002", "type": "diagnosis", "text": "Later PCR confirmed bacterial pneumonia."},
+        ],
+        "poison_records": [],
+    }
+    store = MemoryStore.load("case_clean_revise", tmp_path / "memory.jsonl")
+    card = store.write_card(
+        summary="Viral syndrome is the current diagnosis.",
+        evidence_refs=["ev_001"],
+        time_scope={"start": 1, "end": 1},
+        confidence=0.62,
+        tags=["diagnosis"],
+    )
+
+    class CleanReviseClient:
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            return LLMResult(
+                text=(
+                    '{"operations":[{"op":"Revise","target":"'
+                    + card["memory_id"]
+                    + '","reason":"Later visible evidence changes the temporal interpretation.",'
+                    '"revised_claim":"Treat viral syndrome as an early time-limited impression.",'
+                    '"preserved_facts":["early viral syndrome was considered"]}]}'
+                ),
+                usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                latency_s=0.0,
+            )
+
+    ops = apply_critique(case, store, CleanReviseClient())
+    assert ops[0]["op"] == "Revise"
+    assert ops[0]["guarded_op"] == ""
+    assert ops[0]["guard_applied"] is False
+    assert ops[0]["revised_memory_id"]
+    assert any(memory["status"] == "superseded" for memory in store.cards if memory["memory_id"] == card["memory_id"])
+
+
+def test_clean_memory_without_risk_type_does_not_trigger_pollution_guard(tmp_path):
+    case = {
+        "case_id": "case_clean_no_guard",
+        "events": [{"event_id": "ev_001", "type": "clinical", "text": "Visible clinical note."}],
+        "poison_records": [],
+    }
+    store = MemoryStore.load("case_clean_no_guard", tmp_path / "memory.jsonl")
+    card = store.write_card(
+        summary="Unsupported imported memory from another patient.",
+        evidence_refs=["ev_001"],
+        time_scope={},
+        confidence=0.4,
+        tags=["diagnosis"],
+    )
+
+    class CleanDiscardClient:
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            return LLMResult(
+                text=(
+                    '{"operations":[{"op":"Discard","target":"'
+                    + card["memory_id"]
+                    + '","reason":"Not supported by visible case evidence.",'
+                    '"revised_claim":"","preserved_facts":[]}]}'
+                ),
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                latency_s=0.0,
+            )
+
+    ops = apply_critique(case, store, CleanDiscardClient())
+    assert ops[0]["op"] == "Discard"
+    assert ops[0]["guarded_op"] == ""
+    assert ops[0]["guard_applied"] is False
 
 
 class FakeCriticClient:

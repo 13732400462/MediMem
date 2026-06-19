@@ -249,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument(
         "--baseline-set",
         default=None,
-        choices=["all", "focused", "required"],
+        choices=["all", "focused", "required", "none"],
         help="all includes polluted variants; required runs direct/cot/amem/ddo/colacare only.",
     )
     suite.add_argument(

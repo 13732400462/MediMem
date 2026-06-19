@@ -1,5 +1,7 @@
 from mem_ehr_agent.expanded_data import (
     MEDICAL_DATASET_SPECS,
+    dedupe_cases_by_source_id,
+    dedupe_source_rows,
     generic_row_to_pmoa_like,
     parse_source_names,
     source_rows_to_cases,
@@ -34,6 +36,31 @@ def test_parse_source_names_defaults_to_configured_pool():
     assert "pmc_patients" in names
     assert "medmcqa" in names
     assert len(names) >= 7
+
+
+def test_source_rows_are_deduped_by_stable_identity():
+    rows = [
+        {"_source_id": "same-row", "question": "What is the diagnosis?", "answer": "A"},
+        {"_source_id": "same-row", "question": "What is the diagnosis?", "answer": "A"},
+        {"question": "What is the diagnosis?", "answer": "A"},
+        {"question": "What is the diagnosis?", "answer": "A"},
+        {"_source_id": "unique-row", "question": "Different case", "answer": "B"},
+    ]
+    deduped, duplicate_count = dedupe_source_rows("medqa", rows)
+    assert duplicate_count == 2
+    assert len(deduped) == 3
+    assert [row.get("_source_id") for row in deduped] == ["same-row", None, "unique-row"]
+
+
+def test_cases_are_deduped_by_source_dataset_and_id():
+    cases = [
+        {"case_id": "a", "data_quality_flags": {"source_dataset": "pmoa_tts", "source_id": "row-1"}},
+        {"case_id": "b", "data_quality_flags": {"source_dataset": "pmoa_tts", "source_id": "row-1"}},
+        {"case_id": "c", "data_quality_flags": {"source_dataset": "pmoa_tts", "source_id": "row-2"}},
+    ]
+    deduped, duplicate_count = dedupe_cases_by_source_id(cases)
+    assert duplicate_count == 1
+    assert [case["case_id"] for case in deduped] == ["a", "c"]
 
 
 def test_generic_medmcqa_row_can_be_converted_to_case_schema():
