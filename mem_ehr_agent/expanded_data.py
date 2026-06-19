@@ -112,11 +112,70 @@ def stable_source_id(source_name: str, row: dict[str, Any], idx: int) -> str:
 
 
 def source_row_identity(row: dict[str, Any]) -> str:
-    for key in ("id", "case_report_id", "pmc_id", "patient_uid", "patient_id"):
+    for key in ("_source_id", "id", "case_report_id", "pmc_id", "patient_uid", "patient_id"):
         value = row.get(key)
         if value not in {None, ""}:
             return f"{key}:{value}"
     return "sha1:" + hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def source_row_dedupe_key(source_name: str, row: dict[str, Any]) -> str:
+    identity = source_row_identity(row)
+    if not identity.startswith("sha1:"):
+        return f"{source_name}:{identity}"
+    stable_fields = []
+    for key in (
+        "title",
+        "question",
+        "input",
+        "instruction",
+        "output",
+        "patient",
+        "summary",
+        "text",
+        "answer",
+        "target",
+    ):
+        value = row_field_value(row, key)
+        if isinstance(value, str) and value.strip():
+            stable_fields.append(re.sub(r"\s+", " ", value).strip().lower())
+        elif isinstance(value, (int, float)):
+            stable_fields.append(str(value))
+    if stable_fields:
+        digest = hashlib.sha1("\n".join(stable_fields).encode("utf-8")).hexdigest()
+        return f"{source_name}:stable:{digest}"
+    return f"{source_name}:{identity}"
+
+
+def dedupe_source_rows(source_name: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        key = source_row_dedupe_key(source_name, row)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped, len(rows) - len(deduped)
+
+
+def case_source_identity(case: dict[str, Any]) -> str:
+    flags = case.get("data_quality_flags") or {}
+    dataset = str(flags.get("source_dataset") or "")
+    source_id = str(flags.get("source_id") or case.get("case_id") or "")
+    return f"{dataset}:{source_id}"
+
+
+def dedupe_cases_by_source_id(cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for case in cases:
+        key = case_source_identity(case)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(case)
+    return deduped, len(cases) - len(deduped)
 
 
 def row_field_value(row: dict[str, Any], key: str) -> Any:
@@ -605,6 +664,7 @@ def rows_for_medical_source(
     require_real_data: bool = False,
     notes: list[str] | None = None,
     random_seed: int | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     notes = notes if notes is not None else []
     spec = MEDICAL_DATASET_SPECS[source_name]
@@ -625,6 +685,17 @@ def rows_for_medical_source(
                 notes=notes,
                 cache_dir=cache_dir,
             )
+    raw_loaded_count = len(rows)
+    rows, duplicate_count = dedupe_source_rows(source_name, rows)
+    if stats is not None:
+        stats["raw_loaded_count"] = raw_loaded_count
+        stats["deduped_candidate_count"] = len(rows)
+        stats["duplicate_row_count"] = duplicate_count
+    if duplicate_count:
+        notes.append(
+            f"{source_name}: deduped source rows raw_loaded={raw_loaded_count} "
+            f"deduped={len(rows)} duplicates={duplicate_count}."
+        )
     if require_real_data and len(rows) < n:
         raise RuntimeError(f"{source_name} requires {n} real rows but only {len(rows)} were loaded.")
     if random_seed is not None and len(rows) > n:
@@ -644,6 +715,7 @@ def rows_for_medical_source_split(
     notes: list[str] | None = None,
     random_seed: int | None = None,
     style_n: int | None = None,
+    stats: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     notes = notes if notes is not None else []
     spec = MEDICAL_DATASET_SPECS[source_name]
@@ -665,6 +737,17 @@ def rows_for_medical_source_split(
             )
             if spec.hf_dataset
             else []
+        )
+    raw_loaded_count = len(pool)
+    pool, duplicate_count = dedupe_source_rows(source_name, pool)
+    if stats is not None:
+        stats["raw_loaded_count"] = raw_loaded_count
+        stats["deduped_candidate_count"] = len(pool)
+        stats["duplicate_row_count"] = duplicate_count
+    if duplicate_count:
+        notes.append(
+            f"{source_name}: deduped source split pool raw_loaded={raw_loaded_count} "
+            f"deduped={len(pool)} duplicates={duplicate_count}."
         )
     if require_real_data and len(pool) < n:
         raise RuntimeError(f"{source_name} requires {n} real rows but only {len(pool)} were loaded.")
@@ -900,9 +983,11 @@ def build_medical_ehr_pool(
     )
     all_cases: list[dict[str, Any]] = []
     per_source_counts: dict[str, int] = {}
+    per_source_stats: dict[str, dict[str, int]] = {}
     style_policies: dict[str, dict[str, Any]] = {}
     start_idx = 1
     for source_name in source_names:
+        source_load_stats: dict[str, int] = {}
         rows, style_rows = rows_for_medical_source_split(
             source_name,
             candidate_n,
@@ -911,7 +996,10 @@ def build_medical_ehr_pool(
             notes=notes,
             random_seed=random_seed,
             style_n=min(max(per_source_n, 50), 500),
+            stats=source_load_stats,
         )
+        raw_loaded_count = int(source_load_stats.get("raw_loaded_count", len(rows)))
+        deduped_candidate_count = int(source_load_stats.get("deduped_candidate_count", len(rows)))
         style_policy = learn_source_style_policy(
             source_name,
             task_profile_for_source(source_name),
@@ -920,23 +1008,48 @@ def build_medical_ehr_pool(
         )
         style_policies[source_name] = style_policy
         cases = source_rows_to_cases(source_name, rows, pmc_context, start_idx=start_idx, style_policy=style_policy)
+        built_count = len(cases)
+        cases, case_duplicate_count = dedupe_cases_by_source_id(cases)
+        if case_duplicate_count:
+            notes.append(
+                f"{source_name}: case source_id dedupe dropped={case_duplicate_count} "
+                f"kept={len(cases)} from built={built_count}."
+            )
         if strict_no_leak_filter:
             before = len(cases)
             clean_cases = [case for case in cases if not leakage_findings_for_case(case)]
             dropped = before - len(clean_cases)
             notes.append(f"{source_name}: strict no-leak filter dropped={dropped} kept={len(clean_cases)} from candidates={before}.")
+            clean_cases, post_filter_duplicate_count = dedupe_cases_by_source_id(clean_cases)
+            if post_filter_duplicate_count:
+                notes.append(
+                    f"{source_name}: post-filter source_id dedupe dropped={post_filter_duplicate_count} "
+                    f"kept={len(clean_cases)}."
+                )
+            post_filter_count = len(clean_cases)
             cases = clean_cases[:per_source_n]
             if len(cases) < per_source_n:
                 raise RuntimeError(
-                    f"{source_name}: strict no-leak filter kept only {len(cases)} clean cases "
+                    f"{source_name}: strict no-leak filter and dedupe kept only {len(cases)} clean unique cases "
                     f"from {before} candidates; need {per_source_n}."
                 )
             renumber_source_cases(source_name, cases)
         else:
+            post_filter_count = len(cases)
             cases = cases[:per_source_n]
+            if require_real_data and len(cases) < per_source_n:
+                raise RuntimeError(
+                    f"{source_name}: source row/case dedupe kept only {len(cases)} unique cases; need {per_source_n}."
+                )
         validate_medical_source_cases(source_name, cases)
         start_idx += len(cases)
         per_source_counts[source_name] = len(cases)
+        per_source_stats[source_name] = {
+            "raw_loaded_count": raw_loaded_count,
+            "deduped_candidate_count": deduped_candidate_count,
+            "post_filter_count": post_filter_count,
+            "selected_count": len(cases),
+        }
         write_jsonl(output / f"{source_name}_{len(cases)}.jsonl", cases)
         write_prefix_slices(cases, output_dir=output / "slices" / source_name, stem=source_name, sizes=list(DEFAULT_PREFIX_SIZES))
         all_cases.extend(cases)
@@ -955,6 +1068,7 @@ def build_medical_ehr_pool(
                 "source_type": MEDICAL_DATASET_SPECS[name].source_type,
                 "url": MEDICAL_DATASET_SPECS[name].url,
                 "style_policy": style_policies.get(name, {}),
+                **per_source_stats.get(name, {}),
             }
             for name in source_names
         },

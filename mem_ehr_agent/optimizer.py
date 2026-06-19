@@ -110,6 +110,9 @@ def run_baselines(
     preds = []
     tasks = []
     baseline_set = str(baseline_set or "all")
+    if baseline_set == "none":
+        write_jsonl(run_dir / "predictions" / "baselines.jsonl", preds)
+        return preds
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for case in cases:
             tasks.append(("direct", case["case_id"], pool.submit(run_direct, case, client, fail_on_llm_error=fail_on_llm_error)))

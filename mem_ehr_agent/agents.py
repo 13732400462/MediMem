@@ -2440,7 +2440,7 @@ def run_ours(
             )
     pred["memory_ops"] = ops
     pred["prompt_memory_ops"] = prompt_ops
-    pred["pollution_exposed"] = True
+    pred["pollution_exposed"] = bool(features.get("enable_polluted_memory"))
     pred["retrieved_memory_count"] = len(memories)
     pred["source_evidence_note_count"] = len(evidence_notes)
     pred["diagnosis_candidate_count"] = len(diagnosis_candidates)
