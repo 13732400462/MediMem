@@ -1,5 +1,7 @@
+import json
+
 from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.memory import MemoryStore, apply_critique, bootstrap_memory
+from mem_ehr_agent.memory import MemoryStore, apply_critique, bootstrap_memory, llm_critic_ops
 from mem_ehr_agent.agents import (
     case_context,
     compact_case_context,
@@ -273,6 +275,111 @@ def test_clean_memory_without_risk_type_does_not_trigger_pollution_guard(tmp_pat
     assert ops[0]["op"] == "Discard"
     assert ops[0]["guarded_op"] == ""
     assert ops[0]["guard_applied"] is False
+
+
+def test_llm_critic_ops_splits_many_clean_cards_into_budgeted_batches():
+    case = {
+        "case_id": "case_many_cards",
+        "events": [
+            {
+                "event_id": f"ev_{idx:03d}",
+                "time": idx,
+                "type": "diagnosis" if idx % 3 == 0 else "clinical",
+                "text": "visible timeline evidence " + ("diagnosis confirmed. " * 12),
+            }
+            for idx in range(35)
+        ],
+        "poison_records": [],
+    }
+    candidates = [
+        {
+            "candidate_id": f"mem_{idx}",
+            "candidate_kind": "memory_card",
+            "text": "clean memory card " + str(idx) + " " + ("long details " * 120),
+            "supporting_evidence": [f"ev_{idx % 10:03d}", "extra evidence " * 30],
+            "tags": ["diagnosis"] * 12,
+            "status": "active",
+        }
+        for idx in range(14)
+    ]
+
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            assert len(prompt) < 20000
+            self.calls.append((messages, max_tokens))
+            payload = []
+            for candidate in candidates:
+                if f'"id": "{candidate["candidate_id"]}"' in prompt:
+                    payload.append(
+                        {
+                            "op": "Keep",
+                            "target": candidate["candidate_id"],
+                            "reason": "Visible evidence supports this memory.",
+                            "revised_claim": "",
+                            "preserved_facts": [],
+                        }
+                    )
+            return LLMResult(
+                text='{"operations":' + json.dumps(payload) + "}",
+                usage={"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+                latency_s=0.0,
+            )
+
+    client = RecordingClient()
+    ops = llm_critic_ops(case, candidates, client, fail_on_llm_error=True)
+    assert len(ops) == len(candidates)
+    assert all(op["op"] == "Keep" for op in ops)
+    assert len(client.calls) > 1
+    assert all(max_tokens <= 512 for _, max_tokens in client.calls)
+
+
+def test_single_oversized_clean_card_is_truncated_and_still_reviewed():
+    case = {
+        "case_id": "case_long_card",
+        "events": [
+            {
+                "event_id": "ev_long",
+                "time": 1,
+                "type": "diagnosis",
+                "text": "confirmed diagnosis " + ("visible detail " * 1000),
+            }
+        ],
+        "poison_records": [],
+    }
+    candidate = {
+        "candidate_id": "mem_long",
+        "candidate_kind": "memory_card",
+        "text": "large clean memory " + ("x" * 50000),
+        "supporting_evidence": ["ev_long", "support " * 3000],
+        "tags": ["diagnosis"],
+        "status": "active",
+    }
+
+    class RejectFirstClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            self.calls.append(prompt)
+            if len(self.calls) == 1:
+                raise RuntimeError("context length")
+            assert len(prompt) < 8000
+            return LLMResult(
+                text='{"operations":[{"op":"Keep","target":"mem_long","reason":"ok","revised_claim":"","preserved_facts":[]}]}',
+                usage={"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+                latency_s=0.0,
+            )
+
+    client = RejectFirstClient()
+    ops = llm_critic_ops(case, [candidate], client, fail_on_llm_error=True)
+    assert ops[0]["op"] == "Keep"
+    assert len(client.calls) == 2
+    assert "x" * 1000 not in client.calls[-1]
 
 
 class FakeCriticClient:
