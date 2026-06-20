@@ -186,7 +186,7 @@ KEY_CRITIC_TERMS = (
 )
 
 
-def compact_critic_events(case: dict[str, Any]) -> list[dict[str, Any]]:
+def compact_critic_events(case: dict[str, Any], referenced_event_ids: set[str] | None = None) -> list[dict[str, Any]]:
     events = list(case.get("events", []))
     by_id = {str(event.get("event_id")): idx for idx, event in enumerate(events)}
     selected: dict[str, dict[str, Any]] = {}
@@ -196,11 +196,10 @@ def compact_critic_events(case: dict[str, Any]) -> list[dict[str, Any]]:
         if event_id:
             selected[event_id] = event
 
-    for poison in case.get("poison_records", []):
-        source_id = str(poison.get("source_event_id") or "")
-        idx = by_id.get(source_id)
+    for ref_id in referenced_event_ids or set():
+        idx = by_id.get(str(ref_id))
         if idx is not None:
-            for neighbor_idx in range(max(0, idx - 2), min(len(events), idx + 3)):
+            for neighbor_idx in range(max(0, idx - 1), min(len(events), idx + 2)):
                 add_event(events[neighbor_idx])
     for event in events:
         text = str(event.get("text") or "").lower()
@@ -209,14 +208,47 @@ def compact_critic_events(case: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(selected.values(), key=lambda event: (int(event.get("time", 0) or 0), str(event.get("event_id") or "")))
 
 
-def critic_context(case: dict[str, Any], *, compact: bool = True) -> str:
-    events = compact_critic_events(case) if compact else case.get("events", [])
+def _clip_text(value: Any, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _estimate_tokens(text: str) -> int:
+    # Conservative enough for mixed English/JSON clinical prompts under an 8192-token vLLM limit.
+    return max(1, len(text) // 3)
+
+
+def critic_context(
+    case: dict[str, Any],
+    *,
+    compact: bool = True,
+    referenced_event_ids: set[str] | None = None,
+    max_events: int = 24,
+    max_chars_per_event: int = 240,
+) -> str:
+    events = compact_critic_events(case, referenced_event_ids) if compact else case.get("events", [])
+    if len(events) > max_events:
+        high_value = [event for event in events if event.get("type") in KEY_CRITIC_EVENT_TYPES]
+        recent = sorted(events, key=lambda event: (int(event.get("time", 0) or 0), str(event.get("event_id") or "")))[-max_events:]
+        selected: dict[str, dict[str, Any]] = {}
+        for event in high_value + recent:
+            event_id = str(event.get("event_id") or "")
+            if event_id:
+                selected[event_id] = event
+            if len(selected) >= max_events:
+                break
+        events = sorted(selected.values(), key=lambda event: (int(event.get("time", 0) or 0), str(event.get("event_id") or "")))
     lines = [
         f"case_id: {case.get('case_id')}",
         "timeline evidence:",
     ]
     for event in events:
-        lines.append(f"- {event.get('event_id')} t={event.get('time')} [{event.get('type')}] {event.get('text')}")
+        lines.append(
+            f"- {event.get('event_id')} t={event.get('time')} [{event.get('type')}] "
+            f"{_clip_text(event.get('text'), max_chars_per_event)}"
+        )
     return "\n".join(lines)
 
 
@@ -247,7 +279,55 @@ def critic_prompt(case: dict[str, Any], poison: dict[str, Any]) -> list[dict[str
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def batched_critic_prompt(case: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+def candidate_event_refs(candidate: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for key in ("source_event_id",):
+        value = str(candidate.get(key) or "")
+        if value:
+            refs.add(value)
+    for ref in candidate.get("supporting_evidence") or []:
+        value = str(ref or "")
+        if value.startswith("ev"):
+            refs.add(value)
+    return refs
+
+
+def compact_candidate_payload(
+    candidate: dict[str, Any],
+    *,
+    text_chars: int = 420,
+    evidence_chars: int = 120,
+    max_evidence: int = 3,
+    max_tags: int = 8,
+) -> dict[str, Any]:
+    evidence = [
+        _clip_text(ref, evidence_chars)
+        for ref in candidate.get("supporting_evidence") or []
+        if str(ref).strip()
+    ][:max_evidence]
+    return {
+        "id": candidate_id(candidate),
+        "kind": candidate.get("candidate_kind") or "memory_card",
+        "type": candidate.get("pollution_type") or candidate.get("risk_type"),
+        "claim_type": candidate.get("claim_type"),
+        "source_event_id": candidate.get("source_event_id"),
+        "text": _clip_text(candidate.get("text"), text_chars),
+        "supporting_evidence": evidence,
+        "status": candidate.get("status"),
+        "confidence": candidate.get("confidence"),
+        "tags": [str(tag) for tag in candidate.get("tags") or [] if str(tag).strip()][:max_tags],
+    }
+
+
+def batched_critic_prompt(
+    case: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    max_context_events: int = 24,
+    candidate_text_chars: int = 420,
+    evidence_chars: int = 120,
+    max_chars_per_event: int = 240,
+) -> list[dict[str, str]]:
     system = (
         "You are a longitudinal clinical memory critic for a research benchmark. "
         "Use only the supplied compact timeline and memory candidates. Do not infer from hidden labels. "
@@ -260,23 +340,19 @@ def batched_critic_prompt(case: dict[str, Any], candidates: list[dict[str, Any]]
         "Keep when the memory is still valid. preserved_facts must be an array of short strings. "
         "Return one operation for each memory candidate. Do not include markdown."
     )
-    candidate_payload = []
+    referenced_event_ids: set[str] = set()
     for candidate in candidates:
-        candidate_payload.append(
-            {
-                "id": candidate.get("candidate_id") or candidate.get("memory_id") or candidate.get("poison_id"),
-                "kind": candidate.get("candidate_kind") or "memory_card",
-                "type": candidate.get("pollution_type") or candidate.get("risk_type"),
-                "claim_type": candidate.get("claim_type"),
-                "source_event_id": candidate.get("source_event_id"),
-                "text": candidate.get("text"),
-                "supporting_evidence": candidate.get("supporting_evidence"),
-                "status": candidate.get("status"),
-                "tags": candidate.get("tags"),
-            }
+        referenced_event_ids.update(candidate_event_refs(candidate))
+    candidate_payload = [
+        compact_candidate_payload(
+            candidate,
+            text_chars=candidate_text_chars,
+            evidence_chars=evidence_chars,
         )
+        for candidate in candidates
+    ]
     user = (
-        f"[CASE_TIMELINE]\n{critic_context(case)}\n\n"
+        f"[CASE_TIMELINE]\n{critic_context(case, referenced_event_ids=referenced_event_ids, max_events=max_context_events, max_chars_per_event=max_chars_per_event)}\n\n"
         f"[MEMORY_CANDIDATES]\n{json.dumps(candidate_payload, ensure_ascii=False)}\n\n"
         "Return JSON only."
     )
@@ -470,6 +546,112 @@ def normalize_critic_decision(
     }
 
 
+def critic_prompt_token_estimate(messages: list[dict[str, str]]) -> int:
+    return sum(_estimate_tokens(str(message.get("content") or "")) + 4 for message in messages) + 16
+
+
+def critic_output_tokens(batch_size: int) -> int:
+    return min(512, max(192, 96 + 80 * batch_size))
+
+
+def split_critic_batches(
+    case: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    input_budget_tokens: int = 5800,
+    max_candidates_per_batch: int = 6,
+    candidate_text_chars: int = 420,
+    max_context_events: int = 24,
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+
+    def estimate(batch: list[dict[str, Any]]) -> int:
+        return critic_prompt_token_estimate(
+            batched_critic_prompt(
+                case,
+                batch,
+                max_context_events=max_context_events,
+                candidate_text_chars=candidate_text_chars,
+            )
+        )
+
+    for candidate in candidates:
+        trial = current + [candidate]
+        if current and (len(trial) > max_candidates_per_batch or estimate(trial) > input_budget_tokens):
+            batches.append(current)
+            current = [candidate]
+        else:
+            current = trial
+        if len(current) == 1 and estimate(current) > input_budget_tokens:
+            batches.append(current)
+            current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
+def parse_critic_operations(result_text: str) -> list[dict[str, Any]]:
+    raw = extract_json_object(result_text)
+    operations = raw.get("operations") or []
+    if not operations and raw.get("op"):
+        operations = [raw]
+    return [item for item in operations if isinstance(item, dict)]
+
+
+def call_critic_batch(
+    case: dict[str, Any],
+    batch: list[dict[str, Any]],
+    client: DeepSeekClient,
+    *,
+    max_context_events: int = 24,
+    candidate_text_chars: int = 420,
+    evidence_chars: int = 120,
+    max_chars_per_event: int = 240,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    messages = batched_critic_prompt(
+        case,
+        batch,
+        max_context_events=max_context_events,
+        candidate_text_chars=candidate_text_chars,
+        evidence_chars=evidence_chars,
+        max_chars_per_event=max_chars_per_event,
+    )
+    result = client.chat(messages, temperature=0.0, max_tokens=critic_output_tokens(len(batch)))
+    return parse_critic_operations(result.text), result.usage
+
+
+def call_critic_batch_with_budget_retry(
+    case: dict[str, Any],
+    batch: list[dict[str, Any]],
+    client: DeepSeekClient,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    try:
+        return call_critic_batch(case, batch, client)
+    except Exception:
+        if len(batch) > 1:
+            operations: list[dict[str, Any]] = []
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            for candidate in batch:
+                single_ops, single_usage = call_critic_batch_with_budget_retry(case, [candidate], client)
+                operations.extend(single_ops)
+                usage = {
+                    "prompt_tokens": usage.get("prompt_tokens", 0) + single_usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0) + single_usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0) + single_usage.get("total_tokens", 0),
+                }
+            return operations, usage
+        return call_critic_batch(
+            case,
+            batch,
+            client,
+            max_context_events=10,
+            candidate_text_chars=180,
+            evidence_chars=80,
+            max_chars_per_event=160,
+        )
+
+
 def llm_critic_ops(
     case: dict[str, Any],
     candidates: list[dict[str, Any]],
@@ -481,38 +663,33 @@ def llm_critic_ops(
     guarded_by_id = {candidate_id(candidate): heuristic_critic_op(candidate) for candidate in candidates}
     if client is None:
         return [(guarded_by_id[candidate_id(candidate)] or default_keep_op(candidate)) for candidate in candidates]
-    try:
-        result = client.chat(batched_critic_prompt(case, candidates), temperature=0.0, max_tokens=1400)
-    except Exception:
-        if fail_on_llm_error:
-            raise
-        return [(guarded_by_id[candidate_id(candidate)] or default_keep_op(candidate)) for candidate in candidates]
-    try:
-        raw = extract_json_object(result.text)
-        operations = raw.get("operations") or []
-        if not operations and raw.get("op"):
-            operations = [raw]
-    except Exception:
-        return [(guarded_by_id[candidate_id(candidate)] or default_keep_op(candidate)) for candidate in candidates]
-    raw_by_target = {
-        str(item.get("target") or item.get("id") or ""): item
-        for item in operations
-        if isinstance(item, dict)
-    }
     decisions = []
-    for idx, candidate in enumerate(candidates):
-        target = candidate_id(candidate)
-        raw_item = raw_by_target.get(target, {})
-        usage = result.usage if idx == 0 else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        decisions.append(
-            normalize_critic_decision(
-                raw_item,
-                candidate,
-                guarded_by_id[target],
-                enforce_op_guard=enforce_op_guard,
-                usage=usage,
+    for batch in split_critic_batches(case, candidates):
+        try:
+            operations, batch_usage = call_critic_batch_with_budget_retry(case, batch, client)
+        except Exception:
+            if fail_on_llm_error:
+                raise
+            operations = []
+            batch_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        raw_by_target = {
+            str(item.get("target") or item.get("id") or ""): item
+            for item in operations
+            if isinstance(item, dict)
+        }
+        for idx, candidate in enumerate(batch):
+            target = candidate_id(candidate)
+            raw_item = raw_by_target.get(target, {})
+            usage = batch_usage if idx == 0 else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            decisions.append(
+                normalize_critic_decision(
+                    raw_item,
+                    candidate,
+                    guarded_by_id[target],
+                    enforce_op_guard=enforce_op_guard,
+                    usage=usage,
+                )
             )
-        )
     return decisions
 
 
