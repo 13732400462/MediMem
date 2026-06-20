@@ -45,8 +45,11 @@ mkdir -p "$RUN_ROOT" "$DATA_ROOT" "$CACHE_DIR"
 STATUS_JSONL="$RUN_ROOT/status.jsonl"
 BLOCKED_JSONL="$RUN_ROOT/blocked_sources.jsonl"
 SUMMARY_JSON="$RUN_ROOT/strict_size_sweep_summary.json"
+RUN_CHILD_PIDS="$RUN_ROOT/child_pids.tsv"
+RUN_EXIT_JSON="$RUN_ROOT/launcher_exit.json"
 : > "$STATUS_JSONL"
 : > "$BLOCKED_JSONL"
+: > "$RUN_CHILD_PIDS"
 : > "$RUN_ROOT/run.log"
 
 log() {
@@ -63,6 +66,85 @@ path, payload = sys.argv[1], sys.argv[2]
 with open(path, "a", encoding="utf-8") as f:
     f.write(json.dumps(json.loads(payload), ensure_ascii=False, sort_keys=True) + "\n")
 PY
+}
+
+record_process_snapshot() {
+  local path="$RUN_ROOT/process_snapshot_$(date +%Y%m%d_%H%M%S).txt"
+  {
+    date '+%Y-%m-%d %H:%M:%S'
+    ps -eo pid,ppid,stat,pcpu,pmem,etime,args --sort=-pcpu | head -120
+    printf '\n[registered children]\n'
+    cat "$RUN_CHILD_PIDS" 2>/dev/null || true
+    printf '\n[gpu]\n'
+    nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader 2>/dev/null || true
+  } > "$path" 2>&1 || true
+  echo "$path"
+}
+
+terminate_registered_children() {
+  if [ ! -s "$RUN_CHILD_PIDS" ]; then
+    return 0
+  fi
+  awk -F '\t' '{print $1}' "$RUN_CHILD_PIDS" | while read -r pid; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 3
+  awk -F '\t' '{print $1}' "$RUN_CHILD_PIDS" | while read -r pid; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+on_signal() {
+  local sig="$1"
+  local snapshot
+  snapshot="$(record_process_snapshot)"
+  log "TERMINATED signal=$sig snapshot=$snapshot"
+  append_json "$BLOCKED_JSONL" "{\"stage\":\"launcher\",\"status\":\"terminated\",\"signal\":\"$sig\",\"snapshot\":\"$snapshot\"}"
+  terminate_registered_children
+  exit 128
+}
+
+on_exit() {
+  local status="$?"
+  if [ "$status" -ne 0 ]; then
+    local snapshot
+    snapshot="$(record_process_snapshot)"
+    append_json "$BLOCKED_JSONL" "{\"stage\":\"launcher\",\"status\":\"exited_nonzero\",\"exit_code\":$status,\"snapshot\":\"$snapshot\"}"
+  fi
+  "$PY" - "$RUN_EXIT_JSON" "$status" <<'PY' || true
+import json
+import sys
+from datetime import datetime
+path, status = sys.argv[1], int(sys.argv[2])
+with open(path, "w", encoding="utf-8") as f:
+    json.dump({"exit_code": status, "finished_at": datetime.now().isoformat(timespec="seconds")}, f, ensure_ascii=False, sort_keys=True)
+    f.write("\n")
+PY
+}
+
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+trap on_exit EXIT
+
+run_logged() {
+  local label="$1"
+  local logfile="$2"
+  shift 2
+  "$@" > "$logfile" 2>&1 &
+  local pid=$!
+  printf '%s\t%s\t%s\n' "$pid" "$label" "$logfile" >> "$RUN_CHILD_PIDS"
+  printf '%s\n' "$pid" > "${logfile}.pid"
+  log "RUN command label=$label pid=$pid log=$logfile"
+  local rc=0
+  wait "$pid" || rc=$?
+  printf '%s\n' "$rc" > "${logfile}.exit"
+  log "DONE command label=$label pid=$pid rc=$rc log=$logfile"
+  return "$rc"
 }
 
 json_quote() {
@@ -117,6 +199,7 @@ start_vllm() {
       --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
       > "$model_root/vllm.log" 2>&1 &
   local pid=$!
+  printf '%s\t%s\t%s\n' "$pid" "vllm:$served_name" "$model_root/vllm.log" >> "$RUN_CHILD_PIDS"
   echo "$pid" > "$model_root/vllm.pid"
   local base_url="http://127.0.0.1:${port}/v1"
   if ! wait_for_model "$base_url" "$served_name"; then
@@ -170,14 +253,17 @@ run_medical_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START medical model=$served_name phase=$phase workers=$workers per_source_n=$PER_SOURCE_N"
+  if ! run_logged "build-medical:$served_name:$phase" "$run_dir/build.log" \
   "$PY" -m mem_ehr_agent data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources "$MEDICAL_SOURCES" \
     --output-dir "$data_dir" \
     --require-real-data \
     --cache-dir "$CACHE_DIR" \
-    --random-seed "$RANDOM_SEED" \
-    > "$run_dir/build.log" 2>&1
+    --random-seed "$RANDOM_SEED"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"build\",\"workers\":$workers,\"log\":\"$run_dir/build.log\"}"
+    return 1
+  fi
 
   local dataset_path
   dataset_path="$("$PY" - "$data_dir/manifest.json" <<'PY'
@@ -186,8 +272,13 @@ import sys
 print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
-  "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$run_dir/validate.log" 2>&1
-  if ! "$PY" -u -m mem_ehr_agent experiment-suite \
+  if ! run_logged "validate-medical:$served_name:$phase" "$run_dir/validate.log" \
+    "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"validate\",\"workers\":$workers,\"log\":\"$run_dir/validate.log\"}"
+    return 1
+  fi
+  if ! run_logged "experiment-medical:$served_name:$phase" "$run_dir/experiment.log" \
+    "$PY" -u -m mem_ehr_agent experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -197,8 +288,7 @@ PY
     --counterfactual-policy risk_sample \
     --counterfactual-sample-rate "${COUNTERFACTUAL_SAMPLE_RATE:-0.20}" \
     --counterfactual-risk-threshold "${COUNTERFACTUAL_RISK_THRESHOLD:-0.55}" \
-    --defer-reports \
-    2>&1 | tee "$run_dir/experiment.log"; then
+    --defer-reports; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"log\":\"$run_dir/experiment.log\"}"
     return 1
   fi
@@ -224,14 +314,17 @@ run_pmoa_ablation_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START pmoa ablation model=$served_name phase=$phase workers=$workers per_source_n=$PER_SOURCE_N groups=$PMOA_ABLATION_GROUPS"
+  if ! run_logged "build-pmoa:$served_name:$phase" "$run_dir/build.log" \
   "$PY" -m mem_ehr_agent data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources pmoa_tts \
     --output-dir "$data_dir" \
     --require-real-data \
     --cache-dir "$CACHE_DIR" \
-    --random-seed "$RANDOM_SEED" \
-    > "$run_dir/build.log" 2>&1
+    --random-seed "$RANDOM_SEED"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"pmoa_ablation\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"build\",\"workers\":$workers,\"log\":\"$run_dir/build.log\"}"
+    return 1
+  fi
 
   local dataset_path
   dataset_path="$("$PY" - "$data_dir/manifest.json" <<'PY'
@@ -240,8 +333,13 @@ import sys
 print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
-  "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$run_dir/validate.log" 2>&1
-  if ! "$PY" -u -m mem_ehr_agent experiment-suite \
+  if ! run_logged "validate-pmoa:$served_name:$phase" "$run_dir/validate.log" \
+    "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path"; then
+    append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"pmoa_ablation\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"validate\",\"workers\":$workers,\"log\":\"$run_dir/validate.log\"}"
+    return 1
+  fi
+  if ! run_logged "experiment-pmoa:$served_name:$phase" "$run_dir/experiment.log" \
+    "$PY" -u -m mem_ehr_agent experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -251,8 +349,7 @@ PY
     --counterfactual-policy risk_sample \
     --counterfactual-sample-rate "${COUNTERFACTUAL_SAMPLE_RATE:-0.20}" \
     --counterfactual-risk-threshold "${COUNTERFACTUAL_RISK_THRESHOLD:-0.55}" \
-    --defer-reports \
-    2>&1 | tee "$run_dir/experiment.log"; then
+    --defer-reports; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"pmoa_ablation\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"log\":\"$run_dir/experiment.log\"}"
     return 1
   fi
@@ -277,7 +374,8 @@ run_locomo_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START locomo model=$served_name phase=$phase workers=$workers sample_n=$LOCOMO_SAMPLE_N"
-  if ! "$PY" -u -m mem_ehr_agent benchmark run \
+  if ! run_logged "benchmark-locomo:$served_name:$phase" "$run_dir/benchmark.log" \
+    "$PY" -u -m mem_ehr_agent benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -285,8 +383,7 @@ run_locomo_pipeline() {
     --random-seed "$RANDOM_SEED" \
     --max-workers "$workers" \
     --require-api \
-    --output-root "$run_dir" \
-    2>&1 | tee "$run_dir/benchmark.log"; then
+    --output-root "$run_dir"; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"locomo\",\"phase\":\"$phase\",\"status\":\"failed\",\"workers\":$workers,\"log\":\"$run_dir/benchmark.log\"}"
     return 1
   fi
