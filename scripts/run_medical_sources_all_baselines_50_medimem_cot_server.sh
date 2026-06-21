@@ -11,7 +11,7 @@ export RUN_ROOT="${RUN_ROOT:-runs/medical_sources_all_baselines_50_20260603_cot}
 export MAX_WORKERS="${MAX_WORKERS:-96}"
 export PER_SOURCE_N="${PER_SOURCE_N:-50}"
 export REPORT_STEM="${REPORT_STEM:-medical_sources_all_baselines_50_medimem_cot}"
-export SOURCES_CSV="${SOURCES_CSV:-medical_meadow_wikidoc,medmcqa,medqa,chatdoctor_healthcaremagic,medical_dialogue_to_soap,pmoa_tts}"
+export SOURCES_CSV="${SOURCES_CSV:-medical_meadow_wikidoc,medmcqa,medqa,chatdoctor_healthcaremagic,pmoa_tts}"
 
 export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-http://127.0.0.1:8000/v1}"
 export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-/home/yyh/Qwen3-VL-30B-A3B-Instruct-FP8}"

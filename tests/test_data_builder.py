@@ -23,10 +23,16 @@ def test_stale_poison_records_are_linked_to_timeline():
 
 
 def test_stale_expected_ops_mix_revision_invalidation_and_discard():
-    case = build_case(fallback_pmoa_rows()[0], fallback_pmc_rows()[0], 1)
-    ops = {op["op"] for op in case["expected_memory_ops"]}
+    cases = [
+        build_case(fallback_pmoa_rows()[idx % len(fallback_pmoa_rows())], fallback_pmc_rows()[idx % len(fallback_pmc_rows())], idx + 1)
+        for idx in range(5)
+    ]
+    ops = {op["op"] for case in cases for op in case["expected_memory_ops"]}
     assert {"Revise", "Invalidate", "Discard"}.issubset(ops)
-    assert any(op.get("should_preserve_fact") for op in case["expected_memory_ops"] if op["op"] == "Revise")
+    assert any(op.get("should_preserve_fact") for case in cases for op in case["expected_memory_ops"] if op["op"] == "Revise")
+    poison_ids = {poison["poison_id"] for case in cases for poison in case["poison_records"]}
+    assert not any(op.get("target") in poison_ids for case in cases for op in case["expected_memory_ops"])
+    assert all(str(op.get("target", "")).startswith("mem_") for case in cases for op in case["expected_memory_ops"] if op["op"] != "Write")
 
 
 def test_expected_ops_are_not_fixed_across_cases():

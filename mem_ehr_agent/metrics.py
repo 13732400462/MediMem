@@ -13,6 +13,14 @@ from .medical_terms import canonicalize_diagnosis
 from .task_profiles import MEDICAL_ANSWER_ENTITY, case_task_profile
 
 COUNTERFACTUAL_CPG_THRESHOLD = 0.40
+FORBIDDEN_VISIBLE_FIELDS = (
+    "pollution_type",
+    "staleness_type",
+    "expected_op",
+    "revised_claim",
+    "preserved_facts",
+    "target_diagnosis",
+)
 
 
 def is_medimem_method(method: Any) -> bool:
@@ -209,7 +217,7 @@ def pollution_suppression(case: dict[str, Any], pred: dict[str, Any]) -> float:
     actual = pred.get("memory_ops") or []
     hits = 0
     for exp in expected:
-        if any(op.get("op") == exp.get("op") and str(op.get("target")) == str(exp.get("target")) for op in actual):
+        if any(memory_op_matches(exp, op) for op in actual):
             hits += 1
     return hits / len(expected)
 
@@ -227,12 +235,35 @@ def stale_memory_expected_ops(case: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def memory_op_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
-    return actual.get("op") == expected.get("op") and str(actual.get("target")) == str(expected.get("target"))
+    if actual.get("op") != expected.get("op"):
+        return False
+    expected_ids = {
+        str(value)
+        for value in (
+            expected.get("target"),
+            expected.get("seed_id"),
+            expected.get("runtime_memory_id"),
+        )
+        if str(value or "").strip()
+    }
+    actual_ids = {
+        str(value)
+        for value in (
+            actual.get("target"),
+            actual.get("seed_id"),
+            actual.get("revised_memory_id"),
+        )
+        if str(value or "").strip()
+    }
+    actual_ids.update(str(value) for value in actual.get("touched_memory_ids") or [] if str(value or "").strip())
+    return bool(expected_ids & actual_ids)
 
 
 def actual_op_for_target(pred: dict[str, Any], target: str) -> dict[str, Any] | None:
     for op in pred.get("memory_ops") or []:
-        if str(op.get("target")) == str(target):
+        op_ids = {str(op.get("target") or ""), str(op.get("seed_id") or ""), str(op.get("revised_memory_id") or "")}
+        op_ids.update(str(value) for value in op.get("touched_memory_ids") or [])
+        if str(target) in op_ids:
             return op
     return None
 
@@ -832,7 +863,7 @@ def _audit_option_norms(case: dict[str, Any]) -> set[str]:
 def _audit_verdict(case: dict[str, Any], field: str, alias: str, kind: str, context: str = "") -> str:
     alias_norm = _audit_norm(alias)
     source_type = _audit_source_type(case)
-    if kind in {"runtime_gold_marker", "primary_selection_source", "source_real_false"}:
+    if kind in {"runtime_gold_marker", "primary_selection_source", "source_real_false", "forbidden_visible_field"}:
         return "critical"
     if len(alias_norm) < 4:
         return "short_label_false_positive"
@@ -956,9 +987,25 @@ def build_leakage_audit_details(cases: list[dict[str, Any]], predictions: list[d
                 "diagnosis_candidates": pred.get("diagnosis_candidates"),
                 "evidence": pred.get("evidence"),
                 "reasoning_summary": pred.get("reasoning_summary"),
+                "primary_selection_pass": pred.get("primary_selection_pass"),
+                "counterfactual_verification": pred.get("counterfactual_verification"),
             },
             ensure_ascii=False,
         )
+        for field_name in FORBIDDEN_VISIBLE_FIELDS:
+            if re.search(rf'"{re.escape(field_name)}"\s*:', pred_visible):
+                details.append(
+                    {
+                        "case_id": case_id,
+                        "source": source,
+                        "method": method,
+                        "field": "prediction_visible",
+                        "kind": "forbidden_visible_field",
+                        "alias": field_name,
+                        "verdict": "critical",
+                        "context": _audit_context(pred_visible, field_name),
+                    }
+                )
         marker_match = marker_re.search(pred_visible)
         if marker_match:
             details.append(
@@ -975,6 +1022,20 @@ def build_leakage_audit_details(cases: list[dict[str, Any]], predictions: list[d
             )
         prompt_ops = pred.get("prompt_memory_ops")
         prompt_text = json.dumps(prompt_ops, ensure_ascii=False) if prompt_ops is not None else ""
+        for field_name in FORBIDDEN_VISIBLE_FIELDS:
+            if prompt_text and re.search(rf'"{re.escape(field_name)}"\s*:', prompt_text):
+                details.append(
+                    {
+                        "case_id": case_id,
+                        "source": source,
+                        "method": method,
+                        "field": "prompt_memory_ops",
+                        "kind": "forbidden_visible_field",
+                        "alias": field_name,
+                        "verdict": "critical",
+                        "context": _audit_context(prompt_text, field_name),
+                    }
+                )
         verification = pred.get("counterfactual_verification") or {}
         counterfactual_text = json.dumps({"intervention": verification.get("intervention")}, ensure_ascii=False)
         for alias in _audit_aliases(case):
@@ -1034,11 +1095,13 @@ def summarize_leakage_audit_details(details: list[dict[str, Any]]) -> dict[str, 
         "counterfactual_runtime_gold_mentions": int(kind_counts.get("counterfactual_runtime_gold_mention", 0)),
         "leaked_primary_selection_sources": int(kind_counts.get("primary_selection_source", 0)),
         "leaked_prediction_candidate_mentions": int(kind_counts.get("prediction_marker", 0)),
+        "forbidden_visible_field_mentions": int(kind_counts.get("forbidden_visible_field", 0)),
         "source_real_false": int(kind_counts.get("source_real_false", 0)),
     }
 
 
 def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> dict[str, int]:
+    detailed = summarize_leakage_audit_details(build_leakage_audit_details(cases, predictions))
     case_by_id = {case.get("case_id"): case for case in cases}
     runtime_gold_mentions = 0
     runtime_gold_markers = 0
@@ -1050,6 +1113,7 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
     counterfactual_runtime_gold_mentions = 0
     leaked_primary_selection_sources = 0
     leaked_prediction_candidate_mentions = 0
+    forbidden_visible_field_mentions = int(detailed.get("forbidden_visible_field_mentions", 0) or 0)
     marker_re = re.compile(
         r"\b(?:assessment entity candidate|reference answer evidence|correct answer|correct option|doctor assessment)\b",
         flags=re.I,
@@ -1087,6 +1151,8 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
                 "diagnosis_candidates": pred.get("diagnosis_candidates"),
                 "evidence": pred.get("evidence"),
                 "reasoning_summary": pred.get("reasoning_summary"),
+                "primary_selection_pass": pred.get("primary_selection_pass"),
+                "counterfactual_verification": pred.get("counterfactual_verification"),
             },
             ensure_ascii=False,
         )
@@ -1107,15 +1173,17 @@ def build_leakage_audit(cases: list[dict[str, Any]], predictions: list[dict[str,
         }
         if _contains(json.dumps(runtime_counterfactual, ensure_ascii=False), primary):
             counterfactual_runtime_gold_mentions += 1
-    critical_leakage_count = runtime_gold_markers + leaked_primary_selection_sources
+    critical_leakage_count = runtime_gold_markers + leaked_primary_selection_sources + forbidden_visible_field_mentions
     return {
         "critical_leakage_count": critical_leakage_count,
+        "needs_review_count": int(detailed.get("needs_review_count", 0) or 0),
         "runtime_gold_mentions": runtime_gold_mentions,
         "runtime_gold_markers": runtime_gold_markers,
         "prompt_memory_ops_gold_mentions": prompt_memory_ops_gold_mentions,
         "counterfactual_runtime_gold_mentions": counterfactual_runtime_gold_mentions,
         "leaked_primary_selection_sources": leaked_primary_selection_sources,
         "leaked_prediction_candidate_mentions": leaked_prediction_candidate_mentions,
+        "forbidden_visible_field_mentions": forbidden_visible_field_mentions,
         "poison_expected_op": poison_expected_op,
         "poison_revised_claim": poison_revised_claim,
         "poison_expected_memory_ops": poison_expected_memory_ops,
@@ -1130,11 +1198,11 @@ def build_memory_op_confusion(cases: list[dict[str, Any]], predictions: list[dic
         pred = pred_by_case.get(case.get("case_id"))
         if not pred:
             continue
-        actual_by_target = {str(op.get("target")): str(op.get("op")) for op in pred.get("memory_ops", [])}
         for expected in stale_memory_expected_ops(case):
             expected_op = str(expected.get("op"))
             target = str(expected.get("target"))
-            actual_op = actual_by_target.get(target, "MISSING")
+            actual = actual_op_for_target(pred, target)
+            actual_op = str(actual.get("op")) if actual else "MISSING"
             confusion[f"{expected_op}->{actual_op}"] += 1
     return dict(sorted(confusion.items()))
 
@@ -1149,7 +1217,7 @@ def build_pollution_type_breakdown(cases: list[dict[str, Any]], predictions: lis
         poison_by_id = {str(p.get("poison_id")): p for p in case.get("poison_records", [])}
         for expected in stale_memory_expected_ops(case):
             target = str(expected.get("target"))
-            pollution_type = str(poison_by_id.get(target, {}).get("pollution_type") or "unknown")
+            pollution_type = str(expected.get("memory_issue_type") or poison_by_id.get(target, {}).get("pollution_type") or "unknown")
             single_case = {"expected_memory_ops": [expected]}
             buckets[pollution_type].append(
                 {
@@ -1183,7 +1251,7 @@ def build_expected_memory_op_distribution(cases: list[dict[str, Any]]) -> dict[s
         poison_by_id = poison_by_case.get(case.get("case_id"), {})
         for expected in stale_memory_expected_ops(case):
             target = str(expected.get("target"))
-            pollution_type = str(poison_by_id.get(target, {}).get("pollution_type") or "unknown")
+            pollution_type = str(expected.get("memory_issue_type") or poison_by_id.get(target, {}).get("pollution_type") or "unknown")
             distribution[pollution_type][str(expected.get("op"))] += 1
     return {
         pollution_type: dict(sorted(counts.items()))

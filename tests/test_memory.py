@@ -1,7 +1,7 @@
 import json
 
 from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.memory import MemoryStore, apply_critique, bootstrap_memory, llm_critic_ops
+from mem_ehr_agent.memory import MemoryStore, apply_critique, batched_critic_prompt, bootstrap_memory, llm_critic_ops, memory_card_candidate
 from mem_ehr_agent.agents import (
     case_context,
     compact_case_context,
@@ -10,6 +10,7 @@ from mem_ehr_agent.agents import (
     prefer_visible_diagnosis_candidate,
     pollution_memory_context,
     resolve_top_k,
+    run_llm_prediction,
     run_single_cot_agent,
     safe_memory_ops_for_prompt,
     source_aligned_evidence_notes,
@@ -115,7 +116,7 @@ def test_revise_marks_old_memory_superseded_and_writes_replacement(tmp_path):
     assert any(card["updated_by_op"] == "Revise" and card["status"] == "active" for card in reloaded.cards)
 
 
-def test_apply_critique_emits_revision_metadata_without_gold_fields(tmp_path):
+def test_apply_critique_without_client_keeps_hidden_poison_metadata(tmp_path):
     case = {
         "case_id": "case_x",
         "events": [{"event_id": "ev_000", "type": "clinical", "text": "fever"}, {"event_id": "ev_005", "type": "diagnosis", "text": "biopsy confirmed lymphoma"}],
@@ -139,7 +140,66 @@ def test_apply_critique_emits_revision_metadata_without_gold_fields(tmp_path):
         tags=["initial"],
     )
     ops = apply_critique(case, store)
+    assert ops[0]["op"] == "Keep"
+    assert ops[0]["revised_memory_id"] is None
+    assert ops[0]["preserved_facts"] == []
+
+
+def test_apply_critique_prompt_hides_poison_metadata_and_allows_revision(tmp_path):
+    case = {
+        "case_id": "case_x",
+        "events": [
+            {"event_id": "ev_000", "type": "clinical", "text": "fever"},
+            {"event_id": "ev_005", "type": "diagnosis", "text": "biopsy confirmed lymphoma"},
+        ],
+        "poison_records": [
+            {
+                "poison_id": "poison_x",
+                "text": "Early working impression: viral syndrome was plausible because fever was present.",
+                "pollution_type": "outdated_initial_diagnosis",
+                "staleness_type": "superseded_by_later_diagnosis",
+                "expected_op": "Revise",
+                "revised_claim": "hidden gold revise",
+                "preserved_facts": ["hidden fever fact"],
+                "claim_type": "interpretation",
+                "source_event_id": "ev_000",
+                "supporting_evidence": ["fever was present"],
+            }
+        ],
+    }
+    store = MemoryStore.load("case_x", tmp_path / "memory.jsonl")
+    card = store.write_card(
+        summary="Early working impression: viral syndrome was plausible because fever was present.",
+        evidence_refs=["ev_000"],
+        time_scope={"start": 0, "end": 0},
+        confidence=0.35,
+        tags=["initial"],
+    )
+
+    class CleanReviseClient:
+        def __init__(self):
+            self.prompt = ""
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            self.prompt = "\n".join(message["content"] for message in messages)
+            forbidden = ("poison_x", "pollution_type", "staleness_type", "expected_op", "hidden gold revise")
+            assert not any(item in self.prompt for item in forbidden)
+            return LLMResult(
+                text=(
+                    '{"operations":[{"op":"Revise","target":"'
+                    + card["memory_id"]
+                    + '","reason":"Later visible evidence changes interpretation.",'
+                    '"revised_claim":"Early impression is time-limited.",'
+                    '"preserved_facts":["fever was present"]}]}'
+                ),
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                latency_s=0.0,
+            )
+
+    client = CleanReviseClient()
+    ops = apply_critique(case, store, client)
     assert ops[0]["op"] == "Revise"
+    assert ops[0]["target"] == card["memory_id"]
     assert ops[0]["revised_memory_id"]
     assert ops[0]["preserved_facts"] == ["fever was present"]
 
@@ -160,14 +220,31 @@ def test_apply_critique_discards_cross_patient_memory(tmp_path):
         ],
     }
     store = MemoryStore.load("case_x", tmp_path / "memory.jsonl")
-    store.write_card(
+    card = store.write_card(
         summary="Similar case memory: another patient had COVID ARDS; transfer this prior case context.",
         evidence_refs=["poison_x"],
         time_scope={},
         confidence=0.2,
         tags=["poison"],
     )
-    ops = apply_critique(case, store)
+
+    class CleanDiscardClient:
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            assert "similar_case_mistransfer" not in prompt
+            assert "poison_x" not in prompt
+            return LLMResult(
+                text=(
+                    '{"operations":[{"op":"Discard","target":"'
+                    + card["memory_id"]
+                    + '","reason":"Not supported by visible timeline.",'
+                    '"revised_claim":"","preserved_facts":[]}]}'
+                ),
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                latency_s=0.0,
+            )
+
+    ops = apply_critique(case, store, CleanDiscardClient())
     assert ops[0]["op"] == "Discard"
 
 
@@ -196,7 +273,7 @@ def test_apply_critique_reviews_clean_memory_without_poison_records(tmp_path):
             "touched_memory_ids": [card["memory_id"]],
             "revised_memory_id": None,
             "preserved_facts": [],
-            "revised_claim": card["summary"],
+            "revised_claim": "",
             "reason": "Memory candidate reviewed against visible timeline evidence.",
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -382,11 +459,120 @@ def test_single_oversized_clean_card_is_truncated_and_still_reviewed():
     assert "x" * 1000 not in client.calls[-1]
 
 
+def test_medimem_prediction_prompt_budgets_long_case_and_extra():
+    case = {
+        "case_id": "pmoa_tts_0686_like",
+        "demographics": {},
+        "events": [
+            {
+                "event_id": f"ev_{idx:03d}",
+                "time": idx,
+                "type": "diagnosis" if idx % 9 == 0 else "clinical",
+                "text": "visible longitudinal event " + ("detail " * 220),
+            }
+            for idx in range(90)
+        ],
+        "synthetic_labs": [],
+        "poison_records": [],
+        "counterfactuals": [],
+    }
+
+    class BudgetRecordingClient:
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            self.prompts.append((prompt, max_tokens))
+            assert len(prompt) < 21000
+            assert "extra card " * 900 not in prompt
+            return LLMResult(
+                text='{"primary_diagnosis":"pneumonia","confidence":0.7}',
+                usage={"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+                latency_s=0.0,
+            )
+
+    client = BudgetRecordingClient()
+    pred = run_llm_prediction(
+        case,
+        method="medimem_topk8_round1",
+        client=client,
+        context=case_context(case, include_labs=True),
+        extra="[MEMORY_CARDS]\n" + ("extra card " * 9000),
+        fail_on_llm_error=True,
+    )
+
+    assert pred["primary_diagnosis"] == "pneumonia"
+    assert client.prompts
+    assert client.prompts[0][1] <= 128
+
+
+def test_strict_prediction_retries_compacted_prompt_without_fallback():
+    case = {
+        "case_id": "case_retry",
+        "events": [{"event_id": "ev_1", "time": 0, "type": "clinical", "text": "fever " * 5000}],
+        "synthetic_labs": [],
+    }
+
+    class RejectThenAcceptClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            self.calls.append(prompt)
+            if len(self.calls) == 1:
+                raise RuntimeError("maximum context length")
+            assert len(prompt) < len(self.calls[0])
+            return LLMResult(
+                text='{"primary_diagnosis":"viral syndrome","confidence":0.4}',
+                usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+                latency_s=0.0,
+            )
+
+    client = RejectThenAcceptClient()
+    pred = run_llm_prediction(
+        case,
+        method="medimem_topk8_round1",
+        client=client,
+        context=case_context(case),
+        extra="extra " * 8000,
+        fail_on_llm_error=True,
+    )
+
+    assert pred["primary_diagnosis"] == "viral syndrome"
+    assert "llm_error" not in pred
+    assert len(client.calls) == 2
+
+
+def test_safe_prompt_ops_compaction_keeps_critic_fields_hidden():
+    ops = [
+        {
+            "op": "Revise",
+            "target": "poison_x",
+            "reason": "Later evidence says lymphoma.",
+            "revised_claim": "This is lymphoma.",
+            "preserved_facts": ["fever", "biopsy"],
+            "touched_memory_ids": ["m1", "m2"],
+            "revised_memory_id": "m3",
+        }
+    ]
+    prompt_ops = safe_memory_ops_for_prompt({"case_id": "case_x"}, ops)
+    assert "reason" not in str(prompt_ops)
+    assert "revised_claim" not in str(prompt_ops)
+    assert "lymphoma" not in str(prompt_ops).lower()
+
+
 class FakeCriticClient:
+    def __init__(self, target="poison_x"):
+        self.target = target
+
     def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
         return LLMResult(
             text=(
-                '{"operations":[{"op":"Revise","target":"poison_x","reason":"Later evidence confirms lymphoma.",'
+                '{"operations":[{"op":"Revise","target":"'
+                + self.target
+                + '","reason":"Later evidence confirms lymphoma.",'
                 '"revised_claim":"Fever supports lymphoma rather than viral syndrome.",'
                 '"preserved_facts":["fever was present","lymphoma is likely"]}]}'
             ),
@@ -396,10 +582,15 @@ class FakeCriticClient:
 
 
 class WrongOpCriticClient:
+    def __init__(self, target="poison_x"):
+        self.target = target
+
     def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
         return LLMResult(
             text=(
-                '{"operations":[{"op":"Discard","target":"poison_x","reason":"Overly aggressive deletion.",'
+                '{"operations":[{"op":"Discard","target":"'
+                + self.target
+                + '","reason":"Overly aggressive deletion.",'
                 '"revised_claim":"","preserved_facts":[]}]}'
             ),
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -407,7 +598,7 @@ class WrongOpCriticClient:
         )
 
 
-def test_critic_guard_forces_partial_truth_to_revise(tmp_path):
+def test_hidden_poison_metadata_does_not_force_partial_truth_to_revise(tmp_path):
     case = {
         "case_id": "case_x",
         "events": [{"event_id": "ev_000", "type": "clinical", "text": "fever"}],
@@ -422,17 +613,17 @@ def test_critic_guard_forces_partial_truth_to_revise(tmp_path):
         ],
     }
     store = MemoryStore.load("case_x", tmp_path / "memory.jsonl")
-    store.write_card(
+    card = store.write_card(
         summary="Early interpretation was viral syndrome because fever was present.",
         evidence_refs=["poison_x"],
         time_scope={},
         confidence=0.2,
         tags=["poison"],
     )
-    ops = apply_critique(case, store, WrongOpCriticClient())
-    assert ops[0]["op"] == "Revise"
-    assert ops[0]["preserved_facts"] == ["fever was present"]
-    assert ops[0]["revised_claim"]
+    ops = apply_critique(case, store, WrongOpCriticClient(card["memory_id"]))
+    assert ops[0]["op"] == "Discard"
+    assert ops[0]["guarded_op"] == ""
+    assert ops[0]["preserved_facts"] == []
 
 
 def test_critic_guard_can_be_disabled_for_ablation(tmp_path):
@@ -450,14 +641,14 @@ def test_critic_guard_can_be_disabled_for_ablation(tmp_path):
         ],
     }
     store = MemoryStore.load("case_x", tmp_path / "memory.jsonl")
-    store.write_card(
+    card = store.write_card(
         summary="Early interpretation was viral syndrome because fever was present.",
         evidence_refs=["poison_x"],
         time_scope={},
         confidence=0.2,
         tags=["poison"],
     )
-    ops = apply_critique(case, store, WrongOpCriticClient(), enforce_op_guard=False)
+    ops = apply_critique(case, store, WrongOpCriticClient(card["memory_id"]), enforce_op_guard=False)
     assert ops[0]["op"] == "Discard"
 
 
@@ -480,14 +671,14 @@ def test_critic_diagnostic_text_is_not_exposed_to_final_prompt_or_active_memory(
         ],
     }
     store = MemoryStore.load("case_x", tmp_path / "memory.jsonl")
-    store.write_card(
+    card = store.write_card(
         summary="Early working impression: viral syndrome was plausible because fever was present.",
         evidence_refs=["poison_x"],
         time_scope={},
         confidence=0.2,
         tags=["poison"],
     )
-    ops = apply_critique(case, store, FakeCriticClient())
+    ops = apply_critique(case, store, FakeCriticClient(card["memory_id"]))
     assert "lymphoma" in ops[0]["revised_claim"]
 
     prompt_ops = safe_memory_ops_for_prompt(case, ops)

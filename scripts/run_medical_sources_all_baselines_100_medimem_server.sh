@@ -18,7 +18,6 @@ else
     medmcqa
     medqa
     chatdoctor_healthcaremagic
-    medical_dialogue_to_soap
     pmoa_tts
   )
 fi
