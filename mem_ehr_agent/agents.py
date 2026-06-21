@@ -36,6 +36,10 @@ TARGET_LEAKAGE_PATTERNS = (
 )
 TARGET_LEAKAGE_RE = re.compile(r"(?i)\b(?:" + "|".join(TARGET_LEAKAGE_PATTERNS) + r")\b\s*:?\s*")
 TARGET_LEAKAGE_PREFIX_RE = re.compile(r"(?i)^\s*(?:" + "|".join(TARGET_LEAKAGE_PATTERNS) + r")\s*:?\s*")
+PROMPT_INPUT_TOKEN_BUDGET = int(os.environ.get("MEDIMEM_PROMPT_INPUT_BUDGET", "6600"))
+PROMPT_CONTEXT_TOKEN_LIMIT = int(os.environ.get("MEDIMEM_PROMPT_CONTEXT_LIMIT", "8192"))
+PROMPT_RESERVED_RESPONSE_TOKENS = int(os.environ.get("MEDIMEM_PROMPT_RESERVED_RESPONSE_TOKENS", "384"))
+PROMPT_EST_CHARS_PER_TOKEN = float(os.environ.get("MEDIMEM_PROMPT_EST_CHARS_PER_TOKEN", "3.0"))
 
 
 def contains_target_leakage(text: Any) -> bool:
@@ -51,6 +55,50 @@ def sanitize_runtime_text(text: Any) -> str:
     cleaned = TARGET_LEAKAGE_RE.sub("", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n-:;")
     return cleaned
+
+
+def estimate_prompt_tokens(text: Any) -> int:
+    raw = str(text or "")
+    if not raw:
+        return 0
+    return max(1, int(len(raw) / PROMPT_EST_CHARS_PER_TOKEN) + 1)
+
+
+def estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    return 8 + sum(estimate_prompt_tokens(message.get("content", "")) + 4 for message in messages)
+
+
+def prompt_input_budget(max_tokens: int | None = None) -> int:
+    response_budget = max(PROMPT_RESERVED_RESPONSE_TOKENS, int(max_tokens or 0))
+    return min(PROMPT_INPUT_TOKEN_BUDGET, max(1024, PROMPT_CONTEXT_TOKEN_LIMIT - response_budget - 128))
+
+
+def prompt_max_tokens(requested: int, messages: list[dict[str, str]]) -> int:
+    available = PROMPT_CONTEXT_TOKEN_LIMIT - estimate_messages_tokens(messages) - 64
+    return max(64, min(int(requested), available))
+
+
+def truncate_text(text: Any, max_chars: int) -> str:
+    cleaned = sanitize_runtime_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    if max_chars <= 24:
+        return cleaned[:max_chars].rstrip()
+    return cleaned[: max_chars - 14].rstrip() + " ...[truncated]"
+
+
+def compact_runtime_list(items: list[Any], *, limit: int, text_limit: int) -> list[Any]:
+    compacted: list[Any] = []
+    for item in items[:limit]:
+        if isinstance(item, dict):
+            compacted.append({key: truncate_text(value, text_limit) if isinstance(value, str) else value for key, value in item.items()})
+        else:
+            compacted.append(truncate_text(item, text_limit))
+    return compacted
+
+
+def messages_fit_budget(messages: list[dict[str, str]], *, max_tokens: int | None = None) -> bool:
+    return estimate_messages_tokens(messages) <= prompt_input_budget(max_tokens)
 
 
 def runtime_leakage_filtered_count(items: list[Any]) -> int:
@@ -86,10 +134,22 @@ def case_context(
     return "\n".join(lines)
 
 
-def compact_case_context(case: dict[str, Any], *, max_events: int = 24, include_labs: bool = True) -> str:
+def compact_case_context(
+    case: dict[str, Any],
+    *,
+    max_events: int = 24,
+    include_labs: bool = True,
+    include_time: bool = True,
+    event_text_limit: int = 260,
+) -> str:
     events = list(case.get("events", []))
     if len(events) <= max_events:
-        return case_context(case, max_events=None, include_labs=include_labs)
+        compact_case = dict(case)
+        compact_case["events"] = [
+            {**event, "text": truncate_text(event.get("text"), event_text_limit)}
+            for event in events
+        ]
+        return case_context(compact_case, max_events=None, include_labs=include_labs, include_time=include_time)
     high_value_types = {"diagnosis", "imaging", "pathology", "treatment", "lab"}
     selected: dict[str, dict[str, Any]] = {}
 
@@ -109,9 +169,22 @@ def compact_case_context(case: dict[str, Any], *, max_events: int = 24, include_
     if len(compact_events) > max_events:
         compact_events = compact_events[: max_events - 1] + compact_events[-1:]
     compact_case = dict(case)
-    compact_case["events"] = compact_events
-    context = case_context(compact_case, max_events=None, include_labs=include_labs)
+    compact_case["events"] = [
+        {**event, "text": truncate_text(event.get("text"), event_text_limit)}
+        for event in compact_events
+    ]
+    context = case_context(compact_case, max_events=None, include_labs=include_labs, include_time=include_time)
     return f"{context}\nshown_events={len(compact_events)}/{len(events)}"
+
+
+def budgeted_case_context(case: dict[str, Any], *, level: int = 0, include_labs: bool = True, include_time: bool = True) -> str:
+    if level <= 0:
+        return compact_case_context(case, max_events=42, include_labs=include_labs, include_time=include_time, event_text_limit=260)
+    if level == 1:
+        return compact_case_context(case, max_events=32, include_labs=include_labs, include_time=include_time, event_text_limit=220)
+    if level == 2:
+        return compact_case_context(case, max_events=24, include_labs=include_labs, include_time=include_time, event_text_limit=180)
+    return compact_case_context(case, max_events=16, include_labs=False, include_time=include_time, event_text_limit=140)
 
 
 def primary_only_task_profile_policy(profile: str) -> str:
@@ -157,6 +230,82 @@ def prediction_json_prompt(method: str, context: str, extra: str = "", *, task_p
     )
     user = f"[METHOD]\n{method}\n\n[CASE]\n{context}\n\n{extra}\n\nReturn JSON only."
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def budgeted_prediction_prompt(
+    case: dict[str, Any],
+    method: str,
+    context: str,
+    extra: str,
+    *,
+    task_profile: str,
+    level: int,
+    max_tokens: int,
+) -> tuple[list[dict[str, str]], str, str]:
+    requested_level = level
+    include_time = "t=" in str(context)
+    if "medimem" in method:
+        attempt_context = budgeted_case_context(case, level=level, include_labs=True, include_time=include_time)
+    elif level <= 0:
+        attempt_context = context
+    else:
+        attempt_context = truncate_context_middle(context, max(4000, 24000 // (level + 1)))
+    extra_limits = [12000, 8000, 5000, 3000, 1800]
+    attempt_extra = extra if level <= 0 else truncate_context_middle(extra, extra_limits[min(level, len(extra_limits) - 1)])
+    messages = prediction_json_prompt(method, attempt_context, attempt_extra, task_profile=task_profile)
+    while not messages_fit_budget(messages, max_tokens=max_tokens) and level < 4:
+        level += 1
+        if "medimem" in method:
+            attempt_context = budgeted_case_context(case, level=level, include_labs=True, include_time=include_time)
+        else:
+            attempt_context = truncate_context_middle(context, max(3000, 18000 // (level + 1)))
+        attempt_extra = truncate_context_middle(extra, extra_limits[min(level, len(extra_limits) - 1)])
+        messages = prediction_json_prompt(method, attempt_context, attempt_extra, task_profile=task_profile)
+    if not messages_fit_budget(messages, max_tokens=max_tokens):
+        attempt_extra = truncate_context_middle(attempt_extra, 1000)
+        attempt_context = truncate_context_middle(attempt_context, 6000)
+        messages = prediction_json_prompt(method, attempt_context, attempt_extra, task_profile=task_profile)
+    if requested_level > 0:
+        retry_extra_limit = max(400, 1200 // (requested_level + 1))
+        retry_context_limit = max(3000, 6000 - requested_level * 800)
+        attempt_extra = truncate_context_middle(attempt_extra, retry_extra_limit)
+        attempt_context = truncate_context_middle(attempt_context, retry_context_limit)
+        messages = prediction_json_prompt(method, attempt_context, attempt_extra, task_profile=task_profile)
+    return messages, attempt_context, attempt_extra
+
+
+def budget_retry_json_prompt(method: str, context: str, extra: str) -> list[dict[str, str]]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return exactly one valid minified JSON object with keys primary_diagnosis and confidence. "
+                "primary_diagnosis must be a short non-repeated phrase under 8 words. "
+                "Do not include diagnosis_list, evidence, reasoning, markdown, or any extra text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"[METHOD]\n{method}\n\n[CASE]\n{context}\n\n{extra}\n\n"
+                "The previous response was invalid JSON or an unfinished repeated string. Return valid JSON only."
+            ),
+        },
+    ]
+    if messages_fit_budget(messages, max_tokens=128):
+        return messages
+    compact_context = truncate_context_middle(context, 4000)
+    compact_extra = truncate_context_middle(extra, 1000)
+    return [
+        messages[0],
+        {
+            "role": "user",
+            "content": (
+                f"[METHOD]\n{method}\n\n[CASE]\n{compact_context}\n\n{compact_extra}\n\n"
+                "The previous response was invalid JSON or an unfinished repeated string. Return valid JSON only."
+            ),
+        },
+    ]
 
 
 def is_context_limit_error(exc: Exception) -> bool:
@@ -359,19 +508,26 @@ def run_llm_prediction(
         if fail_on_llm_error:
             raise RuntimeError(f"LLM client unavailable for {case['case_id']} ({method}).")
         return heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
-    context_attempts = [context]
-    for max_chars in (24000, 18000, 12000):
-        truncated = truncate_context_middle(context, max_chars)
-        if truncated != context_attempts[-1]:
-            context_attempts.append(truncated)
+    requested_max_tokens = int(os.environ.get("MEDICAL_PREDICTION_MAX_TOKENS", "128"))
     last_exc: Exception | None = None
+    attempt_context = context
+    attempt_extra = extra
     try:
-        for attempt_context in context_attempts:
+        for level in range(5):
+            messages, attempt_context, attempt_extra = budgeted_prediction_prompt(
+                case,
+                method,
+                context,
+                extra,
+                task_profile=task_profile,
+                level=level,
+                max_tokens=requested_max_tokens,
+            )
             try:
                 result = client.chat(
-                    prediction_json_prompt(method, attempt_context, extra, task_profile=task_profile),
+                    messages,
                     temperature=temperature,
-                    max_tokens=int(os.environ.get("MEDICAL_PREDICTION_MAX_TOKENS", "128")),
+                    max_tokens=prompt_max_tokens(requested_max_tokens, messages),
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
@@ -398,23 +554,7 @@ def run_llm_prediction(
             if parse_attempt >= parse_retries:
                 break
             result = client.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Return exactly one valid minified JSON object with keys primary_diagnosis and confidence. "
-                            "primary_diagnosis must be a short non-repeated phrase under 8 words. "
-                            "Do not include diagnosis_list, evidence, reasoning, markdown, or any extra text."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"[METHOD]\n{method}\n\n[CASE]\n{attempt_context}\n\n{extra}\n\n"
-                            "The previous response was invalid JSON or an unfinished repeated string. Return valid JSON only."
-                        ),
-                    },
-                ],
+                budget_retry_json_prompt(method, attempt_context, attempt_extra),
                 temperature=0.0,
                 max_tokens=128,
             )
@@ -1580,25 +1720,28 @@ def diagnosis_second_pass_prompt(
     pred: dict[str, Any],
     evidence_notes: list[dict[str, Any]],
     diagnosis_candidates: list[dict[str, Any]],
+    *,
+    candidate_limit: int = 40,
+    text_limit: int = 200,
 ) -> list[dict[str, str]]:
     profile = case_task_profile(case)
     min_items, max_items = diagnosis_list_budget(profile)
     candidate_rows = visible_diagnosis_source_rows(case, pred, evidence_notes, diagnosis_candidates)
     candidate_lines = []
     seen_text: set[str] = set()
-    for row in candidate_rows[:80]:
+    for row in candidate_rows[:candidate_limit]:
         text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
         if not text or text.lower() in seen_text:
             continue
         seen_text.add(text.lower())
         candidate_lines.append(
-            f"- source={row.get('source')} time={row.get('time')} refs={row.get('refs') or row.get('event_id')} text={text[:260]}"
+            f"- source={row.get('source')} time={row.get('time')} refs={row.get('refs') or row.get('event_id')} text={truncate_text(text, text_limit)}"
         )
     current = {
-        "primary_diagnosis": pred.get("primary_diagnosis"),
-        "diagnosis_list": pred.get("diagnosis_list", []),
-        "evidence": pred.get("evidence", []),
-        "reasoning_summary": pred.get("reasoning_summary", ""),
+        "primary_diagnosis": truncate_text(pred.get("primary_diagnosis"), 120),
+        "diagnosis_list": compact_runtime_list(list(pred.get("diagnosis_list", [])), limit=8, text_limit=120),
+        "evidence": compact_runtime_list(list(pred.get("evidence", [])), limit=8, text_limit=160),
+        "reasoning_summary": truncate_text(pred.get("reasoning_summary", ""), 240),
     }
     system = (
         "You are a clinical research diagnosis reconciler. Use only the provided visible evidence candidates. "
@@ -1629,11 +1772,30 @@ def llm_diagnosis_second_pass(
     if client is None:
         return pred
     try:
-        result = client.chat(
-            diagnosis_second_pass_prompt(case, pred, evidence_notes, diagnosis_candidates),
-            temperature=0.0,
-            max_tokens=700,
-        )
+        last_exc: Exception | None = None
+        result = None
+        for candidate_limit, text_limit, requested_tokens in ((40, 200, 384), (24, 160, 256), (12, 120, 192), (6, 100, 128)):
+            messages = diagnosis_second_pass_prompt(
+                case,
+                pred,
+                evidence_notes,
+                diagnosis_candidates,
+                candidate_limit=candidate_limit,
+                text_limit=text_limit,
+            )
+            try:
+                result = client.chat(
+                    messages,
+                    temperature=0.0,
+                    max_tokens=prompt_max_tokens(requested_tokens, messages),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
+                last_exc = exc
+                if not is_context_limit_error(exc):
+                    raise
+        if result is None:
+            raise last_exc or RuntimeError("Diagnosis second pass failed without an exception.")
         raw = extract_json_object(result.text)
         refined = normalize_prediction(
             str(case.get("case_id")),
@@ -1694,14 +1856,57 @@ def counterfactual_verification_prompt(
     )
     user = (
         f"[CASE_ID]\n{case.get('case_id')}\n\n"
-        f"[ORIGINAL_DIAGNOSIS_TO_VERIFY]\n{pred.get('primary_diagnosis')}\n\n"
+        f"[ORIGINAL_DIAGNOSIS_TO_VERIFY]\n{truncate_text(pred.get('primary_diagnosis'), 120)}\n\n"
         f"[ORIGINAL_CONFIDENCE]\n{pred.get('confidence')}\n\n"
-        f"[COUNTERFACTUAL_INTERVENTION]\n{intervention}\n\n"
+        f"[COUNTERFACTUAL_INTERVENTION]\n{truncate_text(intervention, 260)}\n\n"
         f"[VISIBLE_CASE]\n{context}\n\n"
         f"{extra}\n\n"
         "Re-run the causal reasoning under the counterfactual intervention. Return JSON only."
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def budgeted_counterfactual_prompt(
+    case: dict[str, Any],
+    pred: dict[str, Any],
+    intervention: str,
+    context: str,
+    extra: str,
+    *,
+    level: int,
+    max_tokens: int,
+) -> list[dict[str, str]]:
+    requested_level = level
+    include_time = "t=" in str(context)
+    if level <= 0:
+        attempt_context = context
+        attempt_extra = extra
+    else:
+        attempt_context = budgeted_case_context(case, level=level, include_labs=True, include_time=include_time)
+        attempt_extra = truncate_context_middle(extra, [8000, 5000, 3000, 1600][min(level - 1, 3)])
+    messages = counterfactual_verification_prompt(case, pred, intervention, attempt_context, attempt_extra)
+    while not messages_fit_budget(messages, max_tokens=max_tokens) and level < 4:
+        level += 1
+        attempt_context = budgeted_case_context(case, level=level, include_labs=True, include_time=include_time)
+        attempt_extra = truncate_context_middle(extra, [8000, 5000, 3000, 1600][min(level - 1, 3)])
+        messages = counterfactual_verification_prompt(case, pred, intervention, attempt_context, attempt_extra)
+    if not messages_fit_budget(messages, max_tokens=max_tokens):
+        messages = counterfactual_verification_prompt(
+            case,
+            pred,
+            intervention,
+            truncate_context_middle(attempt_context, 5000),
+            truncate_context_middle(attempt_extra, 1000),
+        )
+    if requested_level > 0:
+        messages = counterfactual_verification_prompt(
+            case,
+            pred,
+            intervention,
+            truncate_context_middle(attempt_context, max(3000, 5000 - requested_level * 600)),
+            truncate_context_middle(attempt_extra, max(400, 1200 // (requested_level + 1))),
+        )
+    return messages
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1741,11 +1946,31 @@ def run_counterfactual_verification(
         )
 
     try:
-        result = client.chat(
-            counterfactual_verification_prompt(case, pred, intervention, context, extra),
-            temperature=0.0,
-            max_tokens=700,
-        )
+        last_exc: Exception | None = None
+        result = None
+        for level, requested_tokens in ((0, 384), (1, 256), (2, 192), (3, 128), (4, 128)):
+            messages = budgeted_counterfactual_prompt(
+                case,
+                pred,
+                intervention,
+                context,
+                extra,
+                level=level,
+                max_tokens=requested_tokens,
+            )
+            try:
+                result = client.chat(
+                    messages,
+                    temperature=0.0,
+                    max_tokens=prompt_max_tokens(requested_tokens, messages),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - context overflow gets progressively compacted
+                last_exc = exc
+                if not is_context_limit_error(exc):
+                    raise
+        if result is None:
+            raise last_exc or RuntimeError("Counterfactual verification failed without an exception.")
         raw = extract_json_object(result.text)
     except Exception as exc:  # noqa: BLE001
         if fail_on_llm_error:
@@ -2123,14 +2348,80 @@ def verify_primary_with_evidence(case: dict[str, Any], pred: dict[str, Any]) -> 
     return updated
 
 
-def format_memory_line(card: dict[str, Any]) -> str:
+def format_memory_line(card: dict[str, Any], *, summary_limit: int = 220) -> str:
     summary = sanitize_runtime_text(card.get("summary"))
     if not summary:
         return ""
+    summary = truncate_text(summary, summary_limit)
     return (
         f"- {summary} "
         f"(status={card.get('status')}, confidence={card.get('confidence')}, refs={card.get('evidence_refs')})"
     )
+
+
+def compact_memory_lines(cards: list[dict[str, Any]], *, limit: int = 8, summary_limit: int = 180) -> list[str]:
+    ordered = sorted(
+        cards,
+        key=lambda card: (
+            0 if card.get("status") in {"active", "flagged"} else 1,
+            -_safe_float(card.get("confidence"), 0.0),
+        ),
+    )
+    return [line for line in (format_memory_line(card, summary_limit=summary_limit) for card in ordered[:limit]) if line]
+
+
+def compact_evidence_lines(notes: list[dict[str, Any]], *, include_time: bool = True, limit: int = 8, text_limit: int = 180) -> list[str]:
+    selected = notes[-limit:]
+    lines = []
+    for note in selected:
+        summary = truncate_text(note.get("summary"), text_limit)
+        if not summary:
+            continue
+        prefix = f"- t={note.get('time')} " if include_time else "- "
+        lines.append(f"{prefix}refs={note.get('refs')} tags={note.get('tags')} text={summary}")
+    return lines
+
+
+def compact_diagnosis_candidate_lines(
+    candidates: list[dict[str, Any]],
+    *,
+    include_time: bool = True,
+    limit: int = 8,
+    text_limit: int = 160,
+) -> list[str]:
+    scored = [
+        (diagnosis_candidate_priority(str(item.get("text") or "")), item)
+        for item in candidates
+        if sanitize_runtime_text(item.get("text"))
+    ]
+    scored.sort(key=lambda pair: (pair[0], int(pair[1].get("time") or 0)), reverse=True)
+    selected = [item for _, item in scored[:limit]]
+    selected.sort(key=lambda item: str(item.get("time") or ""))
+    lines = []
+    for item in selected:
+        text = truncate_text(item.get("text"), text_limit)
+        if not text:
+            continue
+        prefix = f"- t={item.get('time')} " if include_time else "- "
+        lines.append(f"{prefix}ref={item.get('event_id')} diagnosis_text={text}")
+    return lines
+
+
+def compact_prompt_memory_ops(prompt_ops: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    compacted = []
+    for op in prompt_ops[:limit]:
+        item = {
+            "op": op.get("op"),
+            "target": op.get("target"),
+            "touched_memory_ids": list(op.get("touched_memory_ids") or [])[:4],
+            "revised_memory_id": op.get("revised_memory_id"),
+        }
+        if "preserved_fact_count" in op:
+            item["preserved_fact_count"] = op.get("preserved_fact_count")
+        if "revision_note" in op:
+            item["revision_note"] = op.get("revision_note")
+        compacted.append({key: value for key, value in item.items() if value not in (None, "", [])})
+    return compacted
 
 
 def strip_temporal_signal_from_memory_store(store: Any) -> None:
@@ -2233,25 +2524,12 @@ def run_ours(
         if memory_id not in seen_ids:
             memories.append(memory)
             seen_ids.add(memory_id)
-    memory_lines = [line for line in (format_memory_line(m) for m in memories) if line]
-    if disable_temporal_signal:
-        evidence_lines = [
-            f"- refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
-            for note in evidence_notes
-        ]
-        diagnosis_candidate_lines = [
-            f"- ref={item.get('event_id')} diagnosis_text={item.get('text')}"
-            for item in diagnosis_candidates
-        ]
-    else:
-        evidence_lines = [
-            f"- t={note.get('time')} refs={note.get('refs')} tags={note.get('tags')} text={note.get('summary')}"
-            for note in evidence_notes
-        ]
-        diagnosis_candidate_lines = [
-            f"- t={item.get('time')} ref={item.get('event_id')} diagnosis_text={item.get('text')}"
-            for item in diagnosis_candidates
-        ]
+    memory_lines = compact_memory_lines(memories)
+    evidence_lines = compact_evidence_lines(evidence_notes, include_time=not disable_temporal_signal)
+    diagnosis_candidate_lines = compact_diagnosis_candidate_lines(
+        diagnosis_candidates,
+        include_time=not disable_temporal_signal,
+    )
     source_style = style_policy_prompt((case.get("data_quality_flags") or {}).get("style_policy"))
     if disable_temporal_signal:
         extra_intro = (
@@ -2277,14 +2555,20 @@ def run_ours(
         f"[MEMORY_CARDS]\n{chr(10).join(memory_lines)}\n"
         f"[SOURCE_ALIGNED_EVIDENCE_NOTES]\n{chr(10).join(evidence_lines)}\n"
         f"[DIAGNOSIS_EVENT_CANDIDATES]\n{chr(10).join(diagnosis_candidate_lines)}\n"
-        f"[MEMORY_OPS]\n{prompt_ops}\n"
+        f"[MEMORY_OPS]\n{compact_prompt_memory_ops(prompt_ops)}\n"
         f"{final_check}"
+    )
+    visible_context = budgeted_case_context(
+        case,
+        level=0,
+        include_labs=True,
+        include_time=not disable_temporal_signal,
     )
     pred = run_llm_prediction(
         case,
         method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
         client=client,
-        context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
+        context=visible_context,
         extra=extra,
         fallback_max_events=None,
         temperature=float(strategy.get("temperature", 0.05)),
@@ -2373,7 +2657,7 @@ def run_ours(
                 case,
                 pred,
                 client,
-                context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
+                context=visible_context,
                 extra=extra,
                 threshold=COUNTERFACTUAL_CPG_THRESHOLD,
                 fail_on_llm_error=fail_on_llm_error and counterfactual_policy == "always",
@@ -2410,7 +2694,7 @@ def run_ours(
                 case,
                 method=f"medimem_topk{top_k}_round{strategy.get('rounds', 1)}",
                 client=client,
-                context=case_context(case, include_labs=True, include_time=not disable_temporal_signal),
+                context=visible_context,
                 extra=counterfactual_revision_extra(extra, verification),
                 fallback_max_events=None,
                 temperature=0.0,

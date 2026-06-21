@@ -35,7 +35,8 @@ def test_parse_source_names_defaults_to_configured_pool():
     assert "pmoa_tts" in names
     assert "pmc_patients" in names
     assert "medmcqa" in names
-    assert len(names) >= 7
+    assert "medical_dialogue_to_soap" not in names
+    assert len(names) >= 6
 
 
 def test_source_rows_are_deduped_by_stable_identity():

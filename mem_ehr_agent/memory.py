@@ -132,7 +132,7 @@ def bootstrap_memory(case: dict[str, Any], path: str | Path, *, include_poison: 
     if store.cards:
         return store
     for seed in case.get("memory_seed", []):
-        store.write_card(
+        card = store.write_card(
             summary=str(seed.get("summary", "")),
             evidence_refs=[],
             time_scope=seed.get("time_scope") or {},
@@ -141,6 +141,9 @@ def bootstrap_memory(case: dict[str, Any], path: str | Path, *, include_poison: 
             status=str(seed.get("status") or "active"),
             op="Seed",
         )
+        if seed.get("seed_id"):
+            card["seed_id"] = str(seed.get("seed_id"))
+            store.save()
     for event in case.get("events", []):
         if event.get("type") in {"diagnosis", "treatment", "imaging", "lab"}:
             store.write_card(
@@ -281,11 +284,7 @@ def critic_prompt(case: dict[str, Any], poison: dict[str, Any]) -> list[dict[str
 
 def candidate_event_refs(candidate: dict[str, Any]) -> set[str]:
     refs: set[str] = set()
-    for key in ("source_event_id",):
-        value = str(candidate.get(key) or "")
-        if value:
-            refs.add(value)
-    for ref in candidate.get("supporting_evidence") or []:
+    for ref in candidate.get("evidence_refs") or []:
         value = str(ref or "")
         if value.startswith("ev"):
             refs.add(value)
@@ -300,19 +299,13 @@ def compact_candidate_payload(
     max_evidence: int = 3,
     max_tags: int = 8,
 ) -> dict[str, Any]:
-    evidence = [
-        _clip_text(ref, evidence_chars)
-        for ref in candidate.get("supporting_evidence") or []
-        if str(ref).strip()
-    ][:max_evidence]
+    evidence = [_clip_text(ref, evidence_chars) for ref in candidate.get("evidence_refs") or [] if str(ref).strip()][:max_evidence]
     return {
         "id": candidate_id(candidate),
         "kind": candidate.get("candidate_kind") or "memory_card",
-        "type": candidate.get("pollution_type") or candidate.get("risk_type"),
-        "claim_type": candidate.get("claim_type"),
-        "source_event_id": candidate.get("source_event_id"),
         "text": _clip_text(candidate.get("text"), text_chars),
-        "supporting_evidence": evidence,
+        "evidence_refs": evidence,
+        "time_scope": candidate.get("time_scope") or {},
         "status": candidate.get("status"),
         "confidence": candidate.get("confidence"),
         "tags": [str(tag) for tag in candidate.get("tags") or [] if str(tag).strip()][:max_tags],
@@ -338,6 +331,10 @@ def batched_critic_prompt(
         "Discard when the memory is cross-patient, unrelated, or unsupported; "
         "Flag when a memory is plausible but too ambiguous or low confidence to use directly; "
         "Keep when the memory is still valid. preserved_facts must be an array of short strings. "
+        "Keep reason under 18 words, revised_claim under 18 words, and preserved_facts to at most 2 short items. "
+        "For Keep, Flag, Invalidate, and Discard, revised_claim must be an empty string. "
+        "For Keep, Flag, Invalidate, and Discard, preserved_facts must be an empty array. "
+        "target must exactly copy the candidate id, not the candidate text. "
         "Return one operation for each memory candidate. Do not include markdown."
     )
     referenced_event_ids: set[str] = set()
@@ -369,7 +366,7 @@ def default_keep_op(candidate: dict[str, Any]) -> dict[str, Any]:
         "op": "Keep",
         "target": target,
         "reason": "Memory candidate reviewed against visible timeline evidence.",
-        "revised_claim": str(candidate.get("text") or ""),
+        "revised_claim": "",
         "preserved_facts": [],
     }
 
@@ -422,39 +419,22 @@ def poison_metadata_by_id(case: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return metadata
 
 
-def memory_card_candidate(card: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
-    metadata = poison_metadata_by_id(case)
+def memory_card_candidate(card: dict[str, Any], case: dict[str, Any] | None = None) -> dict[str, Any]:
     refs = [str(ref) for ref in card.get("evidence_refs") or [] if str(ref).strip()]
-    risk_meta = next((metadata.get(ref) for ref in refs if ref in metadata), None)
-    if risk_meta is None:
-        risk_meta = metadata.get(stable_id("txt", str(card.get("summary") or "")))
-    candidate: dict[str, Any] = {
+    if case is not None:
+        visible_event_ids = {str(event.get("event_id")) for event in case.get("events", []) if event.get("event_id")}
+        refs = [ref for ref in refs if ref in visible_event_ids]
+    return {
         "candidate_id": str(card.get("memory_id") or ""),
         "candidate_kind": "memory_card",
         "memory_id": card.get("memory_id"),
         "text": str(card.get("summary") or ""),
-        "source_event_id": refs[0] if refs else None,
-        "supporting_evidence": refs,
+        "evidence_refs": refs,
         "time_scope": card.get("time_scope") or {},
         "status": card.get("status"),
         "tags": list(card.get("tags") or []),
         "confidence": card.get("confidence"),
     }
-    for key in ("pollution_type", "risk_type", "claim_type"):
-        if card.get(key):
-            candidate[key] = card.get(key)
-    if risk_meta:
-        candidate["candidate_kind"] = "risk_labeled_memory_card"
-        for key in ("pollution_type", "risk_type", "claim_type", "source_event_id", "valid_time_scope"):
-            if risk_meta.get(key):
-                candidate[key] = risk_meta.get(key)
-        evidence = risk_meta.get("supporting_evidence") or []
-        if evidence:
-            candidate["supporting_evidence"] = [str(x) for x in evidence if str(x).strip()]
-        if risk_meta.get("poison_id"):
-            candidate["risk_record_id"] = risk_meta.get("poison_id")
-            candidate["target"] = risk_meta.get("poison_id")
-    return candidate
 
 
 def llm_critic_op(
@@ -551,7 +531,7 @@ def critic_prompt_token_estimate(messages: list[dict[str, str]]) -> int:
 
 
 def critic_output_tokens(batch_size: int) -> int:
-    return min(512, max(192, 96 + 80 * batch_size))
+    return min(512, max(384, 160 + 96 * batch_size))
 
 
 def split_critic_batches(
@@ -592,11 +572,57 @@ def split_critic_batches(
 
 
 def parse_critic_operations(result_text: str) -> list[dict[str, Any]]:
-    raw = extract_json_object(result_text)
+    try:
+        raw = extract_json_object(result_text)
+    except Exception:
+        repaired = parse_truncated_critic_operations(result_text)
+        if repaired:
+            return repaired
+        raise
     operations = raw.get("operations") or []
     if not operations and raw.get("op"):
         operations = [raw]
     return [item for item in operations if isinstance(item, dict)]
+
+
+def parse_truncated_critic_operations(result_text: str) -> list[dict[str, Any]]:
+    text = str(result_text or "")
+    operations: list[dict[str, Any]] = []
+    for match in re.finditer(r'"op"\s*:\s*"(Revise|Invalidate|Discard|Flag|Keep)"', text):
+        start = match.start()
+        chunk = text[start : start + 1200]
+        target_match = re.search(r'"target"\s*:\s*"([^"]*)"', chunk)
+        if not target_match:
+            continue
+        reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', chunk)
+        revised_match = re.search(r'"revised_claim"\s*:\s*"([^"]*)"', chunk)
+        op = match.group(1)
+        operations.append(
+            {
+                "op": op,
+                "target": target_match.group(1),
+                "reason": reason_match.group(1) if reason_match else "Parsed from truncated critic output.",
+                "revised_claim": revised_match.group(1) if op == "Revise" and revised_match else "",
+                "preserved_facts": [],
+            }
+        )
+    return operations
+
+
+def critic_repair_prompt(batch: list[dict[str, Any]], malformed_text: str) -> list[dict[str, str]]:
+    targets = [candidate_id(candidate) for candidate in batch]
+    system = (
+        "Repair the malformed memory-critic output into exactly one valid minified JSON object. "
+        "Return key operations as an array. Each operation must have op, target, reason, revised_claim, preserved_facts. "
+        "Use only these target ids, exactly as written. Keep reason under 8 words. "
+        "Use revised_claim and preserved_facts only for Revise; otherwise they must be empty. Return JSON only."
+    )
+    user = (
+        f"[TARGET_IDS]\n{json.dumps(targets, ensure_ascii=False)}\n\n"
+        f"[MALFORMED_OUTPUT]\n{_clip_text(malformed_text, 1800)}\n\n"
+        "Return repaired JSON only."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def call_critic_batch(
@@ -618,7 +644,21 @@ def call_critic_batch(
         max_chars_per_event=max_chars_per_event,
     )
     result = client.chat(messages, temperature=0.0, max_tokens=critic_output_tokens(len(batch)))
-    return parse_critic_operations(result.text), result.usage
+    try:
+        return parse_critic_operations(result.text), result.usage
+    except Exception:
+        repair = client.chat(
+            critic_repair_prompt(batch, result.text),
+            temperature=0.0,
+            max_tokens=critic_output_tokens(len(batch)),
+        )
+        repair_ops = parse_critic_operations(repair.text)
+        usage = {
+            "prompt_tokens": result.usage.get("prompt_tokens", 0) + repair.usage.get("prompt_tokens", 0),
+            "completion_tokens": result.usage.get("completion_tokens", 0) + repair.usage.get("completion_tokens", 0),
+            "total_tokens": result.usage.get("total_tokens", 0) + repair.usage.get("total_tokens", 0),
+        }
+        return repair_ops, usage
 
 
 def call_critic_batch_with_budget_retry(
@@ -730,16 +770,8 @@ def apply_critique(
                 revised_summary=revised_summary,
                 reason=reason,
                 preserved_facts=[str(x) for x in decision.get("preserved_facts", [])],
-                evidence_refs=[
-                    str(ref)
-                    for ref in [
-                        candidate.get("source_event_id"),
-                        candidate.get("memory_id"),
-                        candidate.get("risk_record_id"),
-                    ]
-                    if ref
-                ],
-                time_scope=candidate.get("valid_time_scope") or candidate.get("time_scope") or {},
+                evidence_refs=[str(ref) for ref in [candidate.get("memory_id"), *(candidate.get("evidence_refs") or [])] if ref],
+                time_scope=candidate.get("time_scope") or {},
             )
         elif op == "Flag":
             touched = store.invalidate_or_discard(

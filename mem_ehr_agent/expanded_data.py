@@ -88,7 +88,10 @@ MEDICAL_DATASET_SPECS: dict[str, MedicalDatasetSpec] = {
 }
 
 
-DEFAULT_MEDICAL_POOL_SOURCES = tuple(MEDICAL_DATASET_SPECS)
+EXCLUDED_FORMAL_POOL_SOURCES = frozenset({"medical_dialogue_to_soap"})
+DEFAULT_MEDICAL_POOL_SOURCES = tuple(
+    name for name in MEDICAL_DATASET_SPECS if name not in EXCLUDED_FORMAL_POOL_SOURCES
+)
 DEFAULT_PREFIX_SIZES = (50, 100, 250, 500, 1000)
 
 

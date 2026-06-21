@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,11 @@ from .data_sources import paired_source_rows
 from .io_utils import write_jsonl, write_text
 from .schemas import validate_case
 from .task_profiles import DEFAULT_TASK_PROFILE, LONGITUDINAL_DIAGNOSIS
+
+
+def runtime_memory_id(case_id: str, summary: str, evidence_refs: list[str] | None = None) -> str:
+    text = f"{case_id}:{summary}:{list(evidence_refs or [])}"
+    return f"mem_{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
 
 
 def _as_events(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -206,6 +212,7 @@ def redact_label_mentions(text: str, diagnoses: list[str]) -> str:
 def build_stale_memory_artifacts(
     *,
     idx: int,
+    case_id: str,
     primary: str,
     events: list[dict[str, Any]],
     labs: list[dict[str, Any]],
@@ -225,35 +232,165 @@ def build_stale_memory_artifacts(
     early_time = int(early.get("time", 0) or 0)
     final_time = int(final.get("time", early_time) or early_time)
 
-    memory_seed = [
-        {
-            "summary": f"Early working impression: {old_hypothesis} was plausible because {runtime_early_fact}.",
-            "time_scope": {"start": early_time, "end": early_time},
-            "valid_time_scope": {"start": early_time, "end": final_time},
-            "status": "active",
-            "confidence": 0.35,
-            "tags": ["initial_hypothesis", "stale_candidate"],
-            "claim_type": "interpretation",
-            "should_preserve_fact": True,
-            "source_event_id": early.get("event_id"),
-        }
-    ]
-    if labs:
-        memory_seed.append(
+    seed_expected_specs: list[dict[str, Any]] = []
+
+    def add_seed(
+        *,
+        seed_id: str,
+        summary: str,
+        op: str,
+        reason: str,
+        issue_type: str,
+        preserved_facts: list[str] | None = None,
+        revised_claim: str = "",
+        expected_should_preserve_fact: bool = False,
+        quality_checks: dict[str, Any] | None = None,
+        **seed_fields: Any,
+    ) -> None:
+        memory_seed.append({"seed_id": seed_id, "summary": summary, **seed_fields})
+        seed_expected_specs.append(
             {
-                "summary": (
-                    f"Early lab state: {first_lab.get('name')} was {first_lab.get('value')} "
-                    f"{first_lab.get('unit')} ({first_lab.get('flag')})."
-                ),
-                "time_scope": {"start": first_lab.get("time"), "end": first_lab.get("time")},
-                "valid_time_scope": {"start": first_lab.get("time"), "end": later_lab.get("time")},
-                "status": "active",
-                "confidence": 0.55,
-                "tags": ["early_lab", "stale_candidate"],
-                "claim_type": "fact",
-                "should_preserve_fact": True,
-                "source_event_id": early.get("event_id"),
+                "op": op,
+                "target": runtime_memory_id(case_id, summary, []),
+                "seed_id": seed_id,
+                "memory_issue_type": issue_type,
+                "reason": reason,
+                "preserved_facts": preserved_facts or [],
+                "revised_claim": revised_claim,
+                "should_preserve_fact": expected_should_preserve_fact,
+                "quality_checks": quality_checks or {},
             }
+        )
+
+    memory_seed: list[dict[str, Any]] = []
+    add_seed(
+        seed_id=f"seed_{idx:04d}_initial_interpretation",
+        summary=f"Early working impression: {old_hypothesis} was plausible because {runtime_early_fact}.",
+        op="Revise",
+        reason="Early working interpretation should be narrowed after later visible evidence.",
+        issue_type="outdated_initial_interpretation",
+        preserved_facts=[runtime_early_fact],
+        revised_claim=f"Early {old_hypothesis} impression is time-limited and superseded by later visible evidence.",
+        expected_should_preserve_fact=True,
+        quality_checks={
+            "preserve_true_facts": True,
+            "remove_wrong_interpretation": True,
+            "respect_time_scope": True,
+            "avoid_diagnosis_leakage": True,
+        },
+        time_scope={"start": early_time, "end": early_time},
+        valid_time_scope={"start": early_time, "end": final_time},
+        status="active",
+        confidence=0.35,
+        tags=["initial_hypothesis", "stale_candidate"],
+        claim_type="interpretation",
+        should_preserve_fact=True,
+        source_event_id=early.get("event_id"),
+    )
+    if idx % 2 == 0:
+        add_seed(
+            seed_id=f"seed_{idx:04d}_valid_historical_fact",
+            summary=f"Historical fact memory: {runtime_early_fact}. Keep as source evidence, but do not over-weight it.",
+            op="Keep",
+            reason="Visible timeline still supports this as historical evidence.",
+            issue_type="valid_historical_fact",
+            preserved_facts=[runtime_early_fact],
+            expected_should_preserve_fact=True,
+            quality_checks={"preserve_true_facts": True, "avoid_diagnosis_leakage": True},
+            time_scope={"start": early_time, "end": early_time},
+            valid_time_scope={"start": early_time, "end": final_time},
+            status="active",
+            confidence=0.35,
+            tags=["historical_fact"],
+            claim_type="fact",
+            should_preserve_fact=True,
+            source_event_id=early.get("event_id"),
+        )
+    if idx % 3 == 0:
+        add_seed(
+            seed_id=f"seed_{idx:04d}_ambiguous_low_confidence",
+            summary=f"Ambiguous memory: {runtime_early_fact}; relation to later course is uncertain and needs review.",
+            op="Flag",
+            reason="Visible evidence makes this plausible but too uncertain to use directly.",
+            issue_type="ambiguous_low_confidence_memory",
+            preserved_facts=[runtime_early_fact],
+            expected_should_preserve_fact=True,
+            quality_checks={"preserve_true_facts": True, "respect_time_scope": True, "avoid_diagnosis_leakage": True},
+            time_scope={"start": early_time, "end": final_time},
+            valid_time_scope={"start": early_time, "end": final_time},
+            status="active",
+            confidence=0.32,
+            tags=["ambiguous_memory", "low_confidence"],
+            claim_type="ambiguous_fact",
+            should_preserve_fact=True,
+            source_event_id=early.get("event_id"),
+        )
+    if idx % 5 == 0:
+        add_seed(
+            seed_id=f"seed_{idx:04d}_unsupported_import",
+            summary=f"Imported context note: {similar_snippet}; treat as if it describes the current patient.",
+            op="Discard",
+            reason="The note is not supported by this patient's visible timeline.",
+            issue_type="unsupported_imported_context",
+            preserved_facts=[],
+            expected_should_preserve_fact=False,
+            quality_checks={"avoid_diagnosis_leakage": True},
+            time_scope={"start": early_time, "end": early_time},
+            valid_time_scope={"start": early_time, "end": early_time},
+            status="active",
+            confidence=0.25,
+            tags=["imported_context", "unsupported"],
+            claim_type="context_transfer",
+            should_preserve_fact=False,
+            source_event_id=early.get("event_id"),
+        )
+    if idx % 7 == 0:
+        add_seed(
+            seed_id=f"seed_{idx:04d}_partial_truth",
+            summary=f"Partially true memory: {runtime_final_fact}. Misleading interpretation: it keeps the earlier {old_hypothesis} impression active.",
+            op="Revise",
+            reason="True visible fact should be preserved while the interpretation changes.",
+            issue_type="partial_truth_wrong_interpretation",
+            preserved_facts=[runtime_final_fact],
+            revised_claim="Preserve the visible fact, but do not keep the earlier impression active.",
+            expected_should_preserve_fact=True,
+            quality_checks={
+                "preserve_true_facts": True,
+                "remove_wrong_interpretation": True,
+                "respect_time_scope": True,
+                "avoid_diagnosis_leakage": True,
+            },
+            time_scope={"start": final_time, "end": final_time},
+            valid_time_scope={"start": final_time, "end": final_time},
+            status="active",
+            confidence=0.42,
+            tags=["partial_truth", "stale_candidate"],
+            claim_type="mixed_fact_interpretation",
+            should_preserve_fact=True,
+            source_event_id=final.get("event_id"),
+        )
+    if labs:
+        lab_summary = (
+            f"Early lab state: {first_lab.get('name')} was {first_lab.get('value')} "
+            f"{first_lab.get('unit')} ({first_lab.get('flag')})."
+        )
+        add_seed(
+            seed_id=f"seed_{idx:04d}_early_lab_state",
+            summary=lab_summary,
+            op="Invalidate",
+            reason="Early lab state should not guide the later current state.",
+            issue_type="outdated_lab_state",
+            preserved_facts=[f"{first_lab.get('name')} was {first_lab.get('value')} {first_lab.get('unit')} early"],
+            expected_should_preserve_fact=True,
+            quality_checks={"preserve_true_facts": True, "respect_time_scope": True, "avoid_diagnosis_leakage": True},
+            time_scope={"start": first_lab.get("time"), "end": first_lab.get("time")},
+            valid_time_scope={"start": first_lab.get("time"), "end": later_lab.get("time")},
+            status="active",
+            confidence=0.55,
+            tags=["early_lab", "stale_candidate"],
+            claim_type="fact",
+            should_preserve_fact=True,
+            source_event_id=early.get("event_id"),
         )
 
     private_poison_specs = [
@@ -422,23 +559,7 @@ def build_stale_memory_artifacts(
         "staleness_type",
     }
     poison_records = [{key: poison[key] for key in runtime_keys if key in poison} for poison in private_poison_specs]
-    expected_ops = [
-        {
-            "op": poison["expected_op"],
-            "target": poison["poison_id"],
-            "reason": f"{poison['pollution_type']} should be handled as {poison['expected_op']}.",
-            "preserved_facts": poison.get("preserved_facts", []),
-            "revised_claim": poison.get("revised_claim", ""),
-            "should_preserve_fact": poison.get("should_preserve_fact", False),
-            "quality_checks": {
-                "preserve_true_facts": bool(poison.get("should_preserve_fact")),
-                "remove_wrong_interpretation": poison["expected_op"] == "Revise",
-                "respect_time_scope": poison["expected_op"] in {"Revise", "Invalidate", "Flag"},
-                "avoid_diagnosis_leakage": True,
-            },
-        }
-        for poison in private_poison_specs
-    ]
+    expected_ops = seed_expected_specs
     expected_ops.append(
         {
             "op": "Write",
@@ -450,6 +571,7 @@ def build_stale_memory_artifacts(
 
 
 def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> dict[str, Any]:
+    case_id = f"case_{idx:04d}"
     events = _as_events(pmoa_row)
     diagnoses = _diagnoses(pmoa_row)
     labs = _synthetic_labs(diagnoses, events)
@@ -466,12 +588,12 @@ def build_case(pmoa_row: dict[str, Any], pmc_row: dict[str, Any], idx: int) -> d
     key_event = _superseding_event(events)
     memory_seed, poison_records, expected_memory_ops = build_stale_memory_artifacts(
         idx=idx,
+        case_id=case_id,
         primary=primary,
         events=events,
         labs=labs,
         pmc_row=pmc_row,
     )
-    case_id = f"case_{idx:04d}"
     case = {
         "case_id": case_id,
         "source_refs": [

@@ -2,6 +2,7 @@ from mem_ehr_agent.agents import (
     answer_entity_source_candidates,
     evidence_driven_diagnosis_rerank,
     evidence_gated_diagnosis_recall,
+    llm_diagnosis_second_pass,
     refine_diagnosis_list,
     run_counterfactual_verification,
     run_ours,
@@ -340,6 +341,102 @@ def test_counterfactual_verification_requires_real_client():
         assert "real LLM API client" in str(exc)
     else:
         raise AssertionError("counterfactual verification must not use offline fallback")
+
+
+def test_second_pass_retries_with_compact_evidence_candidates():
+    case = {
+        "case_id": "case_second_pass_long",
+        "events": [{"event_id": f"ev_{idx}", "time": idx, "type": "diagnosis", "text": "diagnosed with pneumonia"} for idx in range(80)],
+    }
+    pred = {
+        "method": "medimem_topk8_round1",
+        "primary_diagnosis": "pneumonia",
+        "diagnosis_list": ["pneumonia"],
+        "confidence": 0.7,
+        "evidence": ["opacity " * 400],
+        "reasoning_summary": "summary " * 400,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    evidence_notes = [
+        {"time": idx, "summary": "source aligned note " + ("detail " * 120), "refs": [f"ev_{idx}"], "tags": ["diagnosis"]}
+        for idx in range(80)
+    ]
+    diagnosis_candidates = [
+        {"time": idx, "event_id": f"ev_{idx}", "text": "diagnosed with pneumonia " + ("detail " * 120)}
+        for idx in range(80)
+    ]
+
+    class RejectThenAcceptClient:
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                raise RuntimeError("maximum context length")
+            assert len(prompt) < len(self.prompts[0])
+            return LLMResult(
+                text='{"primary_diagnosis":"pneumonia","diagnosis_list":["pneumonia"],"confidence":0.8,"evidence":["visible diagnosis"],"reasoning_summary":"supported"}',
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                latency_s=0.0,
+            )
+
+    client = RejectThenAcceptClient()
+    updated = llm_diagnosis_second_pass(
+        case,
+        pred,
+        client,
+        evidence_notes,
+        diagnosis_candidates,
+        fail_on_llm_error=True,
+    )
+
+    assert updated["primary_diagnosis"] == "pneumonia"
+    assert len(client.prompts) == 2
+
+
+def test_counterfactual_retries_with_compact_prompt():
+    case = {
+        "case_id": "case_cf_long",
+        "events": [
+            {"event_id": f"ev_{idx}", "time": idx, "type": "clinical", "text": "visible event " + ("detail " * 160)}
+            for idx in range(60)
+        ],
+        "synthetic_labs": [],
+        "counterfactuals": [{"intervention": "Remove or negate this evidence: opacity " + ("detail " * 300)}],
+    }
+    pred = {"primary_diagnosis": "pneumonia", "confidence": 0.9}
+
+    class RejectThenAcceptClient:
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            prompt = "\n".join(message["content"] for message in messages)
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                raise RuntimeError("maximum context length")
+            assert len(prompt) < len(self.prompts[0])
+            return LLMResult(
+                text='{"primary_diagnosis":"pneumonia","confidence_for_original_diagnosis":0.3,"counterfactual_primary_diagnosis":"uncertain","causal_consistency_summary":"evidence removed"}',
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                latency_s=0.0,
+            )
+
+    client = RejectThenAcceptClient()
+    verification, usage = run_counterfactual_verification(
+        case,
+        pred,
+        client,
+        context="visible " * 10000,
+        extra="[MEMORY_CARDS]\n" + ("memory " * 10000),
+        fail_on_llm_error=True,
+    )
+
+    assert verification["passed"]
+    assert usage["total_tokens"] == 15
+    assert len(client.prompts) == 2
 
 
 def test_run_ours_keeps_counterfactual_audit_only_without_high_confidence_contradiction(tmp_path):

@@ -19,7 +19,7 @@ LOCOMO_DATASET_PATH="${LOCOMO_DATASET_PATH:-datasets/amem_original/locomo/locomo
 LOCOMO_METHODS="${LOCOMO_METHODS:-direct,amem,medimem}"
 
 QUEUE_A_SOURCES=(medmcqa chatdoctor_healthcaremagic medical_meadow_wikidoc locomo)
-QUEUE_B_SOURCES=(medqa medical_dialogue_to_soap pmoa_tts pmc_patients)
+QUEUE_B_SOURCES=(medqa pmoa_tts pmc_patients)
 
 cd "$PROJECT_ROOT" || exit 1
 export PYTHONPATH=.
