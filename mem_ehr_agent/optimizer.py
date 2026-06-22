@@ -532,7 +532,6 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
         return default
     known = {name: features for name, features in ablation_feature_sets()}
     known["ablate_no_temporal_signal"] = {"disable_temporal_signal": True}
-    known["ablate_no_pollution"] = {}
     aliases = {
         "no_memory_cleaning": "ablate_no_memory_cleaning",
         "with_polluted_memory": "ablate_with_polluted_memory",
@@ -542,7 +541,6 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
         "no_dynamic_top_k": "ablate_no_dynamic_top_k",
         "no_normalization": "ablate_no_normalization",
         "no_critic_op_guard": "ablate_no_critic_op_guard",
-        "no_pollution": "ablate_no_pollution",
         "no_temporal_signal": "ablate_no_temporal_signal",
         "temporal_signal": "ablate_no_temporal_signal",
         "no_time_signal": "ablate_no_temporal_signal",

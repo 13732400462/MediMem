@@ -15,7 +15,7 @@ MAX_WORKERS="${MAX_WORKERS:-128}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-128}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-12288}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
-PMOA_ABLATION_GROUPS="${PMOA_ABLATION_GROUPS:-full,no_memory_cleaning,no_evidence_note_injection,no_pollution,no_temporal_signal}"
+PMOA_ABLATION_GROUPS="${PMOA_ABLATION_GROUPS:-full,no_memory_cleaning,no_evidence_note_injection,with_polluted_memory,no_temporal_signal}"
 LOCOMO_DATASET_PATH="${LOCOMO_DATASET_PATH:-datasets/amem_original/locomo/locomo10.official.json}"
 LOCOMO_METHODS="${LOCOMO_METHODS:-direct,amem,medimem}"
 
