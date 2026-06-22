@@ -1,7 +1,7 @@
 import json
 
 from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.memory import MemoryStore, apply_critique, batched_critic_prompt, bootstrap_memory, llm_critic_ops, memory_card_candidate
+from mem_ehr_agent.memory import MemoryStore, apply_critique, batched_critic_prompt, bootstrap_memory, llm_critic_ops, memory_card_candidate, parse_critic_operations
 from mem_ehr_agent.agents import (
     case_context,
     compact_case_context,
@@ -457,6 +457,22 @@ def test_single_oversized_clean_card_is_truncated_and_still_reviewed():
     assert ops[0]["op"] == "Keep"
     assert len(client.calls) == 2
     assert "x" * 1000 not in client.calls[-1]
+
+
+def test_truncated_critic_output_uses_valid_single_target():
+    ops = parse_critic_operations(
+        '{"op": "Keep", "target": "mem_fcd37cd188a444444444444444444444444444444444444444444444444',
+        valid_targets=["mem_fcd37cd188a"],
+    )
+    assert ops == [
+        {
+            "op": "Keep",
+            "target": "mem_fcd37cd188a",
+            "reason": "Parsed from truncated critic output.",
+            "revised_claim": "",
+            "preserved_facts": [],
+        }
+    ]
 
 
 def test_medimem_prediction_prompt_budgets_long_case_and_extra():
