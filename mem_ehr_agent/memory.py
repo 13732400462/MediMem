@@ -571,11 +571,11 @@ def split_critic_batches(
     return batches
 
 
-def parse_critic_operations(result_text: str) -> list[dict[str, Any]]:
+def parse_critic_operations(result_text: str, valid_targets: list[str] | None = None) -> list[dict[str, Any]]:
     try:
         raw = extract_json_object(result_text)
     except Exception:
-        repaired = parse_truncated_critic_operations(result_text)
+        repaired = parse_truncated_critic_operations(result_text, valid_targets=valid_targets)
         if repaired:
             return repaired
         raise
@@ -585,14 +585,22 @@ def parse_critic_operations(result_text: str) -> list[dict[str, Any]]:
     return [item for item in operations if isinstance(item, dict)]
 
 
-def parse_truncated_critic_operations(result_text: str) -> list[dict[str, Any]]:
+def parse_truncated_critic_operations(result_text: str, valid_targets: list[str] | None = None) -> list[dict[str, Any]]:
     text = str(result_text or "")
+    targets = [str(target) for target in valid_targets or [] if str(target).strip()]
     operations: list[dict[str, Any]] = []
     for match in re.finditer(r'"op"\s*:\s*"(Revise|Invalidate|Discard|Flag|Keep)"', text):
         start = match.start()
         chunk = text[start : start + 1200]
         target_match = re.search(r'"target"\s*:\s*"([^"]*)"', chunk)
-        if not target_match:
+        target = target_match.group(1) if target_match else ""
+        if targets and target not in targets:
+            exact = next((candidate_id for candidate_id in targets if candidate_id in chunk), "")
+            if exact:
+                target = exact
+            elif len(targets) == 1:
+                target = targets[0]
+        if not target:
             continue
         reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', chunk)
         revised_match = re.search(r'"revised_claim"\s*:\s*"([^"]*)"', chunk)
@@ -600,7 +608,7 @@ def parse_truncated_critic_operations(result_text: str) -> list[dict[str, Any]]:
         operations.append(
             {
                 "op": op,
-                "target": target_match.group(1),
+                "target": target,
                 "reason": reason_match.group(1) if reason_match else "Parsed from truncated critic output.",
                 "revised_claim": revised_match.group(1) if op == "Revise" and revised_match else "",
                 "preserved_facts": [],
@@ -635,6 +643,7 @@ def call_critic_batch(
     evidence_chars: int = 120,
     max_chars_per_event: int = 240,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    valid_targets = [candidate_id(candidate) for candidate in batch]
     messages = batched_critic_prompt(
         case,
         batch,
@@ -645,14 +654,14 @@ def call_critic_batch(
     )
     result = client.chat(messages, temperature=0.0, max_tokens=critic_output_tokens(len(batch)))
     try:
-        return parse_critic_operations(result.text), result.usage
+        return parse_critic_operations(result.text, valid_targets=valid_targets), result.usage
     except Exception:
         repair = client.chat(
             critic_repair_prompt(batch, result.text),
             temperature=0.0,
             max_tokens=critic_output_tokens(len(batch)),
         )
-        repair_ops = parse_critic_operations(repair.text)
+        repair_ops = parse_critic_operations(repair.text, valid_targets=valid_targets)
         usage = {
             "prompt_tokens": result.usage.get("prompt_tokens", 0) + repair.usage.get("prompt_tokens", 0),
             "completion_tokens": result.usage.get("completion_tokens", 0) + repair.usage.get("completion_tokens", 0),
