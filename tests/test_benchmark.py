@@ -17,6 +17,7 @@ from mem_ehr_agent.benchmark import (
     run_locomo_ours_memory_pipeline,
     validate_horizontal_run,
 )
+from mem_ehr_agent.memory import MemoryStore
 
 
 def test_parse_methods_normalizes_comma_list():
@@ -77,6 +78,51 @@ def test_locomo_turns_build_jsonl_memory_cards(tmp_path):
     assert card["entities"] == ["Boston", "Monday"]
     assert "Monday" in card["temporal_markers"]
     assert "locomo" in card["tags"]
+
+
+def test_locomo_memory_store_saves_enriched_cards_once(tmp_path, monkeypatch):
+    sample = {
+        "sample_id": "conv-batch__qa_0000",
+        "conversation_id": "conv-batch",
+        "turns": [
+            {
+                "event_id": "D1:0",
+                "dia_id": "D1:0",
+                "session": "1",
+                "session_date": "Monday",
+                "time": "D1:0",
+                "speaker": "A",
+                "text": "Alice visited Boston on Monday.",
+            },
+            {
+                "event_id": "D1:1",
+                "dia_id": "D1:1",
+                "session": "1",
+                "session_date": "Monday",
+                "time": "D1:1",
+                "speaker": "B",
+                "text": "Bob scheduled follow-up on Tuesday.",
+            },
+        ],
+    }
+    save_calls = 0
+    original_save = MemoryStore.save
+
+    def counted_save(store):
+        nonlocal save_calls
+        save_calls += 1
+        return original_save(store)
+
+    monkeypatch.setattr(MemoryStore, "save", counted_save)
+    path = locomo_memory_path(tmp_path, "conv-batch")
+    store = build_locomo_memory_store(sample, path)
+
+    assert save_calls == 1
+    assert len(store.cards) == 2
+    reloaded = MemoryStore.load("conv-batch", path)
+    assert reloaded.cards == store.cards
+    assert reloaded.cards[0]["entities"] == ["Alice", "Boston", "Monday"]
+    assert "Tuesday" in reloaded.cards[1]["temporal_markers"]
 
 
 def test_parse_int_list_for_top_k_sweep():
