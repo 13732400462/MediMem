@@ -756,6 +756,7 @@ def build_locomo_memory_store(sample: dict[str, Any], memory_path: str | Path) -
     store = MemoryStore.load(str(sample.get("conversation_id") or sample["sample_id"]), memory_path)
     if store.cards:
         return store
+    wrote_card = False
     for turn in sample.get("turns", []):
         text = normalize_answer(turn.get("text"))
         if not text:
@@ -780,6 +781,8 @@ def build_locomo_memory_store(sample: dict[str, Any], memory_path: str | Path) -
             turn.get("session_date"),
             turn.get("time"),
         )
+        wrote_card = True
+    if wrote_card:
         store.save()
     return store
 
