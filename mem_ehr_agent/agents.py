@@ -545,6 +545,8 @@ def run_llm_prediction(
         pred["llm_error"] = str(exc)
         return pred
     parse_retries = int(os.environ.get("MEDICAL_JSON_PARSE_RETRIES", "2")) if fail_on_llm_error else 0
+    if hasattr(client, "remaining_completion_tokens"):
+        parse_retries = min(parse_retries, int(client.remaining_completion_tokens) // 128)
     parse_exc: Exception | None = None
     for parse_attempt in range(parse_retries + 1):
         try:
@@ -2496,7 +2498,8 @@ def run_ours(
         adaptive_memory_cleaning and source_dataset == "pmc_patients"
     )
     if hasattr(client, "reserved_completion_tokens"):
-        client.reserved_completion_tokens = min(256, int(client.completion_token_budget) // 2)
+        client.reserved_completion_tokens = min(512, (int(client.completion_token_budget) * 2) // 3)
+    critic_fail_on_llm_error = fail_on_llm_error and not hasattr(client, "remaining_completion_tokens")
     try:
         if disable_memory_cleaning:
             ops = []
@@ -2507,7 +2510,7 @@ def run_ours(
                 case,
                 audit_store,
                 client,
-                fail_on_llm_error=fail_on_llm_error,
+                fail_on_llm_error=critic_fail_on_llm_error,
                 enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
             )
         else:
@@ -2515,7 +2518,7 @@ def run_ours(
                 case,
                 store,
                 client,
-                fail_on_llm_error=fail_on_llm_error,
+                fail_on_llm_error=critic_fail_on_llm_error,
                 enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
             )
     finally:
@@ -2765,6 +2768,12 @@ def run_ours(
     )
     pred["strategy"] = strategy
     pred["optimization_features"] = feature_state(strategy)
+    if hasattr(client, "cumulative_usage"):
+        pred["usage"] = {
+            **client.cumulative_usage,
+            "completion_budget": client.completion_token_budget,
+            "completion_budget_remaining": client.remaining_completion_tokens,
+        }
     return pred
 
 

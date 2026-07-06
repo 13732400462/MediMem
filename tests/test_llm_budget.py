@@ -27,6 +27,8 @@ def test_completion_budget_is_cumulative() -> None:
     assert first.usage["completion_tokens"] == 40
     assert second.usage["completion_tokens"] == 20
     assert client.remaining_completion_tokens == 0
+    assert client.cumulative_usage["completion_tokens"] == 60
+    assert client.cumulative_usage["calls"] == 2
     with pytest.raises(LLMError):
         client.chat([], max_tokens=1)
 
@@ -41,3 +43,4 @@ def test_completion_budget_preserves_reserved_tokens() -> None:
         client.chat([], max_tokens=1)
     client.reserved_completion_tokens = 0
     client.chat([], max_tokens=20)
+    assert client.cumulative_usage["completion_tokens"] == 60

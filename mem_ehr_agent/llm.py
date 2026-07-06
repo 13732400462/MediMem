@@ -140,6 +140,13 @@ class CompletionBudgetClient:
         self.completion_token_budget = int(completion_token_budget)
         self.remaining_completion_tokens = int(completion_token_budget)
         self.reserved_completion_tokens = 0
+        self.cumulative_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "calls": 0,
+            "latency_ms": 0,
+        }
 
     def healthcheck(self) -> tuple[bool, str]:
         return self.client.healthcheck()
@@ -165,6 +172,8 @@ class CompletionBudgetClient:
         )
         used = int(result.usage.get("completion_tokens", 0) or 0)
         self.remaining_completion_tokens = max(0, self.remaining_completion_tokens - used)
+        for key in self.cumulative_usage:
+            self.cumulative_usage[key] += int(result.usage.get(key, 0) or 0)
         result.usage["completion_budget"] = self.completion_token_budget
         result.usage["completion_budget_remaining"] = self.remaining_completion_tokens
         result.usage["completion_budget_reserved"] = self.reserved_completion_tokens
