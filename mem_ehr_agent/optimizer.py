@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import csv
 import json
+import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -10,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from .agents import run_direct, run_direct_polluted, run_ours, run_single_cot_agent
-from .baselines import run_baseline
+from .baselines import run_baseline, run_static_rag_adapter
 from .config import get_deepseek_config
 from .error_analysis import build_error_analysis, render_error_analysis
 from .io_utils import append_jsonl, ensure_dir, read_jsonl, read_text, write_jsonl
-from .llm import DeepSeekClient
+from .llm import DeepSeekClient, with_completion_budget
 from .metrics import (
     add_merged_ours_summaries,
     best_baseline_accuracy,
@@ -63,10 +64,12 @@ def strategy_for_round(
             "disable_dynamic_top_k": bool((features or {}).get("disable_dynamic_top_k")),
             "disable_normalization": bool((features or {}).get("disable_normalization")),
             "disable_memory_cleaning": bool((features or {}).get("disable_memory_cleaning")),
+            "critic_audit_only": bool((features or {}).get("critic_audit_only")),
             "enable_polluted_memory": bool((features or {}).get("enable_polluted_memory")),
             "disable_critic_op_guard": bool((features or {}).get("disable_critic_op_guard")),
             "disable_evidence_note_injection": bool((features or {}).get("disable_evidence_note_injection")),
             "disable_counterfactual_verification": bool((features or {}).get("disable_counterfactual_verification")),
+            "disable_sanitization_boundary": bool((features or {}).get("disable_sanitization_boundary")),
             "disable_temporal_signal": bool((features or {}).get("disable_temporal_signal")),
             "counterfactual_policy": str((features or {}).get("counterfactual_policy") or counterfactual_policy),
             "counterfactual_sample_rate": float(
@@ -106,6 +109,7 @@ def run_baselines(
     max_workers: int,
     fail_on_llm_error: bool = False,
     baseline_set: str = "all",
+    completion_token_budget: int | None = None,
 ) -> list[dict[str, Any]]:
     preds = []
     tasks = []
@@ -115,12 +119,13 @@ def run_baselines(
         return preds
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for case in cases:
-            tasks.append(("direct", case["case_id"], pool.submit(run_direct, case, client, fail_on_llm_error=fail_on_llm_error)))
-            tasks.append(("single_cot", case["case_id"], pool.submit(run_single_cot_agent, case, client, fail_on_llm_error=fail_on_llm_error)))
-            tasks.append(("amem", case["case_id"], pool.submit(run_baseline, "amem", case, client, fail_on_llm_error=fail_on_llm_error)))
+            tasks.append(("direct", case["case_id"], pool.submit(run_direct, case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
+            tasks.append(("single_cot", case["case_id"], pool.submit(run_single_cot_agent, case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
+            tasks.append(("static_rag", case["case_id"], pool.submit(run_static_rag_adapter, case, with_completion_budget(client, completion_token_budget), memory_dir=run_dir / "memory" / "baseline_static_rag", fail_on_llm_error=fail_on_llm_error)))
+            tasks.append(("amem", case["case_id"], pool.submit(run_baseline, "amem", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
             if baseline_set in {"all", "required"}:
-                tasks.append(("ddo", case["case_id"], pool.submit(run_baseline, "ddo", case, client, fail_on_llm_error=fail_on_llm_error)))
-                tasks.append(("colacare", case["case_id"], pool.submit(run_baseline, "colacare", case, client, fail_on_llm_error=fail_on_llm_error)))
+                tasks.append(("ddo", case["case_id"], pool.submit(run_baseline, "ddo", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
+                tasks.append(("colacare", case["case_id"], pool.submit(run_baseline, "colacare", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
             if baseline_set in {"all", "focused"}:
                 tasks.append(("polluted_direct", case["case_id"], pool.submit(run_direct_polluted, case, client, fail_on_llm_error=fail_on_llm_error)))
                 tasks.append(
@@ -173,6 +178,7 @@ def summary_metric(summaries: list[dict[str, Any]], method: str, metric: str = "
 FAST_FORMAL_PIPELINE_METHODS = {
     "direct_deepseek",
     "baseline_single_cot_agent",
+    "baseline_static_rag",
     "baseline_amem_adapter",
     "baseline_ddo_adapter",
     "baseline_colacare_adapter",
@@ -180,8 +186,12 @@ FAST_FORMAL_PIPELINE_METHODS = {
 }
 FAST_FORMAL_MEDIMEM_METHODS = {
     "full_medimem_merged",
+    "ablate_static_memory_no_critic_medimem_merged",
     "ablate_no_memory_cleaning_medimem_merged",
+    "ablate_no_dynamic_top_k_medimem_merged",
     "ablate_no_evidence_note_injection_medimem_merged",
+    "ablate_no_counterfactual_verification_medimem_merged",
+    "ablate_no_sanitization_boundary_medimem_merged",
     "ablate_with_polluted_memory_medimem_merged",
     "ablate_no_temporal_signal_medimem_merged",
 }
@@ -214,13 +224,7 @@ def write_fast_formal_comparison_outputs(run_dir: Path, summaries: list[dict[str
         if not full:
             continue
         full_obj = float(full.get("primary_diag_objective") or 0)
-        for method in [
-            "full_medimem_merged",
-            "ablate_no_memory_cleaning_medimem_merged",
-            "ablate_no_evidence_note_injection_medimem_merged",
-            "ablate_with_polluted_memory_medimem_merged",
-            "ablate_no_temporal_signal_medimem_merged",
-        ]:
+        for method in sorted(FAST_FORMAL_MEDIMEM_METHODS, key=lambda name: (name != "full_medimem_merged", name)):
             row = methods.get(method)
             if not row:
                 continue
@@ -381,6 +385,7 @@ def optimize(
         for method in [
             "direct_deepseek",
             "baseline_single_cot_agent",
+            "baseline_static_rag",
             "baseline_amem_adapter",
             "baseline_ddo_adapter",
             "baseline_colacare_adapter",
@@ -432,7 +437,8 @@ def optimize(
         eval_result = add_merged_ours_summaries(evaluate_predictions(cases, all_preds), group_names=["round"])
         leakage_audit = build_leakage_audit(cases, all_preds)
         append_jsonl(run_dir / "leakage_audit.jsonl", {"round": round_idx, **leakage_audit})
-        if int(leakage_audit.get("critical_leakage_count", 0) or 0) > 0:
+        intentional_leakage_ablation = bool(features.get("disable_sanitization_boundary"))
+        if int(leakage_audit.get("critical_leakage_count", 0) or 0) > 0 and not intentional_leakage_ablation:
             raise RuntimeError(f"Critical no-leak audit failed: {leakage_audit}")
         memory_op_confusion = build_memory_op_confusion(cases, ours_preds)
         pollution_type_breakdown = build_pollution_type_breakdown(cases, ours_preds)
@@ -500,18 +506,20 @@ def ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
         ("full", {}),
         ("ablate_no_dynamic_top_k", {"disable_dynamic_top_k": True}),
         ("ablate_no_normalization", {"disable_normalization": True}),
-        ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_static_memory_no_critic", {"disable_memory_cleaning": True}),
+        ("ablate_no_memory_cleaning", {"critic_audit_only": True}),
         ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_critic_op_guard", {"disable_critic_op_guard": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
         ("ablate_no_counterfactual_verification", {"disable_counterfactual_verification": True}),
+        ("ablate_no_sanitization_boundary", {"disable_sanitization_boundary": True}),
     ]
 
 
 def focused_ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
     return [
         ("full", {}),
-        ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_no_memory_cleaning", {"critic_audit_only": True}),
         ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
         ("ablate_no_counterfactual_verification", {"disable_counterfactual_verification": True}),
@@ -521,7 +529,7 @@ def focused_ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
 def fast_formal_ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
     return [
         ("full", {}),
-        ("ablate_no_memory_cleaning", {"disable_memory_cleaning": True}),
+        ("ablate_no_memory_cleaning", {"critic_audit_only": True}),
         ("ablate_with_polluted_memory", {"enable_polluted_memory": True}),
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
     ]
@@ -541,6 +549,8 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
         "no_dynamic_top_k": "ablate_no_dynamic_top_k",
         "no_normalization": "ablate_no_normalization",
         "no_critic_op_guard": "ablate_no_critic_op_guard",
+        "no_sanitization_boundary": "ablate_no_sanitization_boundary",
+        "static_memory_no_critic": "ablate_static_memory_no_critic",
         "no_temporal_signal": "ablate_no_temporal_signal",
         "temporal_signal": "ablate_no_temporal_signal",
         "no_time_signal": "ablate_no_temporal_signal",
@@ -572,9 +582,13 @@ def optimize_suite(
     counterfactual_sample_rate: float = 0.2,
     counterfactual_risk_threshold: float = 0.55,
     defer_reports: bool = False,
+    completion_token_budget: int | None = None,
+    run_seed: int = 20260706,
+    output_root: str | Path = "runs",
 ) -> Path:
+    os.environ["MEDICAL_LLM_SEED"] = str(run_seed)
     cases = read_jsonl(dataset_path)
-    run_dir = make_run_dir()
+    run_dir = make_run_dir(output_root)
     data_notes_path = Path(dataset_path).with_suffix(".notes.txt")
     data_notes = read_text(data_notes_path) if data_notes_path.exists() else ""
     client, blocker = build_client(require_api=require_api)
@@ -598,6 +612,27 @@ def optimize_suite(
         effective_baseline_set = baseline_set or ("focused" if focused else "all")
         effective_counterfactual_policy = counterfactual_policy
     feature_sets = parse_ablation_groups(ablation_groups, default=default_feature_sets)
+    (run_dir / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset_path": str(dataset_path),
+                "dataset_sha256": hashlib.sha256(Path(dataset_path).read_bytes()).hexdigest(),
+                "case_count": len(cases),
+                "run_seed": run_seed,
+                "suite_profile": suite_profile,
+                "baseline_set": effective_baseline_set,
+                "ablation_groups": [name for name, _ in feature_sets],
+                "completion_token_budget": completion_token_budget,
+                "counterfactual_policy": effective_counterfactual_policy,
+                "counterfactual_sample_rate": counterfactual_sample_rate,
+                "counterfactual_risk_threshold": counterfactual_risk_threshold,
+                "max_workers": max_workers,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     baseline_preds = run_baselines(
         cases,
@@ -606,6 +641,7 @@ def optimize_suite(
         max_workers=max_workers,
         fail_on_llm_error=require_api,
         baseline_set=effective_baseline_set,
+        completion_token_budget=completion_token_budget,
     )
     baseline_eval = evaluate_predictions(cases, baseline_preds)
     write_metrics_csv(run_dir / "baseline_metrics.csv", baseline_eval["summary"])
@@ -615,6 +651,7 @@ def optimize_suite(
         for method in [
             "direct_deepseek",
             "baseline_single_cot_agent",
+            "baseline_static_rag",
             "baseline_amem_adapter",
             "baseline_ddo_adapter",
             "baseline_colacare_adapter",
@@ -644,7 +681,7 @@ def optimize_suite(
                 pool.submit(
                     run_ours,
                     case,
-                    client,
+                    with_completion_budget(client, completion_token_budget),
                     memory_dir=memory_dir,
                     strategy=strategy,
                     fail_on_llm_error=require_api,
@@ -678,7 +715,8 @@ def optimize_suite(
         detail_audit = summarize_leakage_audit_details(group_details)
         leakage_audit = {**build_leakage_audit(cases, all_preds), **detail_audit}
         append_jsonl(run_dir / "leakage_audit.jsonl", {"group": group_name, **leakage_audit})
-        if int(leakage_audit.get("critical_leakage_count", 0) or 0) > 0:
+        intentional_leakage_ablation = bool(features.get("disable_sanitization_boundary"))
+        if int(leakage_audit.get("critical_leakage_count", 0) or 0) > 0 and not intentional_leakage_ablation:
             raise RuntimeError(f"Critical no-leak audit failed: {leakage_audit}")
         memory_op_confusion = build_memory_op_confusion(cases, ours_preds)
         pollution_type_breakdown = build_pollution_type_breakdown(cases, ours_preds)

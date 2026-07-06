@@ -370,7 +370,8 @@ def normalize_prediction(
         "reasoning_summary": str(raw.get("reasoning_summary") or raw.get("summary") or ""),
         "species_context": species_context,
         "diagnosis_granularity": diagnosis_granularity,
-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage
+        or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0, "latency_ms": 0},
     }
 
 
@@ -1824,12 +1825,7 @@ def llm_diagnosis_second_pass(
             "species_context": refined.get("species_context", pred.get("species_context")),
             "diagnosis_granularity": refined.get("diagnosis_granularity", pred.get("diagnosis_granularity")),
             "diagnosis_second_pass": {"enabled": True},
-            "usage": {
-                "prompt_tokens": int(previous_usage.get("prompt_tokens", 0) or 0) + int(usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(previous_usage.get("completion_tokens", 0) or 0)
-                + int(usage.get("completion_tokens", 0) or 0),
-                "total_tokens": int(previous_usage.get("total_tokens", 0) or 0) + int(usage.get("total_tokens", 0) or 0),
-            },
+            "usage": add_usage(previous_usage, usage),
         }
     )
     return evidence_driven_diagnosis_rerank(case, updated, evidence_notes, diagnosis_candidates)
@@ -2080,6 +2076,8 @@ def add_usage(previous: dict[str, Any] | None, extra: dict[str, Any] | None) -> 
         "prompt_tokens": int(previous.get("prompt_tokens", 0) or 0) + int(extra.get("prompt_tokens", 0) or 0),
         "completion_tokens": int(previous.get("completion_tokens", 0) or 0) + int(extra.get("completion_tokens", 0) or 0),
         "total_tokens": int(previous.get("total_tokens", 0) or 0) + int(extra.get("total_tokens", 0) or 0),
+        "calls": int(previous.get("calls", 0) or 0) + int(extra.get("calls", 0) or 0),
+        "latency_ms": int(previous.get("latency_ms", 0) or 0) + int(extra.get("latency_ms", 0) or 0),
     }
 
 
@@ -2497,14 +2495,27 @@ def run_ours(
     disable_memory_cleaning = bool(features.get("disable_memory_cleaning")) or (
         adaptive_memory_cleaning and source_dataset == "pmc_patients"
     )
-    ops = [] if disable_memory_cleaning else apply_critique(
-        case,
-        store,
-        client,
-        fail_on_llm_error=fail_on_llm_error,
-        enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
-    )
-    prompt_ops = safe_memory_ops_for_prompt(case, ops)
+    if disable_memory_cleaning:
+        ops = []
+    elif bool(features.get("critic_audit_only")):
+        audit_path = memory_path.with_name(f"{memory_path.stem}.critic-audit.jsonl")
+        audit_store = bootstrap_memory(case, audit_path, include_poison=bool(features.get("enable_polluted_memory")))
+        ops = apply_critique(
+            case,
+            audit_store,
+            client,
+            fail_on_llm_error=fail_on_llm_error,
+            enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
+        )
+    else:
+        ops = apply_critique(
+            case,
+            store,
+            client,
+            fail_on_llm_error=fail_on_llm_error,
+            enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
+        )
+    prompt_ops = ops if bool(features.get("disable_sanitization_boundary")) else safe_memory_ops_for_prompt(case, ops)
     query = "final diagnosis longitudinal causal evidence treatment imaging pathology labs"
     top_k = resolve_top_k(case, strategy)
     retrieved_memories = store.retrieve(query, k=top_k)

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from .agents import case_context, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
+from pathlib import Path
+
+from .agents import case_context, compact_memory_lines, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
 from .amem_baseline import run_amem_adapter
 from .llm import DeepSeekClient
+from .memory import bootstrap_memory
 
 
 BASELINE_SOURCES = {
+    "static_rag": {"paper": "Static lexical retrieval baseline", "repo": "local protocol baseline"},
     "amem": {
         "paper": "A-MEM: Agentic Memory for LLM Agents",
         "repo": "https://github.com/agiresearch/A-mem",
@@ -21,6 +25,32 @@ BASELINE_SOURCES = {
         "repo": "https://github.com/PKU-AICare/ColaCare",
     },
 }
+
+
+def run_static_rag_adapter(
+    case: dict[str, Any],
+    client: DeepSeekClient | None,
+    *,
+    memory_dir: str | Path,
+    fail_on_llm_error: bool = False,
+    top_k: int = 8,
+) -> dict[str, Any]:
+    memory_path = Path(memory_dir) / f"{case['case_id']}.static-rag.jsonl"
+    store = bootstrap_memory(case, memory_path, include_poison=False)
+    retrieved = store.retrieve("final diagnosis treatment imaging pathology laboratory follow-up", k=top_k)
+    context = "\n".join([f"case_id: {case['case_id']}", "[STATIC_RETRIEVED_CARDS]", *compact_memory_lines(retrieved)])
+    pred = run_llm_prediction(
+        case,
+        method="baseline_static_rag",
+        client=client,
+        context=context,
+        extra="Use only the statically retrieved cards. No critic, memory update, evidence-note injection, or audit is available.",
+        fail_on_llm_error=fail_on_llm_error,
+        temperature=0.05,
+    )
+    pred["retrieved_memory_count"] = len(retrieved)
+    pred["baseline_source"] = BASELINE_SOURCES["static_rag"]
+    return pred
 
 
 def run_ddo_adapter(

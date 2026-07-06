@@ -10,6 +10,7 @@ from .io_utils import ensure_dir, read_jsonl, write_jsonl
 from .metrics import build_metric_gate, read_metrics_csv, render_metric_gate
 from .optimizer import optimize, optimize_suite
 from .schemas import validate_case
+from .statistical_analysis import analyze_run, source_name
 
 
 def cmd_data_build(args: argparse.Namespace) -> None:
@@ -69,8 +70,35 @@ def cmd_experiment_suite(args: argparse.Namespace) -> None:
         counterfactual_sample_rate=args.counterfactual_sample_rate,
         counterfactual_risk_threshold=args.counterfactual_risk_threshold,
         defer_reports=args.defer_reports,
+        completion_token_budget=args.completion_token_budget,
+        run_seed=args.run_seed,
+        output_root=args.output_root,
     )
     print(f"run_dir={run_dir}")
+
+
+def cmd_analyze_run(args: argparse.Namespace) -> None:
+    output = analyze_run(
+        dataset_path=args.dataset,
+        prediction_paths=args.predictions,
+        output_dir=args.output_dir,
+        target_method=args.target_method,
+        compare_methods=[item.strip() for item in args.compare_methods.split(",") if item.strip()]
+        if args.compare_methods
+        else None,
+        resamples=args.resamples,
+        seed=args.random_seed,
+    )
+    print(f"analysis_dir={output}")
+
+
+def cmd_filter_sources(args: argparse.Namespace) -> None:
+    selected = {item.strip().lower() for item in args.sources.split(",") if item.strip()}
+    cases = [case for case in read_jsonl(args.dataset) if source_name(case) in selected]
+    if not cases:
+        raise SystemExit(f"No cases matched sources: {sorted(selected)}")
+    write_jsonl(args.output, cases)
+    print(f"wrote {len(cases)} rows to {args.output}")
 
 
 def cmd_sample(args: argparse.Namespace) -> None:
@@ -271,11 +299,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write metrics/predictions/leakage during the run, then render markdown/error analysis once at the end.",
     )
     suite.add_argument(
+        "--completion-token-budget",
+        type=int,
+        default=None,
+        help="Optional cumulative generated-token budget per method/case (e.g. 750, 1500, 3000).",
+    )
+    suite.add_argument("--run-seed", type=int, default=20260706)
+    suite.add_argument("--output-root", default="runs")
+    suite.add_argument(
         "--focused",
         action="store_true",
         help="Run only direct/AMEM/polluted AMEM plus full ours and memory/evidence ablations.",
     )
     suite.set_defaults(func=cmd_experiment_suite)
+
+    analysis = sub.add_parser("analyze-run")
+    analysis.add_argument("--dataset", required=True)
+    analysis.add_argument("--predictions", nargs="+", required=True)
+    analysis.add_argument("--output-dir", required=True)
+    analysis.add_argument("--target-method", default="full_medimem")
+    analysis.add_argument("--compare-methods", default=None)
+    analysis.add_argument("--resamples", type=int, default=10_000)
+    analysis.add_argument("--random-seed", type=int, default=20260706)
+    analysis.set_defaults(func=cmd_analyze_run)
+
+    filter_sources = sub.add_parser("filter-sources")
+    filter_sources.add_argument("--dataset", required=True)
+    filter_sources.add_argument("--sources", required=True)
+    filter_sources.add_argument("--output", required=True)
+    filter_sources.set_defaults(func=cmd_filter_sources)
 
     gate = sub.add_parser("metric-gate")
     gate.add_argument("--metrics", required=True, help="Path to metrics.csv from an experiment run.")

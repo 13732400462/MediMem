@@ -907,8 +907,9 @@ def test_required_baseline_set_runs_required_unpolluted_pipelines(tmp_path, monk
     methods = {pred["method"] for pred in preds}
     assert methods == {
         "direct_deepseek",
-        "baseline_single_cot_agent",
-        "baseline_amem_adapter",
+            "baseline_single_cot_agent",
+            "baseline_static_rag",
+            "baseline_amem_adapter",
         "baseline_ddo_adapter",
         "baseline_colacare_adapter",
     }

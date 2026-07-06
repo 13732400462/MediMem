@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -63,6 +64,9 @@ class DeepSeekClient:
             "temperature": temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
+        request_seed = os.environ.get("MEDICAL_LLM_SEED", "").strip()
+        if request_seed:
+            payload["seed"] = int(request_seed)
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         headers = {
@@ -118,9 +122,59 @@ class DeepSeekClient:
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
                 "total_tokens": int(usage.get("total_tokens", 0) or 0),
+                "calls": 1,
+                "latency_ms": int(round(latency * 1000)),
             },
             latency_s=latency,
         )
+
+
+class CompletionBudgetClient:
+    """Per-case wrapper that enforces a cumulative generated-token budget."""
+
+    def __init__(self, client: DeepSeekClient, completion_token_budget: int):
+        if completion_token_budget <= 0:
+            raise ValueError("completion_token_budget must be positive")
+        self.client = client
+        self.config = client.config
+        self.completion_token_budget = int(completion_token_budget)
+        self.remaining_completion_tokens = int(completion_token_budget)
+
+    def healthcheck(self) -> tuple[bool, str]:
+        return self.client.healthcheck()
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.1,
+        max_tokens: int | None = None,
+        json_mode: bool = True,
+    ) -> LLMResult:
+        if self.remaining_completion_tokens <= 0:
+            raise LLMError("Per-case completion-token budget exhausted.")
+        requested = int(max_tokens if max_tokens is not None else self.config.max_tokens)
+        allowed = min(requested, self.remaining_completion_tokens)
+        result = self.client.chat(
+            messages,
+            temperature=temperature,
+            max_tokens=allowed,
+            json_mode=json_mode,
+        )
+        used = int(result.usage.get("completion_tokens", 0) or 0)
+        self.remaining_completion_tokens = max(0, self.remaining_completion_tokens - used)
+        result.usage["completion_budget"] = self.completion_token_budget
+        result.usage["completion_budget_remaining"] = self.remaining_completion_tokens
+        return result
+
+
+def with_completion_budget(
+    client: DeepSeekClient | CompletionBudgetClient | None, completion_token_budget: int | None
+) -> DeepSeekClient | CompletionBudgetClient | None:
+    if client is None or completion_token_budget is None:
+        return client
+    base = client.client if isinstance(client, CompletionBudgetClient) else client
+    return CompletionBudgetClient(base, completion_token_budget)
 
 
 def extract_json_object(text: str) -> dict[str, Any]:

@@ -523,6 +523,8 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
             {
                 "case_id": pred["case_id"],
                 "method": pred["method"],
+                "replicate_id": pred.get("replicate_id", "default"),
+                "completion_token_budget": pred.get("completion_token_budget"),
                 "task_profile": case_task_profile(case),
                 "diagnosis_metric_applicable": 1.0 if diagnosis_applicable else 0.0,
                 "primary_correct": (1.0 if primary_ok else 0.0) if primary_ok is not None else None,
@@ -548,6 +550,10 @@ def evaluate_predictions(cases: list[dict[str, Any]], predictions: list[dict[str
                 "counterfactual_evaluated": cf["counterfactual_evaluated"],
                 "counterfactual_skipped": cf["counterfactual_skipped"],
                 "tokens": float((pred.get("usage") or {}).get("total_tokens", 0) or 0),
+                "prompt_tokens": float((pred.get("usage") or {}).get("prompt_tokens", 0) or 0),
+                "completion_tokens": float((pred.get("usage") or {}).get("completion_tokens", 0) or 0),
+                "model_calls": float((pred.get("usage") or {}).get("calls", 0) or 0),
+                "latency_ms": float((pred.get("usage") or {}).get("latency_ms", 0) or 0),
             }
         )
     by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -592,6 +598,10 @@ def summarize_case_rows(method: str, vals: list[dict[str, Any]]) -> dict[str, An
         "counterfactual_coverage_rate": avg(vals, "counterfactual_evaluated"),
         "counterfactual_skipped_rate": avg(vals, "counterfactual_skipped"),
         "avg_tokens": avg(vals, "tokens"),
+        "avg_prompt_tokens": avg(vals, "prompt_tokens"),
+        "avg_completion_tokens": avg(vals, "completion_tokens"),
+        "avg_model_calls": avg(vals, "model_calls"),
+        "avg_latency_s": (avg(vals, "latency_ms") or 0.0) / 1000.0,
     }
 
 
