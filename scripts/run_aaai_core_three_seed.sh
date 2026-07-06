@@ -11,6 +11,8 @@ ABLATIONS="${ABLATIONS:-full,static_memory_no_critic,no_memory_cleaning,no_dynam
 export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-http://127.0.0.1:8002/v1}"
 export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-local-key}"
 export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-qwen3-vl-8b-aaai}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 cd "$ROOT"
 mkdir -p "$(dirname "$CORE_DATASET")" "$OUTPUT_ROOT"
