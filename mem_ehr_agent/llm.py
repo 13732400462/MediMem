@@ -139,6 +139,7 @@ class CompletionBudgetClient:
         self.config = client.config
         self.completion_token_budget = int(completion_token_budget)
         self.remaining_completion_tokens = int(completion_token_budget)
+        self.reserved_completion_tokens = 0
 
     def healthcheck(self) -> tuple[bool, str]:
         return self.client.healthcheck()
@@ -151,10 +152,11 @@ class CompletionBudgetClient:
         max_tokens: int | None = None,
         json_mode: bool = True,
     ) -> LLMResult:
-        if self.remaining_completion_tokens <= 0:
+        available = self.remaining_completion_tokens - self.reserved_completion_tokens
+        if available <= 0:
             raise LLMError("Per-case completion-token budget exhausted.")
         requested = int(max_tokens if max_tokens is not None else self.config.max_tokens)
-        allowed = min(requested, self.remaining_completion_tokens)
+        allowed = min(requested, available)
         result = self.client.chat(
             messages,
             temperature=temperature,
@@ -165,6 +167,7 @@ class CompletionBudgetClient:
         self.remaining_completion_tokens = max(0, self.remaining_completion_tokens - used)
         result.usage["completion_budget"] = self.completion_token_budget
         result.usage["completion_budget_remaining"] = self.remaining_completion_tokens
+        result.usage["completion_budget_reserved"] = self.reserved_completion_tokens
         return result
 
 

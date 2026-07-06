@@ -2495,26 +2495,32 @@ def run_ours(
     disable_memory_cleaning = bool(features.get("disable_memory_cleaning")) or (
         adaptive_memory_cleaning and source_dataset == "pmc_patients"
     )
-    if disable_memory_cleaning:
-        ops = []
-    elif bool(features.get("critic_audit_only")):
-        audit_path = memory_path.with_name(f"{memory_path.stem}.critic-audit.jsonl")
-        audit_store = bootstrap_memory(case, audit_path, include_poison=bool(features.get("enable_polluted_memory")))
-        ops = apply_critique(
-            case,
-            audit_store,
-            client,
-            fail_on_llm_error=fail_on_llm_error,
-            enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
-        )
-    else:
-        ops = apply_critique(
-            case,
-            store,
-            client,
-            fail_on_llm_error=fail_on_llm_error,
-            enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
-        )
+    if hasattr(client, "reserved_completion_tokens"):
+        client.reserved_completion_tokens = min(256, int(client.completion_token_budget) // 2)
+    try:
+        if disable_memory_cleaning:
+            ops = []
+        elif bool(features.get("critic_audit_only")):
+            audit_path = memory_path.with_name(f"{memory_path.stem}.critic-audit.jsonl")
+            audit_store = bootstrap_memory(case, audit_path, include_poison=bool(features.get("enable_polluted_memory")))
+            ops = apply_critique(
+                case,
+                audit_store,
+                client,
+                fail_on_llm_error=fail_on_llm_error,
+                enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
+            )
+        else:
+            ops = apply_critique(
+                case,
+                store,
+                client,
+                fail_on_llm_error=fail_on_llm_error,
+                enforce_op_guard=not bool(features.get("disable_critic_op_guard")),
+            )
+    finally:
+        if hasattr(client, "reserved_completion_tokens"):
+            client.reserved_completion_tokens = 0
     prompt_ops = ops if bool(features.get("disable_sanitization_boundary")) else safe_memory_ops_for_prompt(case, ops)
     query = "final diagnosis longitudinal causal evidence treatment imaging pathology labs"
     top_k = resolve_top_k(case, strategy)
@@ -2592,7 +2598,8 @@ def run_ours(
         pred = verify_primary_with_evidence(case, pred)
         pred = evidence_gated_diagnosis_recall(case, pred, evidence_notes, diagnosis_candidates)
         pred = evidence_driven_diagnosis_rerank(case, pred, evidence_notes, diagnosis_candidates)
-        if profile != MEDICAL_ANSWER_ENTITY and source_dataset != "pmc_patients":
+        optional_budget_available = not hasattr(client, "remaining_completion_tokens") or client.remaining_completion_tokens >= 96
+        if profile != MEDICAL_ANSWER_ENTITY and source_dataset != "pmc_patients" and optional_budget_available:
             pred = llm_diagnosis_second_pass(
                 case,
                 pred,
@@ -2603,7 +2610,10 @@ def run_ours(
                 enable_normalization=not bool(features.get("disable_normalization")),
             )
         else:
-            reason = "pmc_source_evidence_primary_locked" if source_dataset == "pmc_patients" else "medical_answer_entity_option_locked"
+            if not optional_budget_available:
+                reason = "completion_budget_below_optional_pass_minimum"
+            else:
+                reason = "pmc_source_evidence_primary_locked" if source_dataset == "pmc_patients" else "medical_answer_entity_option_locked"
             pred["diagnosis_second_pass"] = {"enabled": False, "reason": reason}
         pred = select_primary_for_task_profile(
             case,
@@ -2650,6 +2660,9 @@ def run_ours(
             sample_rate=counterfactual_sample_rate,
             risk_threshold=counterfactual_risk_threshold,
         )
+        if hasattr(client, "remaining_completion_tokens") and client.remaining_completion_tokens < 96:
+            should_run_cf = False
+            cf_reasons = [*cf_reasons, "completion_budget_below_optional_audit_minimum"]
         pred["counterfactual_revision_triggered"] = False
         if not should_run_cf:
             verification = {
