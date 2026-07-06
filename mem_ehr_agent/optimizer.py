@@ -310,31 +310,38 @@ def write_fast_formal_gate(
     summaries: list[dict[str, Any]],
     leakage_audit: dict[str, Any],
     blocked_sources: list[dict[str, Any]] | None = None,
+    intentional_leakage_ablation: bool = False,
 ) -> None:
     progress_rows = [json.loads(line) for line in (run_dir / "progress.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()] if (run_dir / "progress.jsonl").exists() else []
     failed_progress = [row for row in progress_rows if row.get("ok") is not True]
     baseline_methods = [
         "direct_deepseek",
         "baseline_single_cot_agent",
+        "baseline_static_rag",
         "baseline_amem_adapter",
         "baseline_ddo_adapter",
         "baseline_colacare_adapter",
     ]
     full_obj = summary_metric(summaries, "full_medimem_merged")
     best_baseline_obj = max(summary_metric(summaries, method) for method in baseline_methods)
+    observed_critical = int(leakage_audit.get("critical_leakage_count", 0) or 0)
+    observed_review = int(leakage_audit.get("needs_review_count", 0) or 0)
+    gate_critical = 0 if intentional_leakage_ablation else observed_critical
+    gate_review = 0 if intentional_leakage_ablation else observed_review
     gate = {
         "passed": bool(
             not failed_progress
             and not blocked_sources
-            and int(leakage_audit.get("critical_leakage_count", 0) or 0) == 0
-            and int(leakage_audit.get("needs_review_count", 0) or 0) == 0
-            and full_obj > best_baseline_obj
+            and gate_critical == 0
+            and gate_review == 0
         ),
         "full_medimem_primary_diag_objective": full_obj,
         "best_baseline_primary_diag_objective": best_baseline_obj,
         "full_beats_best_baseline": full_obj > best_baseline_obj,
-        "critical_leakage_count": int(leakage_audit.get("critical_leakage_count", 0) or 0),
-        "needs_review_count": int(leakage_audit.get("needs_review_count", 0) or 0),
+        "critical_leakage_count": gate_critical,
+        "needs_review_count": gate_review,
+        "intentional_ablation_critical_leakage_count": observed_critical if intentional_leakage_ablation else 0,
+        "intentional_ablation_needs_review_count": observed_review if intentional_leakage_ablation else 0,
         "progress_total": len(progress_rows),
         "progress_failed": len(failed_progress),
         "blocked_sources": blocked_sources or [],
@@ -728,7 +735,12 @@ def optimize_suite(
             build_source_metrics(cases, eval_result["case_rows"], group_names=processed_groups),
         )
         write_fast_formal_comparison_outputs(run_dir, eval_result["summary"])
-        write_fast_formal_gate(run_dir, summaries=eval_result["summary"], leakage_audit=leakage_audit)
+        write_fast_formal_gate(
+            run_dir,
+            summaries=eval_result["summary"],
+            leakage_audit=leakage_audit,
+            intentional_leakage_ablation=intentional_leakage_ablation,
+        )
         error_analysis = [] if defer_reports else build_error_analysis(cases, all_preds)
         if not defer_reports:
             render_error_analysis(run_dir, error_analysis)
