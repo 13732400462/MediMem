@@ -22,7 +22,7 @@ if [[ ! -s "$CORE_DATASET" ]]; then
     --output "$CORE_DATASET"
 fi
 
-python -m mem_ehr_agent data-validate --dataset "$CORE_DATASET"
+python -m mem_ehr_agent data validate --dataset "$CORE_DATASET"
 [[ "$(wc -l < "$CORE_DATASET")" -eq 2000 ]] || { echo "expected 2000 core cases" >&2; exit 1; }
 
 for seed in $SEEDS; do

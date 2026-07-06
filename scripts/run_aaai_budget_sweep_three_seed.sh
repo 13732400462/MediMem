@@ -13,7 +13,7 @@ export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-qwen3-vl-8b-aaai}"
 
 cd "$ROOT"
 mkdir -p "$OUTPUT_ROOT"
-python -m mem_ehr_agent data-validate --dataset "$CORE_DATASET"
+python -m mem_ehr_agent data validate --dataset "$CORE_DATASET"
 
 for budget in $BUDGETS; do
   for seed in $SEEDS; do
