@@ -48,6 +48,37 @@ def test_dynamic_top_k_uses_complexity_and_evidence():
     assert resolve_top_k(long_case, strategy) == 8
 
 
+def test_strict_prediction_parse_failure_falls_back_with_error_marker():
+    class TruncatedJsonClient:
+        def __init__(self):
+            self.config = type("Config", (), {"max_tokens": 128})()
+            self.remaining_completion_tokens = 96
+
+        def chat(self, messages, *, temperature=0.1, max_tokens=None, json_mode=True):
+            return LLMResult(
+                text='{"primary_diagnosis": "chronic',
+                usage={"prompt_tokens": 7, "completion_tokens": 32, "total_tokens": 39, "calls": 1, "latency_ms": 1},
+                latency_s=0.001,
+            )
+
+    case = {
+        "case_id": "case_parse_fallback",
+        "source": "PMOA-TTS",
+        "events": [{"event_id": "ev_1", "time": 1, "type": "diagnosis", "text": "Confirmed pneumonia."}],
+        "labels": {"primary_diagnosis": "pneumonia", "diagnosis_list": ["pneumonia"]},
+    }
+    pred = run_llm_prediction(
+        case,
+        method="strict_parse_fallback_test",
+        client=TruncatedJsonClient(),
+        context=case_context(case),
+        fail_on_llm_error=True,
+    )
+    assert pred["llm_error_type"] == "malformed_json"
+    assert "LLM parse fallback reason" in pred["reasoning_summary"]
+    assert pred["usage"]["completion_tokens"] == 32
+
+
 def test_ablation_feature_state_and_fixed_top_k():
     strategy = {
         "top_k": 3,

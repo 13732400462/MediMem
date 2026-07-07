@@ -565,11 +565,17 @@ def run_llm_prediction(
     try:
         raise exc
     except Exception as exc:  # noqa: BLE001 - prediction should degrade to fallback, not crash the run
-        if fail_on_llm_error:
+        allow_strict_parse_fallback = os.environ.get("MEDICAL_STRICT_PARSE_FALLBACK", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if fail_on_llm_error and not allow_strict_parse_fallback:
             raise RuntimeError(f"LLM prediction returned malformed JSON for {case['case_id']} ({method}): {exc}") from exc
         pred = heuristic_predict(case, method, max_events=fallback_max_events, enable_normalization=enable_normalization)
-        pred["reasoning_summary"] += f" LLM fallback reason: {exc}"
+        pred["reasoning_summary"] += f" LLM parse fallback reason: {exc}"
         pred["llm_error"] = str(exc)
+        pred["llm_error_type"] = "malformed_json"
         pred["usage"] = result.usage
         return pred
 
