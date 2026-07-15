@@ -510,6 +510,8 @@ def load_frozen_sample_ids(path: str | Path) -> list[str]:
         rows = payload
     elif isinstance(payload, dict):
         rows = payload.get("sample_ids") or payload.get("selected_sample_ids") or payload.get("ids")
+        if rows is None and isinstance(payload.get("test"), dict):
+            rows = payload["test"].get("sample_ids")
         if rows is None:
             raise ValueError(f"Frozen sample manifest {path} has no sample_ids field.")
     else:

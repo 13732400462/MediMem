@@ -46,6 +46,12 @@ def test_frozen_sample_manifest_preserves_declared_order(tmp_path):
     assert [row["sample_id"] for row in select_frozen_samples(samples, ids)] == ["s2", "s1"]
 
 
+def test_frozen_sample_manifest_accepts_nested_test_split(tmp_path):
+    path = tmp_path / "split_manifest.json"
+    path.write_text(json.dumps({"test": {"sample_ids": ["s1"]}}), encoding="utf-8")
+    assert load_frozen_sample_ids(path) == ["s1"]
+
+
 def test_load_longmemeval_preserves_sessions_dates_and_evidence(tmp_path):
     path = tmp_path / "longmemeval_s_cleaned.json"
     path.write_text(
