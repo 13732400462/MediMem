@@ -1670,11 +1670,6 @@ def run_locomo_official_wrapper(
     retrieved = retrieve_locomo_memories(store, sample, top_k=top_k, coarse_k=coarse_k)
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
     prompt_context = (
-        f"[OFFICIAL_BASELINE]\n{method}\n"
-        f"[REPRODUCTION_LEVEL]\n{BASELINE_REPRODUCTION_LEVELS[method]}\n"
-        f"[ADAPTER_NOTE]\n{BASELINE_ADAPTER_NOTES[method]}\n"
-        f"[REPO]\n{repo}\n"
-        f"[PYTHON]\n{python}\n\n"
         "[RETRIEVED_MEMORY_CARDS]\n"
         f"{memory_context}\n\n"
         "[QUESTION]\n"
