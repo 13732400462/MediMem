@@ -162,6 +162,24 @@ def test_load_locomo_samples_from_official_json(tmp_path):
     assert samples[0]["turns"][0]["evidence_refs"] == ["D1:0"]
 
 
+def test_load_locomo_normalizes_combined_and_zero_padded_evidence(tmp_path):
+    path = tmp_path / "locomo.json"
+    payload = [
+        {
+            "qa": [{"question": "What?", "answer": "x", "category": 4, "evidence": ["D1:00; D1:1", "D"]}],
+            "conversation": {
+                "session_1_date_time": "Monday",
+                "session_1": [
+                    {"speaker": "A", "dia_id": "D1:0", "text": "first"},
+                    {"speaker": "B", "dia_id": "D1:1", "text": "second"},
+                ],
+            },
+        }
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert load_locomo_samples(path)[0]["evidence"] == ["D1:0", "D1:1"]
+
+
 def test_locomo_turns_build_jsonl_memory_cards(tmp_path):
     sample = {
         "sample_id": "conv-1__qa_0000",

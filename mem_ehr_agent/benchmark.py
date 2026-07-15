@@ -470,9 +470,16 @@ def load_locomo_samples(path: str | Path, *, limit: int | None = None) -> list[d
         context = conversation_context(item)
         conversation_id = str(item.get("sample_id") or item.get("conversation_id") or f"conv-{sample_idx}")
         turns = locomo_turns(item, sample_index=sample_idx, sample_id=conversation_id)
+        valid_evidence_refs = {str(ref) for turn in turns for ref in turn.get("evidence_refs", [])}
         for qa_idx, qa in enumerate(item.get("qa", [])):
             answer = qa.get("adversarial_answer") if qa.get("category") == 5 and qa.get("adversarial_answer") else qa.get("answer")
             category = qa.get("category")
+            evidence: list[str] = []
+            for raw_ref in qa.get("evidence", []):
+                for session, turn_index in re.findall(r"D:?(\d+):(\d+)", str(raw_ref)):
+                    candidate = f"D{int(session)}:{int(turn_index)}"
+                    if candidate in valid_evidence_refs and candidate not in evidence:
+                        evidence.append(candidate)
             samples.append(
                 {
                     "sample_id": f"{conversation_id}__qa_{qa_idx:04d}",
@@ -487,7 +494,7 @@ def load_locomo_samples(path: str | Path, *, limit: int | None = None) -> list[d
                     "turn_count": len(turns),
                     "question": normalize_answer(qa.get("question")),
                     "answer": normalize_answer(answer),
-                    "evidence": qa.get("evidence", []),
+                    "evidence": evidence,
                     "metadata": {"conversation_index": sample_idx, "qa_index": qa_idx, "category": category},
                 }
             )
