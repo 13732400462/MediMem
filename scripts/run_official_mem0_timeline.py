@@ -163,7 +163,7 @@ def run_worker(
             memory.add(
                 chunk["text"],
                 user_id=conversation_id,
-                infer=True,
+                infer=False,
                 metadata={"chunk_index": chunk_index, "evidence_refs": chunk["evidence_refs"]},
             )
         append_jsonl(worker_dir / "progress.jsonl", {"stage": "memory_ready", "conversation_id": conversation_id, "chunks": len(chunks)})
@@ -235,7 +235,7 @@ def main() -> None:
         "top_k": args.top_k,
         "workers": workers,
         "endpoint": args.endpoint,
-        "adapter_note": "Official Memory.add/Memory.search; the adapter only maps frozen timelines, evidence refs, endpoint, and unified metrics.",
+        "adapter_note": "Official Memory.add(infer=False)/Memory.search; raw frozen timeline chunks are stored losslessly so ingestion policy cannot discard benchmark evidence.",
     }
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     results: list[dict[str, Any]] = []
