@@ -432,6 +432,7 @@ def locomo_turns(sample: dict[str, Any], *, sample_index: int = 0, sample_id: st
                     "dia_id": dia_id,
                     "tags": ["dialogue", "locomo"],
                     "conversation_id": conversation_id,
+                    "evidence_refs": [dia_id],
                 }
             )
     return turns
@@ -644,9 +645,7 @@ def load_dialsim_samples(
                                 question = question + "\nOptions: " + " | ".join(normalize_answer(item) for item in option_values)
                             if not question or not answer:
                                 continue
-                            evidence: list[str] = []
-                            if qa_idx < len(evidence_indexes):
-                                evidence.append(f"timeline:{evidence_indexes[qa_idx]}")
+                            evidence_index = evidence_indexes[qa_idx] if qa_idx < len(evidence_indexes) else None
                             candidate = {
                                 "sample_id": f"{subset}__r{global_row:05d}__s{session:04d}__{family}__{qa_idx:05d}",
                                 "conversation_id": f"dialsim::{subset}::r{global_row:05d}",
@@ -659,7 +658,7 @@ def load_dialsim_samples(
                                 "turn_count": len(timeline),
                                 "question": question,
                                 "answer": answer,
-                                "evidence": evidence,
+                                "evidence": [],
                                 "metadata": {
                                     "subset": subset,
                                     "episode": episode,
@@ -667,6 +666,8 @@ def load_dialsim_samples(
                                     "question_family": family,
                                     "source_file": str(parquet_path),
                                     "source_row": global_row,
+                                    "official_question_index": evidence_index,
+                                    "evidence_note": "DialSim *_idxes is an official QA/oracle index, not a runtime timeline source ID.",
                                 },
                             }
                             seen_by_subset[subset] += 1
@@ -803,7 +804,7 @@ def _rhelm_document_turns(path: Path, character: str, source_type: str, *, chunk
     date = "-".join(date_match.groups()) if date_match else path.stem[:10]
     source_refs = [path.name]
     if source_type == "email" and date_match:
-        source_refs.append(f"Emails_{date}:Email")
+        source_refs.extend([f"Emails_{date}", f"Emails_{date}:Email"])
     return [
         {
             "dia_id": f"{path.name}:chunk-{idx}",
@@ -844,6 +845,14 @@ def load_rhelm_samples(path: str | Path, *, limit: int | None = None) -> list[di
                 turns.extend(_rhelm_document_turns(attachment_path, character, "attachment"))
         for row_idx, row in enumerate(read_jsonl(qa_path)):
             sample_id = str(row.get("id") or f"{character}_{row_idx:04d}")
+            evidence: list[str] = []
+            for raw_ref in row.get("supporting_evidence", []):
+                ref = str(raw_ref)
+                match = re.fullmatch(r"(20\d{2}-\d{2}-\d{2}):(\d+(?:,\d+)+)", ref)
+                if match:
+                    evidence.extend(f"{match.group(1)}:{item}" for item in match.group(2).split(","))
+                else:
+                    evidence.append(ref)
             samples.append(
                 {
                     "sample_id": sample_id,
@@ -857,7 +866,7 @@ def load_rhelm_samples(path: str | Path, *, limit: int | None = None) -> list[di
                     "turn_count": len(turns),
                     "question": normalize_answer(row.get("question")),
                     "answer": normalize_answer(row.get("answer")),
-                    "evidence": [str(item) for item in row.get("supporting_evidence", [])],
+                    "evidence": evidence,
                     "question_date": row.get("question_date"),
                     "metadata": {
                         "character": character,
@@ -1908,6 +1917,7 @@ def prediction_metric_values(sample: dict[str, Any], pred: dict[str, Any]) -> di
         "meteor": lightweight_meteor(answer, gold),
         "sbert_similarity": sbert,
         "avg_tokens": float((pred.get("usage") or {}).get("total_tokens", 0) or 0),
+        "latency_ms": float((pred.get("usage") or {}).get("latency_ms", 0) or 0),
         "retrieved_memory_count": float(pred.get("retrieved_memory_count", 0) or 0),
         "guard_pass_rate": 1.0 if bool(pred.get("guard_passed", True)) else 0.0,
         "fallback_rate": 1.0 if pred.get("fallback_reason") else 0.0,
@@ -1992,6 +2002,7 @@ def evaluate_benchmark_predictions(samples: list[dict[str, Any]], predictions: l
             "qa_f1",
             "bleu1",
             "avg_tokens",
+            "latency_ms",
             "retrieved_memory_count",
         ),
         include_category=False,

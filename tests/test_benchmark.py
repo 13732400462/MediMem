@@ -159,6 +159,7 @@ def test_load_locomo_samples_from_official_json(tmp_path):
     assert samples[0]["category_name"] == "temporal"
     assert samples[0]["turns"][0]["event_id"] == "D1:0"
     assert samples[0]["turns"][0]["tags"] == ["dialogue", "locomo"]
+    assert samples[0]["turns"][0]["evidence_refs"] == ["D1:0"]
 
 
 def test_locomo_turns_build_jsonl_memory_cards(tmp_path):

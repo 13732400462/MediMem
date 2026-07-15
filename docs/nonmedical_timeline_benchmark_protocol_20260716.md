@@ -15,7 +15,7 @@
 
 每个冻结清单必须记录样本 ID、来源文件 SHA-256、抽样 seed、各子集数量和清单 SHA-256。开发集与测试集不得重叠。LoCoMo 继续使用既有 200 题独立开发集选出的 `top-k=32`；正式测试不再调参。为避免逐数据集测试集调参，检索预算 `top-k=32` 在其余三个数据集上也保持冻结。
 
-DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before_event_unans`、`easy_qs_dont_know_unans` 与 `easy_qs_dont_know_unans_time`。这些官方字段具有逐题 `*_idxes` 时间线证据位置，可计算统一的 Evidence R@5；不带可核验逐题证据索引的 hard QA 不进入正文统一指标实验。
+DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before_event_unans`、`easy_qs_dont_know_unans` 与 `easy_qs_dont_know_unans_time`。逐题 `*_idxes` 经官方包与全量数据核验后属于 QA/oracle 索引，并非可直接映射到运行时 Script 时间线条目的来源 ID，因此不得伪装成 Evidence R@5 gold；DialSim 在正文改报其原生重要指标平均响应延迟，官方索引保留在逐题 metadata 供审计。
 
 ## 方法
 
@@ -44,7 +44,8 @@ DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before
 ## 统一主指标
 
 - `Answer Acc. ↑`：使用固定 judge prompt 和固定 evaluator 对语义正确性作二元判断。judge 输入只能包含问题、参考答案和方法输出，不包含方法名称。
-- `Evidence R@5 ↑`：前五条实际检索结果命中官方 supporting evidence 的样本级 recall，再对有证据标注的适用样本取平均。Direct 无检索，表中记为 `--`，不得当作 0 参与平均。
+- `Evidence R@5 ↑`：前五条实际检索结果命中官方 supporting evidence 的样本级 recall，再对有可映射来源证据标注的适用样本取平均。Direct、Letta core memory 以及 DialSim 无可比的排序来源证据，表中记为 `--`，不得当作 0 参与平均。
+- `Latency (ms) ↓`：DialSim 使用端到端单题 QA 延迟，保留其实时模拟器的原生评价重点；不与 Evidence R@5 混算。
 - `Average`：四个数据集的 Answer Acc. 算术平均；Evidence R@5 只对具有检索输出的方法按四数据集算术平均。
 
 附录保留 LoCoMo QA F1/BLEU-1、LongMemEval 官方 auto-eval、DialSim time-constrained accuracy/latency、RHELM 类别准确率，以及每种方法的平均 token、调用次数、延迟和失败数。
@@ -64,4 +65,4 @@ DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before
 
 ## 正文表格结构
 
-第一层表头依次为 LoCoMo、LongMemEval、DialSim、RHELM、Average；第二层每个数据源包含 `Answer Acc.` 和 `Evidence R@5`。方法在第一列。最佳结果加粗、第二名加下划线；成本列不参与最佳/次优标记。
+第一层表头依次为 LoCoMo、LongMemEval、DialSim、RHELM、Average；LoCoMo、LongMemEval 与 RHELM 的第二层为 `Answer Acc.`、`Evidence R@5`，DialSim 为 `Answer Acc.`、`Latency (ms)`；Average 为四源 `Answer Acc.` 与三个具备来源证据数据集的 `Evidence R@5`。方法在第一列。最佳结果加粗、第二名加下划线；成本列不参与最佳/次优标记。
