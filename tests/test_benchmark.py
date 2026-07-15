@@ -80,13 +80,22 @@ def test_load_longmemeval_preserves_sessions_dates_and_evidence(tmp_path):
 
 
 def test_load_rhelm_combines_conversation_email_attachment_and_qa(tmp_path):
-    root = tmp_path / "data"
+    repo = tmp_path / "rhelm"
+    root = repo / "data"
     for name in ("QA_final", "conversations/Alice", "emails/Alice", "attachments/Alice"):
         (root / name).mkdir(parents=True, exist_ok=True)
-    (root / "conversations/Alice/2025-01-01.json").write_text(
-        json.dumps({"messages": [{"role": "user", "content": "I moved to Boston."}]}), encoding="utf-8"
+    (root / "conversations/Alice/conversation_2025_01_01.json").write_text(
+        json.dumps(
+            {
+                "date": "2025-01-01",
+                "conversation": [
+                    {"turn": 1, "timestamp": "2025-01-01T09:00:00", "user": "I moved to Boston.", "assistant": "Noted."}
+                ],
+            }
+        ),
+        encoding="utf-8",
     )
-    (root / "emails/Alice/mail.txt").write_text("Subject: travel\nBoston plans", encoding="utf-8")
+    (root / "emails/Alice/01_email_2025_01_01.txt").write_text("Subject: travel\nBoston plans", encoding="utf-8")
     (root / "attachments/Alice/note.md").write_text("# Note\nBoston", encoding="utf-8")
     (root / "QA_final/low_score_qa_Alice_all_validated.jsonl").write_text(
         json.dumps(
@@ -96,16 +105,18 @@ def test_load_rhelm_combines_conversation_email_attachment_and_qa(tmp_path):
                 "answer": "Boston",
                 "question_date": "2025-02-01",
                 "question_type": "fact",
-                "supporting_evidence": ["2025-01-01:0"],
+                "supporting_evidence": ["2025-01-01:1"],
             }
         )
         + "\n",
         encoding="utf-8",
     )
-    samples = load_rhelm_samples(root)
+    samples = load_rhelm_samples(repo)
     assert len(samples) == 1
-    assert samples[0]["evidence"] == ["2025-01-01:0"]
+    assert samples[0]["evidence"] == ["2025-01-01:1"]
     assert {turn["speaker"] for turn in samples[0]["turns"]} >= {"user", "email", "attachment"}
+    assert "2025-01-01:1" in samples[0]["turns"][0]["evidence_refs"]
+    assert any("Emails_2025-01-01:Email" in turn["evidence_refs"] for turn in samples[0]["turns"])
 
 
 def test_static_rag_and_evidence_recall_use_actual_top_five_refs():

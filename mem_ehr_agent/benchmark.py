@@ -736,6 +736,32 @@ def load_longmemeval_samples(path: str | Path, *, limit: int | None = None) -> l
 
 def _rhelm_json_turns(path: Path, character: str) -> list[dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict) and isinstance(data.get("conversation"), list):
+        date = str(data.get("date") or "") or "-".join(path.stem.split("_")[-3:])
+        turns: list[dict[str, Any]] = []
+        for idx, item in enumerate(data["conversation"]):
+            if not isinstance(item, dict):
+                continue
+            turn_number = str(item.get("turn") or idx + 1)
+            shared_ref = f"{date}:{turn_number}"
+            timestamp = str(item.get("timestamp") or date)
+            for role in ("user", "assistant"):
+                text = normalize_answer(item.get(role))
+                if not text:
+                    continue
+                turns.append(
+                    {
+                        "dia_id": f"{path.stem}:{turn_number}:{role}",
+                        "session": path.stem,
+                        "session_date": date,
+                        "time": timestamp,
+                        "speaker": role,
+                        "text": text,
+                        "tags": ["dialogue", "rhelm", character],
+                        "evidence_refs": [shared_ref, f"{path.name}:{turn_number}:{role}"],
+                    }
+                )
+        return turns
     if isinstance(data, dict):
         values: Any = data.get("messages") or data.get("turns") or data.get("conversation") or data.get("dialogue") or data
     else:
@@ -773,16 +799,21 @@ def _rhelm_json_turns(path: Path, character: str) -> list[dict[str, Any]]:
 def _rhelm_document_turns(path: Path, character: str, source_type: str, *, chunk_chars: int = 1600) -> list[dict[str, Any]]:
     text = path.read_text(encoding="utf-8", errors="replace")
     chunks = [text[start : start + chunk_chars] for start in range(0, len(text), chunk_chars)] or [text]
+    date_match = re.search(r"(20\d{2})_(\d{2})_(\d{2})", path.stem)
+    date = "-".join(date_match.groups()) if date_match else path.stem[:10]
+    source_refs = [path.name]
+    if source_type == "email" and date_match:
+        source_refs.append(f"Emails_{date}:Email")
     return [
         {
             "dia_id": f"{path.name}:chunk-{idx}",
             "session": path.name,
-            "session_date": path.stem[:10],
-            "time": path.stem[:10],
+            "session_date": date,
+            "time": date,
             "speaker": source_type,
             "text": chunk,
             "tags": [source_type, "rhelm", character],
-            "evidence_refs": [path.name, f"{path.name}:chunk-{idx}"],
+            "evidence_refs": [*source_refs, f"{path.name}:chunk-{idx}"],
         }
         for idx, chunk in enumerate(chunks)
         if normalize_answer(chunk)
@@ -791,6 +822,8 @@ def _rhelm_document_turns(path: Path, character: str, source_type: str, *, chunk
 
 def load_rhelm_samples(path: str | Path, *, limit: int | None = None) -> list[dict[str, Any]]:
     root = Path(path)
+    if not (root / "QA_final").is_dir() and (root / "data" / "QA_final").is_dir():
+        root = root / "data"
     qa_files = sorted((root / "QA_final").glob("*.jsonl"))
     samples: list[dict[str, Any]] = []
     for qa_path in qa_files:
