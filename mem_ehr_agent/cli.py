@@ -148,6 +148,8 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         locomo_top_k=args.locomo_top_k,
         locomo_coarse_k=args.locomo_coarse_k,
         top_k_sweep=parse_int_list(args.top_k_sweep),
+        judge_answers=args.judge_answers,
+        sample_manifest=args.sample_manifest,
     )
     print(f"run_dir={run_dir}")
 
@@ -340,7 +342,16 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_run.add_argument(
         "--dataset",
         required=True,
-        choices=["locomo", "dialsim", "memoryos_native", "meminsight_native", "gmemory_native", "ddo_native"],
+        choices=[
+            "locomo",
+            "dialsim",
+            "longmemeval",
+            "rhelm",
+            "memoryos_native",
+            "meminsight_native",
+            "gmemory_native",
+            "ddo_native",
+        ],
     )
     benchmark_run.add_argument("--methods", required=True, help="Comma-separated methods, e.g. ours,amem")
     benchmark_run.add_argument("--dataset-path", default=None)
@@ -353,6 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_run.add_argument("--locomo-top-k", type=int, default=8, help="Final LoCoMo memory cards passed to ours QA.")
     benchmark_run.add_argument("--locomo-coarse-k", type=int, default=32, help="Coarse LoCoMo retrieval pool before reranking.")
     benchmark_run.add_argument("--top-k-sweep", default=None, help="Comma-separated LoCoMo ours top-k sweep, e.g. 8,16,32.")
+    benchmark_run.add_argument("--judge-answers", action="store_true", help="Run the frozen blinded semantic-correctness judge.")
+    benchmark_run.add_argument("--sample-manifest", default=None, help="Frozen JSON sample-ID manifest; disables resampling.")
     benchmark_run.set_defaults(func=cmd_benchmark_run)
     locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")
     locomo_parallel.add_argument("--methods-a", default="direct,amem,memoryos,medimem")

@@ -10,10 +10,12 @@
 |---|---:|---|
 | LoCoMo | 既有 seed `20260606` 冻结测试 1,000 QA；不得重新抽样 | 多会话双人长期生活事件 |
 | LongMemEval-S | 官方 cleaned 版本全部 500 QA | 多会话助手记忆、时间推理、知识更新与拒答 |
-| DialSim / LongDialQA | Friends、Big Bang、The Office 三子集分层抽样共 1,000 QA；seed `20260716` | 五年多方剧情时间线 |
+| DialSim / LongDialQA | Friends、Big Bang、The Office 三子集按官方带 `*_idxes` 证据映射的 easy QA 家族分层抽样共 1,000 QA；seed `20260716` | 五年多方剧情时间线 |
 | RHELM | 官方发布的全部 1,305 QA | 对话、邮件和附件共同演化的个人时间线 |
 
 每个冻结清单必须记录样本 ID、来源文件 SHA-256、抽样 seed、各子集数量和清单 SHA-256。开发集与测试集不得重叠。LoCoMo 继续使用既有 200 题独立开发集选出的 `top-k=32`；正式测试不再调参。为避免逐数据集测试集调参，检索预算 `top-k=32` 在其余三个数据集上也保持冻结。
+
+DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before_event_unans`、`easy_qs_dont_know_unans` 与 `easy_qs_dont_know_unans_time`。这些官方字段具有逐题 `*_idxes` 时间线证据位置，可计算统一的 Evidence R@5；不带可核验逐题证据索引的 hard QA 不进入正文统一指标实验。
 
 ## 方法
 

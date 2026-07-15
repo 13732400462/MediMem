@@ -75,6 +75,22 @@ NATIVE_BENCHMARKS: dict[str, NativeBenchmarkSpec] = {
         official_repo="https://huggingface.co/datasets/jiho283",
         notes="DialSim is kept in its native parquet subsets; pyarrow is required to read it locally.",
     ),
+    "longmemeval": NativeBenchmarkSpec(
+        name="longmemeval",
+        track="long_term_interactive_memory",
+        default_path="data/native/longmemeval/longmemeval_s_cleaned.json",
+        official_methods=(),
+        official_repo="https://github.com/xiaowu0162/LongMemEval",
+        notes="The frozen protocol uses all 500 instances from the cleaned LongMemEval-S release.",
+    ),
+    "rhelm": NativeBenchmarkSpec(
+        name="rhelm",
+        track="heterogeneous_evolving_memory",
+        default_path="data/native/rhelm/data",
+        official_methods=(),
+        official_repo="https://github.com/microsoft/RHELM",
+        notes="The frozen protocol uses every validated QA item and all released conversation, email, and attachment sources.",
+    ),
     "memoryos_native": NativeBenchmarkSpec(
         name="memoryos_native",
         track="official_external",
@@ -114,7 +130,7 @@ NATIVE_BENCHMARKS: dict[str, NativeBenchmarkSpec] = {
 }
 
 
-LOCAL_METHODS = {"direct", "ours", "medimem", "amem"}
+LOCAL_METHODS = {"direct", "static_rag", "ours", "medimem", "amem"}
 OFFICIAL_WRAPPER_METHODS = {"memoryos", "meminsight", "gmemory", "ddo"}
 BASELINE_ENV_ROOT = Path("/home/syh/A-mem/baseline_envs")
 DEFAULT_BASELINE_REPOS = {
@@ -176,8 +192,8 @@ FULL_CONTEXT_SHORTCUT_ADVICE = (
 
 
 def make_benchmark_run_dir(root: str | Path = "runs", *, prefix: str = "benchmark") -> Path:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = Path(root) / f"{prefix}_{stamp}"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = Path(root) / f"{prefix}_{stamp}_pid{os.getpid()}"
     ensure_dir(path / "predictions")
     return path
 
@@ -488,33 +504,332 @@ def sample_benchmark_rows(samples: list[dict[str, Any]], *, sample_n: int | None
     return rng.sample(samples, sample_n)
 
 
-def load_dialsim_samples(path: str | Path, *, limit: int | None = None) -> list[dict[str, Any]]:
+def load_frozen_sample_ids(path: str | Path) -> list[str]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("sample_ids") or payload.get("selected_sample_ids") or payload.get("ids")
+        if rows is None:
+            raise ValueError(f"Frozen sample manifest {path} has no sample_ids field.")
+    else:
+        raise ValueError(f"Frozen sample manifest {path} must contain a JSON list or object.")
+    ids = [str(item.get("sample_id") if isinstance(item, dict) else item) for item in rows]
+    if not ids or any(not item or item == "None" for item in ids):
+        raise ValueError(f"Frozen sample manifest {path} contains an empty sample ID.")
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"Frozen sample manifest {path} contains duplicate sample IDs.")
+    return ids
+
+
+def select_frozen_samples(samples: list[dict[str, Any]], sample_ids: list[str]) -> list[dict[str, Any]]:
+    by_id = {str(sample["sample_id"]): sample for sample in samples}
+    missing = [sample_id for sample_id in sample_ids if sample_id not in by_id]
+    if missing:
+        raise ValueError(f"Frozen sample IDs not present in loaded dataset: {missing[:10]}")
+    return [by_id[sample_id] for sample_id in sample_ids]
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_file_manifest(path: str | Path) -> list[dict[str, Any]]:
+    root = Path(path)
+    files = [root] if root.is_file() else sorted(item for item in root.rglob("*") if item.is_file())
+    return [
+        {
+            "path": str(item),
+            "relative_path": item.name if root.is_file() else str(item.relative_to(root)),
+            "bytes": item.stat().st_size,
+            "sha256": sha256_file(item),
+        }
+        for item in files
+    ]
+
+
+def load_dialsim_samples(
+    path: str | Path,
+    *,
+    limit: int | None = None,
+    sample_n: int | None = None,
+    random_seed: int = 20260716,
+) -> list[dict[str, Any]]:
     try:
         import pyarrow.parquet as pq  # type: ignore
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("DialSim native loading requires pyarrow. Install pyarrow on the server to run this benchmark.") from exc
     root = Path(path)
-    parquet_files = sorted(root.rglob("*.parquet"))
+    parquet_files_by_subset: dict[str, list[Path]] = {}
+    for parquet_path in sorted(root.rglob("*.parquet")):
+        parquet_files_by_subset.setdefault(parquet_path.parent.name, []).append(parquet_path)
+    if not parquet_files_by_subset:
+        return []
+    target_total = sample_n or limit
+    if target_total is None:
+        raise ValueError("DialSim loading requires sample_n or limit because the official parquet contains very large QA arrays.")
+    subsets = sorted(parquet_files_by_subset)
+    base, remainder = divmod(target_total, len(subsets))
+    quotas = {subset: base + (1 if idx < remainder else 0) for idx, subset in enumerate(subsets)}
+    rng = random.Random(random_seed)
+    reservoirs: dict[str, list[dict[str, Any]]] = {subset: [] for subset in subsets}
+    seen_by_subset = {subset: 0 for subset in subsets}
+    question_families = (
+        "easy_qs_ans_w_time",
+        "easy_qs_ans_wo_time",
+        "easy_qs_before_event_unans",
+        "easy_qs_dont_know_unans",
+        "easy_qs_dont_know_unans_time",
+    )
+    parquet_columns = ["Episode", "Session", "Date", "Script"]
+    for family in question_families:
+        parquet_columns.extend(
+            [
+                f"{family}_questions",
+                f"{family}_options",
+                f"{family}_answers",
+                f"{family}_idxes",
+            ]
+        )
+    for subset in subsets:
+        history: list[dict[str, Any]] = []
+        global_row = 0
+        for parquet_path in parquet_files_by_subset[subset]:
+            parquet = pq.ParquetFile(parquet_path)
+            available_columns = [column for column in parquet_columns if column in parquet.schema_arrow.names]
+            for batch in parquet.iter_batches(batch_size=1, columns=available_columns):
+                for row in batch.to_pylist():
+                    session = int(row.get("Session") or len(history) + 1)
+                    episode = normalize_answer(row.get("Episode"))
+                    date = normalize_answer(row.get("Date"))
+                    script = normalize_answer(row.get("Script"))
+                    if script:
+                        history.append(
+                            {
+                                "dia_id": f"timeline:{global_row}",
+                                "event_id": f"episode:{episode}",
+                                "session": session,
+                                "session_date": date,
+                                "time": date,
+                                "speaker": "multi-party-script",
+                                "text": script,
+                                "tags": ["dialogue", "dialsim", subset],
+                                "evidence_refs": [f"timeline:{global_row}", f"episode:{episode}"],
+                            }
+                        )
+                    timeline = tuple(history)
+                    for family in question_families:
+                        questions = row.get(f"{family}_questions") or []
+                        answers = row.get(f"{family}_answers") or []
+                        options = row.get(f"{family}_options") or []
+                        evidence_indexes = row.get(f"{family}_idxes") or []
+                        if not isinstance(questions, list) or not isinstance(answers, list):
+                            continue
+                        for qa_idx, (question_item, answer_item) in enumerate(zip(questions, answers)):
+                            if isinstance(question_item, dict):
+                                question = normalize_answer(
+                                    question_item.get("default") or next((value for value in question_item.values() if value), "")
+                                )
+                            else:
+                                question = normalize_answer(question_item)
+                            answer = normalize_answer(answer_item)
+                            option_values = options[qa_idx] if qa_idx < len(options) and isinstance(options[qa_idx], list) else []
+                            if option_values:
+                                question = question + "\nOptions: " + " | ".join(normalize_answer(item) for item in option_values)
+                            if not question or not answer:
+                                continue
+                            evidence: list[str] = []
+                            if qa_idx < len(evidence_indexes):
+                                evidence.append(f"timeline:{evidence_indexes[qa_idx]}")
+                            candidate = {
+                                "sample_id": f"{subset}__r{global_row:05d}__s{session:04d}__{family}__{qa_idx:05d}",
+                                "conversation_id": f"dialsim::{subset}::r{global_row:05d}",
+                                "dataset": "dialsim",
+                                "split": subset,
+                                "category_name": family,
+                                "context": "",
+                                "turns": timeline,
+                                "context_line_count": len(timeline),
+                                "turn_count": len(timeline),
+                                "question": question,
+                                "answer": answer,
+                                "evidence": evidence,
+                                "metadata": {
+                                    "subset": subset,
+                                    "episode": episode,
+                                    "session": session,
+                                    "question_family": family,
+                                    "source_file": str(parquet_path),
+                                    "source_row": global_row,
+                                },
+                            }
+                            seen_by_subset[subset] += 1
+                            seen = seen_by_subset[subset]
+                            reservoir = reservoirs[subset]
+                            quota = quotas[subset]
+                            if len(reservoir) < quota:
+                                reservoir.append(candidate)
+                            else:
+                                replacement = rng.randrange(seen)
+                                if replacement < quota:
+                                    reservoir[replacement] = candidate
+                    global_row += 1
+    return [sample for subset in subsets for sample in reservoirs[subset]]
+
+
+def load_longmemeval_samples(path: str | Path, *, limit: int | None = None) -> list[dict[str, Any]]:
+    rows = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     samples: list[dict[str, Any]] = []
-    for parquet_path in parquet_files:
-        subset = parquet_path.parent.name
-        table = pq.read_table(parquet_path)
-        for row_idx, row in enumerate(table.to_pylist()):
-            context = normalize_answer(row.get("context") or row.get("dialogue") or row.get("conversation") or row)
-            question = normalize_answer(row.get("question") or row.get("query") or "What should be remembered from this dialogue?")
-            answer = normalize_answer(row.get("answer") or row.get("target") or row.get("response") or row.get("summary"))
-            if not context or not answer:
-                continue
+    for row_idx, row in enumerate(rows):
+        session_ids = [str(item) for item in row.get("haystack_session_ids", [])]
+        dates = [str(item) for item in row.get("haystack_dates", [])]
+        sessions = row.get("haystack_sessions", [])
+        turns: list[dict[str, Any]] = []
+        for session_idx, session_turns in enumerate(sessions):
+            session_id = session_ids[session_idx] if session_idx < len(session_ids) else f"session-{session_idx:04d}"
+            date = dates[session_idx] if session_idx < len(dates) else ""
+            for turn_idx, turn in enumerate(session_turns or []):
+                text = normalize_answer(turn.get("content") if isinstance(turn, dict) else turn)
+                if not text:
+                    continue
+                turns.append(
+                    {
+                        "dia_id": f"{session_id}:{turn_idx}",
+                        "session": session_id,
+                        "session_date": date,
+                        "time": date,
+                        "speaker": str(turn.get("role") or "") if isinstance(turn, dict) else "",
+                        "text": text,
+                        "tags": ["dialogue", "longmemeval"],
+                        "evidence_refs": [session_id, f"{session_id}:{turn_idx}"],
+                    }
+                )
+        sample_id = str(row.get("question_id") or f"longmemeval_{row_idx:04d}")
+        samples.append(
+            {
+                "sample_id": sample_id,
+                "conversation_id": sample_id,
+                "dataset": "longmemeval",
+                "split": "longmemeval_s_cleaned",
+                "category_name": str(row.get("question_type") or "unknown"),
+                "context": "",
+                "turns": turns,
+                "context_line_count": len(turns),
+                "turn_count": len(turns),
+                "question": normalize_answer(row.get("question")),
+                "answer": normalize_answer(row.get("answer")),
+                "evidence": [str(item) for item in row.get("answer_session_ids", [])],
+                "question_date": row.get("question_date"),
+                "metadata": {"question_type": row.get("question_type"), "source_row": row_idx},
+            }
+        )
+        if limit and len(samples) >= limit:
+            break
+    return samples
+
+
+def _rhelm_json_turns(path: Path, character: str) -> list[dict[str, Any]]:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
+        values: Any = data.get("messages") or data.get("turns") or data.get("conversation") or data.get("dialogue") or data
+    else:
+        values = data
+    if isinstance(values, dict):
+        values = list(values.values())
+    if not isinstance(values, list):
+        values = [values]
+    turns: list[dict[str, Any]] = []
+    date = path.stem[:10]
+    for idx, item in enumerate(values):
+        if isinstance(item, dict):
+            text = normalize_answer(item.get("content") or item.get("text") or item.get("message") or item.get("utterance") or item)
+            speaker = normalize_answer(item.get("role") or item.get("speaker") or item.get("name"))
+        else:
+            text = normalize_answer(item)
+            speaker = ""
+        if not text:
+            continue
+        turns.append(
+            {
+                "dia_id": f"{path.stem}:{idx}",
+                "session": path.stem,
+                "session_date": date,
+                "time": date,
+                "speaker": speaker,
+                "text": text,
+                "tags": ["dialogue", "rhelm", character],
+                "evidence_refs": [f"{date}:{idx}", f"{path.name}:{idx}"],
+            }
+        )
+    return turns
+
+
+def _rhelm_document_turns(path: Path, character: str, source_type: str, *, chunk_chars: int = 1600) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    chunks = [text[start : start + chunk_chars] for start in range(0, len(text), chunk_chars)] or [text]
+    return [
+        {
+            "dia_id": f"{path.name}:chunk-{idx}",
+            "session": path.name,
+            "session_date": path.stem[:10],
+            "time": path.stem[:10],
+            "speaker": source_type,
+            "text": chunk,
+            "tags": [source_type, "rhelm", character],
+            "evidence_refs": [path.name, f"{path.name}:chunk-{idx}"],
+        }
+        for idx, chunk in enumerate(chunks)
+        if normalize_answer(chunk)
+    ]
+
+
+def load_rhelm_samples(path: str | Path, *, limit: int | None = None) -> list[dict[str, Any]]:
+    root = Path(path)
+    qa_files = sorted((root / "QA_final").glob("*.jsonl"))
+    samples: list[dict[str, Any]] = []
+    for qa_path in qa_files:
+        prefix = "low_score_qa_"
+        suffix = "_all_validated"
+        character = qa_path.stem
+        if character.startswith(prefix):
+            character = character[len(prefix) :]
+        if character.endswith(suffix):
+            character = character[: -len(suffix)]
+        turns: list[dict[str, Any]] = []
+        for conversation_path in sorted((root / "conversations" / character).glob("*.json")):
+            turns.extend(_rhelm_json_turns(conversation_path, character))
+        for email_path in sorted((root / "emails" / character).glob("*.txt")):
+            turns.extend(_rhelm_document_turns(email_path, character, "email"))
+        for attachment_path in sorted((root / "attachments" / character).glob("*")):
+            if attachment_path.is_file():
+                turns.extend(_rhelm_document_turns(attachment_path, character, "attachment"))
+        for row_idx, row in enumerate(read_jsonl(qa_path)):
+            sample_id = str(row.get("id") or f"{character}_{row_idx:04d}")
             samples.append(
                 {
-                    "sample_id": f"{subset}__{parquet_path.stem}__{row_idx:06d}",
-                    "dataset": "dialsim",
-                    "split": subset,
-                    "context": context,
-                    "question": question,
-                    "answer": answer,
-                    "evidence": [],
-                    "metadata": {"subset": subset, "source_file": str(parquet_path)},
+                    "sample_id": sample_id,
+                    "conversation_id": f"rhelm::{character}",
+                    "dataset": "rhelm",
+                    "split": "official_validated",
+                    "category_name": str(row.get("question_type") or "unknown"),
+                    "context": "",
+                    "turns": tuple(turns),
+                    "context_line_count": len(turns),
+                    "turn_count": len(turns),
+                    "question": normalize_answer(row.get("question")),
+                    "answer": normalize_answer(row.get("answer")),
+                    "evidence": [str(item) for item in row.get("supporting_evidence", [])],
+                    "question_date": row.get("question_date"),
+                    "metadata": {
+                        "character": character,
+                        "question_type": row.get("question_type"),
+                        "characteristics": row.get("characteristics", []),
+                        "source_file": str(qa_path),
+                    },
                 }
             )
             if limit and len(samples) >= limit:
@@ -557,6 +872,10 @@ def load_native_samples(dataset: str, path: str | Path | None = None, *, limit: 
         return load_locomo_samples(source_path, limit=limit)
     if dataset == "dialsim":
         return load_dialsim_samples(source_path, limit=limit)
+    if dataset == "longmemeval":
+        return load_longmemeval_samples(source_path, limit=limit)
+    if dataset == "rhelm":
+        return load_rhelm_samples(source_path, limit=limit)
     if source_path.is_file() and source_path.suffix.lower() == ".jsonl":
         return load_jsonl_native_samples(dataset, source_path, limit=limit)
     raise RuntimeError(
@@ -588,7 +907,7 @@ def qa_prompt(sample: dict[str, Any], method: str, context: str) -> list[dict[st
         {
             "role": "user",
             "content": (
-                f"[DATASET]\n{sample['dataset']}\n[METHOD]\n{method}\n[CONTEXT]\n{truncate_text(context)}\n\n"
+                f"[DATASET]\n{sample['dataset']}\n[CONTEXT]\n{truncate_text(context)}\n\n"
                 f"[QUESTION]\n{sample['question']}\n\nReturn JSON only."
             ),
         },
@@ -681,15 +1000,95 @@ def answer_with_context(
         }
 
 
+def judge_prediction(sample: dict[str, Any], pred: dict[str, Any], client: DeepSeekClient | None, *, require_api: bool) -> dict[str, Any]:
+    if client is None:
+        if require_api:
+            raise RuntimeError(f"Benchmark judge client unavailable for {sample['sample_id']}.")
+        return {"sample_id": sample["sample_id"], "method": pred.get("method"), "judge_correct": None, "judge_error": "no client"}
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a blinded evaluator for long-term-memory question answering. Decide whether the candidate answer "
+                "is semantically correct relative to the reference answer for the question. Accept concise paraphrases and "
+                "equivalent multiple-choice wording. For an unanswerable reference, accept only an explicit unknown or "
+                "insufficient-information answer. Return exactly one minified JSON object with keys correct and reason. "
+                "correct must be true or false. Do not infer which system produced the candidate."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"[QUESTION]\n{sample.get('question', '')}\n\n"
+                f"[REFERENCE]\n{sample.get('answer', '')}\n\n"
+                f"[CANDIDATE]\n{pred.get('answer', '')}\n\nReturn JSON only."
+            ),
+        },
+    ]
+    try:
+        result = client.chat(messages, temperature=0.0, max_tokens=128)
+        raw = extract_json_object(result.text)
+        correct = raw.get("correct")
+        if isinstance(correct, str):
+            correct = correct.strip().lower() == "true"
+        if not isinstance(correct, bool):
+            raise ValueError(f"judge correct is not boolean: {correct!r}")
+        return {
+            "sample_id": sample["sample_id"],
+            "method": pred.get("method"),
+            "judge_correct": correct,
+            "judge_reason": normalize_answer(raw.get("reason")),
+            "judge_usage": result.usage,
+        }
+    except Exception as exc:  # noqa: BLE001
+        if require_api:
+            raise RuntimeError(f"Benchmark judge failed for {sample['sample_id']} ({pred.get('method')}): {exc}") from exc
+        return {
+            "sample_id": sample["sample_id"],
+            "method": pred.get("method"),
+            "judge_correct": None,
+            "judge_error": str(exc),
+        }
+
+
+def judge_predictions(
+    samples: list[dict[str, Any]],
+    predictions: list[dict[str, Any]],
+    client: DeepSeekClient | None,
+    *,
+    require_api: bool,
+    max_workers: int,
+) -> list[dict[str, Any]]:
+    sample_by_id = {str(sample["sample_id"]): sample for sample in samples}
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as pool:
+        futures = {
+            pool.submit(
+                judge_prediction,
+                sample_by_id[str(pred["sample_id"])],
+                pred,
+                client,
+                require_api=require_api,
+            ): pred
+            for pred in predictions
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            pred = futures[future]
+            pred.update(result)
+            results.append(result)
+    return results
+
+
 def locomo_memory_path(run_dir: str | Path, conversation_id: str) -> Path:
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", conversation_id).strip("_") or "conversation"
     return Path(run_dir) / "memory" / "ours" / f"{safe_id}.memory.jsonl"
 
 
 def locomo_cache_key(sample: dict[str, Any], *, dataset_hash: str, top_k: int, coarse_k: int) -> str:
-    raw_id = str(sample.get("sample_id") or sample.get("conversation_id") or "")
+    raw_id = str(sample.get("conversation_id") or sample.get("sample_id") or "")
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
-    return f"{safe_id}__{dataset_hash[:12]}__top{top_k}__coarse{coarse_k}"
+    return f"{safe_id}__turns{len(sample.get('turns') or [])}__{dataset_hash[:12]}__top{top_k}__coarse{coarse_k}"
 
 
 def locomo_dataset_hash(samples: list[dict[str, Any]]) -> str:
@@ -761,16 +1160,29 @@ def build_locomo_memory_store(sample: dict[str, Any], memory_path: str | Path) -
         text = normalize_answer(turn.get("text"))
         if not text:
             continue
+        explicit_refs = turn.get("evidence_refs") or []
+        if isinstance(explicit_refs, str):
+            explicit_refs = [explicit_refs]
+        refs = [str(item) for item in explicit_refs if str(item).strip()]
+        if not refs:
+            value = str(turn.get("dia_id") or turn.get("event_id") or turn.get("session") or "").strip()
+            if value:
+                refs.append(value)
+        dataset = str(sample.get("dataset") or ("locomo" if "locomo" in turn.get("tags", []) else "native_benchmark"))
+        card_tags = [str(tag) for tag in turn.get("tags", []) if str(tag).strip()]
+        for tag in ("dialogue", dataset, str(turn.get("speaker") or "").strip()):
+            if tag and tag not in card_tags:
+                card_tags.append(tag)
         store.write_card(
             summary=text,
-            evidence_refs=[str(turn.get("dia_id") or turn.get("event_id") or "")],
+            evidence_refs=refs,
             time_scope={
                 "session": turn.get("session"),
                 "time": turn.get("time"),
                 "date": turn.get("session_date"),
             },
             confidence=0.72,
-            tags=["dialogue", "locomo", str(turn.get("speaker") or "").strip()],
+            tags=card_tags,
             status="active",
             op="Write",
         )
@@ -973,8 +1385,7 @@ def retrieve_locomo_memories(
         if card.get("status") not in {"active", "flagged"}:
             continue
         score = locomo_retrieval_score(query, sample, card)
-        if score > 0:
-            scored.append((score, card))
+        scored.append((score, card))
     scored.sort(
         key=lambda item: (
             item[0],
@@ -993,13 +1404,19 @@ def assert_no_full_context_shortcut(
     sample: dict[str, Any],
     *,
     retrieved_memory_count: int | None = None,
+    retrieval_budget: int | None = None,
 ) -> None:
-    if "ours" not in method:
+    if "ours" not in method and "medimem" not in method:
         return
     if "[FULL LONG-TERM CONTEXT]" in prompt_context:
         raise RuntimeError(f"Full-context shortcut detected for {method}: prompt contains [FULL LONG-TERM CONTEXT]. {FULL_CONTEXT_SHORTCUT_ADVICE}")
     context_line_count = int(sample.get("context_line_count") or len(str(sample.get("context") or "").splitlines()))
-    if retrieved_memory_count is not None and context_line_count and retrieved_memory_count == context_line_count:
+    if (
+        retrieved_memory_count is not None
+        and context_line_count
+        and retrieved_memory_count == context_line_count
+        and (retrieval_budget is None or context_line_count > retrieval_budget)
+    ):
         raise RuntimeError(
             f"Full-context shortcut detected for {method}: retrieved_memory_count equals original context_line_count ({context_line_count}). "
             f"{FULL_CONTEXT_SHORTCUT_ADVICE}"
@@ -1026,8 +1443,7 @@ def run_locomo_ours_memory_pipeline(
     memory_cache_dir: str | Path | None = None,
     dataset_hash: str = "",
 ) -> dict[str, Any]:
-    if sample.get("dataset") != "locomo":
-        raise ValueError("run_locomo_ours_memory_pipeline only supports LoCoMo samples.")
+    dataset = str(sample.get("dataset") or "native_benchmark")
     conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
     memory_id = f"{conversation_id}_{sample['sample_id']}"
     memory_path = locomo_memory_path(run_dir, memory_id)
@@ -1049,13 +1465,15 @@ def run_locomo_ours_memory_pipeline(
         f"{sample['question']}\n"
         "Answer using only the retrieved memory cards."
     )
+    method_label = f"medimem_{dataset}_memory_pipeline"
     assert_no_full_context_shortcut(
-        "medimem_locomo_memory_pipeline",
+        method_label,
         prompt_context,
         sample,
         retrieved_memory_count=len(retrieved),
+        retrieval_budget=top_k,
     )
-    pred = answer_with_context(sample, "medimem_locomo_memory_pipeline", prompt_context, client, fail_on_llm_error=require_api)
+    pred = answer_with_context(sample, method_label, prompt_context, client, fail_on_llm_error=require_api)
     pred["retrieved_memory_count"] = len(retrieved)
     pred["memory_card_count"] = len(store.cards)
     pred["memory_path"] = str(store.path)
@@ -1064,8 +1482,15 @@ def run_locomo_ours_memory_pipeline(
     pred["locomo_top_k"] = top_k
     pred["locomo_coarse_k"] = coarse_k
     pred["retrieval_query"] = locomo_expanded_query(sample)
+    pred["retrieved_evidence_refs"] = sorted(
+        {str(ref) for memory in retrieved for ref in memory.get("evidence_refs", []) if str(ref).strip()}
+    )
+    pred["retrieved_evidence_refs_at5"] = sorted(
+        {str(ref) for memory in retrieved[:5] for ref in memory.get("evidence_refs", []) if str(ref).strip()}
+    )
+    pred["retrieved_memory_ids"] = [str(memory.get("memory_id") or "") for memory in retrieved]
     pred["pipeline_note"] = (
-        "LoCoMo turns are written to JSONL memory cards with entity/time metadata; "
+        f"{dataset} timeline items are written to JSONL memory cards with entity/time metadata; "
         "QA prompt receives only two-stage retrieved memory cards."
     )
     return pred
@@ -1081,22 +1506,32 @@ def build_locomo_amem_system(sample: dict[str, Any]) -> SourceAlignedAMEMSystem:
                 normalize_answer(turn.get("text")),
                 str(turn.get("conversation_id") or sample.get("conversation_id") or sample["sample_id"]),
                 [str(tag) for tag in turn.get("tags", ["dialogue", "locomo"])],
+                turn.get("evidence_refs") or [turn.get("dia_id") or turn.get("event_id") or turn.get("session")],
             )
             for idx, turn in enumerate(turns)
         ]
     else:
         iterable = [
-            (str(idx), line.strip(), str(sample.get("conversation_id") or sample["sample_id"]), ["dialogue", "native_benchmark"])
+            (
+                str(idx),
+                line.strip(),
+                str(sample.get("conversation_id") or sample["sample_id"]),
+                ["dialogue", "native_benchmark"],
+                [str(idx)],
+            )
             for idx, line in enumerate(str(sample.get("context") or "").splitlines())
         ]
-    for time, text, conversation_id, tags in iterable:
+    for time, text, conversation_id, tags, source_refs in iterable:
         if not text:
             continue
+        if isinstance(source_refs, str):
+            source_refs = [source_refs]
+        tagged_refs = [f"ref:{ref}" for ref in source_refs if str(ref or "").strip()]
         system.add_note(
             content=text,
             time=time,
-            context=f"{sample['dataset']} LoCoMo turn memory for {conversation_id}",
-            tags=tags,
+            context=f"{sample['dataset']} timeline memory for {conversation_id}",
+            tags=list(tags) + tagged_refs,
             category="dialogue",
         )
     return system
@@ -1121,6 +1556,72 @@ def amem_retrieved_context(
     else:
         retrieved = system.find_related_memories_raw(str(sample.get("question") or ""), k=top_k)
     return f"[A-MEM RETRIEVED MEMORY]\n{retrieved}\n\n[QUESTION]\n{sample['question']}", min(top_k, len(system.memories))
+
+
+def amem_retrieved_context_with_refs(
+    sample: dict[str, Any],
+    *,
+    top_k: int = 8,
+    runtime: LocomoAMEMRuntime | None = None,
+) -> tuple[str, int, list[str]]:
+    system = runtime.system if runtime is not None else build_locomo_amem_system(sample)
+
+    def retrieve() -> tuple[str, list[int]]:
+        raw = system.find_related_memories_raw(str(sample.get("question") or ""), k=top_k)
+        indices = system.retriever.search(str(sample.get("question") or ""), top_k) if system.memories else []
+        return raw, indices
+
+    if runtime is not None:
+        with runtime.lock:
+            retrieved, indices = retrieve()
+    else:
+        retrieved, indices = retrieve()
+    memories = list(system.memories.values())
+    refs = sorted(
+        {
+            tag[4:]
+            for index in indices[:5]
+            if 0 <= index < len(memories)
+            for tag in memories[index].tags
+            if str(tag).startswith("ref:") and str(tag)[4:]
+        }
+    )
+    context = f"[A-MEM RETRIEVED MEMORY]\n{retrieved}\n\n[QUESTION]\n{sample['question']}"
+    return context, min(top_k, len(system.memories)), refs
+
+
+def static_rag_retrieved_context(sample: dict[str, Any], *, top_k: int = 32) -> tuple[str, list[str], list[str]]:
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    query = locomo_expanded_query(sample)
+    for idx, turn in enumerate(sample.get("turns") or []):
+        text = normalize_answer(turn.get("text"))
+        if not text:
+            continue
+        metadata = " ".join(
+            str(value or "")
+            for value in (turn.get("speaker"), turn.get("session"), turn.get("session_date"), turn.get("time"))
+        )
+        score = text_similarity(query, f"{text} {metadata}")
+        scored.append((score, idx, turn))
+    scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    selected = [turn for _, _, turn in scored[:top_k]]
+    lines = []
+    refs_all: list[str] = []
+    refs_at5: list[str] = []
+    for rank, turn in enumerate(selected):
+        refs = turn.get("evidence_refs") or [turn.get("dia_id") or turn.get("event_id") or turn.get("session")]
+        if isinstance(refs, str):
+            refs = [refs]
+        normalized_refs = [str(ref) for ref in refs if str(ref or "").strip()]
+        refs_all.extend(normalized_refs)
+        if rank < 5:
+            refs_at5.extend(normalized_refs)
+        lines.append(
+            f"- refs={','.join(normalized_refs)} date={turn.get('session_date') or turn.get('time') or ''} "
+            f"speaker={turn.get('speaker') or ''} text={normalize_answer(turn.get('text'))}"
+        )
+    context = "[STATIC_RAG_RETRIEVED_ITEMS]\n" + "\n".join(lines) + f"\n\n[QUESTION]\n{sample['question']}"
+    return context, sorted(set(refs_all)), sorted(set(refs_at5))
 
 
 def baseline_method_paths(method: str) -> tuple[Path, Path]:
@@ -1153,8 +1654,7 @@ def run_locomo_official_wrapper(
     memory_cache_dir: str | Path | None = None,
     dataset_hash: str = "",
 ) -> dict[str, Any]:
-    if sample.get("dataset") != "locomo":
-        raise ValueError(f"{method} official wrapper currently supports only LoCoMo samples.")
+    dataset = str(sample.get("dataset") or "native_benchmark")
     repo, python = ensure_official_wrapper_ready(method)
     memory_path = locomo_memory_path(Path(run_dir) / "official_wrappers" / method, str(sample["sample_id"]))
     store = build_cached_locomo_memory_store(
@@ -1179,13 +1679,14 @@ def run_locomo_official_wrapper(
         f"{sample['question']}\n"
         "Answer using only the retrieved memory cards."
     )
+    method_label = BASELINE_METHOD_LABELS[method] if dataset == "locomo" else f"protocol_{method}_{dataset}_wrapper"
     assert_no_full_context_shortcut(
-        BASELINE_METHOD_LABELS[method],
+        method_label,
         prompt_context,
         sample,
         retrieved_memory_count=len(retrieved),
     )
-    pred = answer_with_context(sample, BASELINE_METHOD_LABELS[method], prompt_context, client, fail_on_llm_error=require_api)
+    pred = answer_with_context(sample, method_label, prompt_context, client, fail_on_llm_error=require_api)
     pred["retrieved_memory_count"] = len(retrieved)
     pred["memory_card_count"] = len(store.cards)
     pred["memory_path"] = str(store.path)
@@ -1197,6 +1698,13 @@ def run_locomo_official_wrapper(
     pred["adapter_note"] = BASELINE_ADAPTER_NOTES[method]
     pred["locomo_top_k"] = top_k
     pred["locomo_coarse_k"] = coarse_k
+    pred["retrieved_evidence_refs"] = sorted(
+        {str(ref) for memory in retrieved for ref in memory.get("evidence_refs", []) if str(ref).strip()}
+    )
+    pred["retrieved_evidence_refs_at5"] = sorted(
+        {str(ref) for memory in retrieved[:5] for ref in memory.get("evidence_refs", []) if str(ref).strip()}
+    )
+    pred["retrieved_memory_ids"] = [str(memory.get("memory_id") or "") for memory in retrieved]
     return pred
 
 
@@ -1214,20 +1722,36 @@ def run_local_method(
     memory_cache_dir: str | Path | None = None,
     dataset_hash: str = "",
 ) -> dict[str, Any]:
+    dataset = str(sample.get("dataset") or "native_benchmark")
     if method == "direct":
         pred = answer_with_context(
             sample,
-            "direct_locomo_qa",
+            f"direct_{dataset}_qa",
             "",
             client,
             fail_on_llm_error=require_api,
         )
         pred["retrieved_memory_count"] = 0
         pred["baseline_reproduction_level"] = "local_direct_no_memory"
-        pred["adapter_note"] = "Direct LoCoMo QA baseline: same QA model and samples, no retrieved memory context."
+        pred["adapter_note"] = f"Direct {dataset} QA baseline: same QA model and samples, no retrieved memory context."
+        return pred
+    if method == "static_rag":
+        context, refs, refs_at5 = static_rag_retrieved_context(sample, top_k=locomo_top_k)
+        pred = answer_with_context(
+            sample,
+            f"static_rag_{dataset}",
+            context,
+            client,
+            fail_on_llm_error=require_api,
+        )
+        pred["retrieved_memory_count"] = min(locomo_top_k, len(sample.get("turns") or []))
+        pred["retrieved_evidence_refs"] = refs
+        pred["retrieved_evidence_refs_at5"] = refs_at5
+        pred["baseline_reproduction_level"] = "local_static_rag"
+        pred["adapter_note"] = "Deterministic lexical-semantic retrieval over runtime-visible timeline items."
         return pred
     if method in {"ours", "medimem"}:
-        if sample.get("dataset") != "locomo" or run_dir is None:
+        if run_dir is None:
             raise RuntimeError(
                 "The previous ours full-context native shortcut is disabled. "
                 f"{FULL_CONTEXT_SHORTCUT_ADVICE}"
@@ -1250,15 +1774,22 @@ def run_local_method(
         if amem_runtimes is not None:
             conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
             runtime = amem_runtimes.get(conversation_id)
-        context, retrieved = amem_retrieved_context(sample, runtime=runtime)
-        pred = answer_with_context(sample, BASELINE_METHOD_LABELS["amem"], context, client, fail_on_llm_error=require_api)
+        context, retrieved, refs_at5 = amem_retrieved_context_with_refs(
+            sample,
+            top_k=locomo_top_k,
+            runtime=runtime,
+        )
+        method_name = BASELINE_METHOD_LABELS["amem"] if dataset == "locomo" else f"protocol_amem_{dataset}_wrapper"
+        pred = answer_with_context(sample, method_name, context, client, fail_on_llm_error=require_api)
         pred["retrieved_memory_count"] = retrieved
+        pred["retrieved_evidence_refs_at5"] = refs_at5
         pred["baseline_reproduction_level"] = "official_native_locomo_wrapper"
         pred["official_repo"] = METHOD_OFFICIAL_REPOS["amem"]
         pred["repo_path"] = str(Path(os.getenv("AMEM_REPO", "/home/syh/A-mem/A-mem-main")))
+        dataset_label = "LoCoMo" if dataset == "locomo" else dataset
         pred["adapter_note"] = (
             "A-MEM is wrapped through the project SourceAlignedAMEMSystem memory flow and evaluated with "
-            "the same LoCoMo samples, QA model, and metric script; this is not original-paper full reproduction."
+            f"the same {dataset_label} samples, QA model, and metric script; this is not original-paper full reproduction."
         )
         return pred
     raise ValueError(f"Unsupported local benchmark method: {method}")
@@ -1302,11 +1833,38 @@ def official_method_status(method: str, dataset: str) -> dict[str, Any]:
     }
 
 
+def _evidence_ref_matches(gold: str, retrieved: str) -> bool:
+    left = re.sub(r"\s+", " ", str(gold or "").strip().lower())
+    right = re.sub(r"\s+", " ", str(retrieved or "").strip().lower())
+    if not left or not right:
+        return False
+    if left == right or left.startswith(right + ":") or right.startswith(left + ":"):
+        return True
+    left_file = left.split(":", 1)[0]
+    right_file = right.split(":", 1)[0]
+    return bool(left_file and "." in left_file and left_file == right_file)
+
+
+def evidence_recall_at5(sample: dict[str, Any], pred: dict[str, Any]) -> float | None:
+    gold_refs = [str(item) for item in sample.get("evidence", []) if str(item or "").strip()]
+    if not gold_refs or "retrieved_evidence_refs_at5" not in pred:
+        return None
+    retrieved_refs = [str(item) for item in pred.get("retrieved_evidence_refs_at5", []) if str(item or "").strip()]
+    matched = sum(1 for gold in gold_refs if any(_evidence_ref_matches(gold, retrieved) for retrieved in retrieved_refs))
+    return matched / len(gold_refs)
+
+
 def prediction_metric_values(sample: dict[str, Any], pred: dict[str, Any]) -> dict[str, float | None]:
     answer = normalize_answer(pred.get("answer"))
     gold = normalize_answer(sample.get("answer"))
     sbert, _ = optional_sbert_similarity(answer, gold)
     return {
+        "answer_accuracy": (
+            1.0 if bool(pred.get("judge_correct")) else 0.0
+        )
+        if pred.get("judge_correct") is not None
+        else None,
+        "evidence_recall_at5": evidence_recall_at5(sample, pred),
         "exact_match": 1.0 if answer.lower() == gold.lower() and answer else 0.0,
         "soft_match": 1.0 if soft_match(answer, gold) else 0.0,
         "qa_f1": token_f1(answer, gold),
@@ -1396,7 +1954,16 @@ def evaluate_benchmark_predictions(samples: list[dict[str, Any]], predictions: l
     rows = collect_metric_rows(samples, predictions)
     legacy = aggregate_metric_rows(
         rows,
-        metrics=("exact_match", "soft_match", "qa_f1", "bleu1", "avg_tokens", "retrieved_memory_count"),
+        metrics=(
+            "answer_accuracy",
+            "evidence_recall_at5",
+            "exact_match",
+            "soft_match",
+            "qa_f1",
+            "bleu1",
+            "avg_tokens",
+            "retrieved_memory_count",
+        ),
         include_category=False,
     )
     for row in legacy:
@@ -1488,16 +2055,33 @@ def run_native_benchmark(
     locomo_top_k: int = 8,
     locomo_coarse_k: int = 32,
     top_k_sweep: list[int] | None = None,
+    judge_answers: bool = False,
+    sample_manifest: str | Path | None = None,
 ) -> Path:
-    loaded_samples = load_native_samples(dataset, dataset_path, limit=limit)
-    samples = sample_benchmark_rows(loaded_samples, sample_n=sample_n, random_seed=random_seed)
-    prefix = f"{dataset}_memory_random{sample_n}" if dataset == "locomo" and sample_n else "benchmark"
+    source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
+    if dataset == "dialsim":
+        loaded_samples = load_dialsim_samples(
+            source_path,
+            limit=limit,
+            sample_n=sample_n,
+            random_seed=int(random_seed or 20260716),
+        )
+        samples = loaded_samples
+    else:
+        loaded_samples = load_native_samples(dataset, dataset_path, limit=limit)
+        samples = sample_benchmark_rows(loaded_samples, sample_n=sample_n, random_seed=random_seed)
+    frozen_sample_ids = load_frozen_sample_ids(sample_manifest) if sample_manifest else None
+    if frozen_sample_ids is not None:
+        samples = select_frozen_samples(loaded_samples, frozen_sample_ids)
+    prefix = f"{dataset}_memory_random{sample_n}" if sample_n else f"{dataset}_benchmark"
     run_dir = make_benchmark_run_dir(output_root, prefix=prefix)
+    memory_cache_dir = run_dir / "shared_cache"
+    dataset_hash = locomo_dataset_hash(samples)
     client, blocker = build_client(require_api=require_api)
     predictions: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     amem_runtimes: dict[str, LocomoAMEMRuntime] = {}
-    if dataset == "locomo" and "ours" in methods:
+    if ("ours" in methods or "medimem" in methods) and samples:
         seen_conversations: set[str] = set()
         for sample in samples:
             conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
@@ -1505,7 +2089,7 @@ def run_native_benchmark(
                 continue
             build_locomo_memory_store(sample, locomo_memory_path(run_dir, conversation_id))
             seen_conversations.add(conversation_id)
-    if dataset == "locomo" and "amem" in methods:
+    if "amem" in methods:
         seen_conversations: set[str] = set()
         for sample in samples:
             conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
@@ -1551,12 +2135,14 @@ def run_native_benchmark(
                             amem_runtimes=amem_runtimes,
                             locomo_top_k=locomo_top_k,
                             locomo_coarse_k=locomo_coarse_k,
+                            memory_cache_dir=memory_cache_dir,
+                            dataset_hash=dataset_hash,
                         ): sample["sample_id"]
                         for sample in samples
                     }
                 for future in as_completed(futures):
                     predictions.append(future.result())
-        elif dataset == "locomo" and method in OFFICIAL_WRAPPER_METHODS:
+        elif method in OFFICIAL_WRAPPER_METHODS:
             status = official_method_status(method, dataset)
             if status.get("status") != "official_wrapper_configured":
                 blocked.append(status)
@@ -1572,6 +2158,8 @@ def run_native_benchmark(
                         top_k=locomo_top_k,
                         coarse_k=locomo_coarse_k,
                         require_api=require_api,
+                        memory_cache_dir=memory_cache_dir,
+                        dataset_hash=dataset_hash,
                     ): sample["sample_id"]
                     for sample in samples
                 }
@@ -1579,8 +2167,39 @@ def run_native_benchmark(
                     predictions.append(future.result())
         else:
             blocked.append(official_method_status(method, dataset))
+    judge_results: list[dict[str, Any]] = []
+    if judge_answers and predictions:
+        judge_results = judge_predictions(
+            samples,
+            predictions,
+            client,
+            require_api=require_api,
+            max_workers=max_workers,
+        )
     write_jsonl(run_dir / "samples.jsonl", samples)
+    selected_ids = [str(sample["sample_id"]) for sample in samples]
+    selected_ids_sha256 = hashlib.sha256(
+        ("\n".join(selected_ids) + "\n").encode("utf-8")
+    ).hexdigest()
+    write_text(
+        run_dir / "sample_manifest.json",
+        json.dumps(
+            {
+                "dataset": dataset,
+                "sample_ids": selected_ids,
+                "sample_count": len(selected_ids),
+                "sample_ids_sha256": selected_ids_sha256,
+                "random_seed": random_seed,
+                "source_files": source_file_manifest(source_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
     write_jsonl(run_dir / "predictions" / f"{dataset}.jsonl", predictions)
+    write_jsonl(run_dir / "judge_results.jsonl", judge_results)
     write_jsonl(run_dir / "blocked_methods.jsonl", blocked)
     metrics = evaluate_benchmark_predictions(samples, predictions)
     write_csv(run_dir / f"{dataset}_metrics.csv", metrics)
@@ -1593,18 +2212,21 @@ def run_native_benchmark(
         write_csv(run_dir / "locomo_metrics_official_style.csv", locomo_metrics["official_style"])
         write_jsonl(run_dir / "locomo_metrics_per_sample.jsonl", locomo_metrics["per_sample"])
     validation = validate_horizontal_run(samples, predictions) if predictions else {"passed": False, "failures": ["no predictions"]}
+    direct_label = next((str(pred["method"]) for pred in predictions if str(pred["method"]).startswith("direct_")), f"direct_{dataset}_qa")
+    medimem_label = next((str(pred["method"]) for pred in predictions if str(pred["method"]).startswith("medimem_")), f"medimem_{dataset}_memory_pipeline")
+    amem_label = next((str(pred["method"]) for pred in predictions if "amem" in str(pred["method"]).lower()), f"protocol_amem_{dataset}_wrapper")
     baseline_reproduction_level = {
-        "direct_locomo_qa": {
+        direct_label: {
             "level": "local_direct_no_memory",
             "official_repo": None,
             "core_flow": "Question-only QA with the same OpenAI-compatible model; no memory retrieval.",
         },
-        "medimem_locomo_memory_pipeline": {
+        medimem_label: {
             "level": "project_pipeline",
             "official_repo": None,
             "core_flow": "Entity/time-aware JSONL memory cards, expanded-query coarse retrieval, rerank to top-k, QA over retrieved memories only.",
         },
-        BASELINE_METHOD_LABELS["amem"]: {
+        amem_label: {
             "level": "official_native_locomo_wrapper",
             "official_repo": METHOD_OFFICIAL_REPOS["amem"],
             "core_flow": "SourceAlignedAMEMSystem.add_note/process_memory/find_related_memories_raw.",
@@ -1615,7 +2237,11 @@ def run_native_benchmark(
         },
     }
     for method in OFFICIAL_WRAPPER_METHODS:
-        baseline_reproduction_level[BASELINE_METHOD_LABELS[method]] = {
+        method_label = next(
+            (str(pred["method"]) for pred in predictions if method in str(pred["method"]).lower()),
+            BASELINE_METHOD_LABELS[method] if dataset == "locomo" else f"protocol_{method}_{dataset}_wrapper",
+        )
+        baseline_reproduction_level[method_label] = {
             "level": BASELINE_REPRODUCTION_LEVELS[method],
             "official_repo": METHOD_OFFICIAL_REPOS[method],
             "core_flow": "Official baseline repository mirrored into baseline_envs; project-unified LoCoMo wrapper, sample set, QA model, and metric script.",
@@ -1632,6 +2258,8 @@ def run_native_benchmark(
     manifest = {
         "dataset": dataset,
         "dataset_path": str(dataset_path or NATIVE_BENCHMARKS[dataset].default_path),
+        "sample_manifest_input": str(sample_manifest) if sample_manifest else None,
+        "sample_ids_sha256": selected_ids_sha256,
         "methods": methods,
         "sample_n": sample_n,
         "random_seed": random_seed,
@@ -1639,6 +2267,7 @@ def run_native_benchmark(
         "locomo_top_k": locomo_top_k,
         "locomo_coarse_k": locomo_coarse_k,
         "top_k_sweep": sweep_values,
+        "judge_answers": judge_answers,
         "total_available_qa_samples": len(loaded_samples),
         "local_methods": sorted({pred["method"] for pred in predictions}),
         "blocked_methods": blocked,
@@ -1651,7 +2280,7 @@ def run_native_benchmark(
             "passed": all(bool(pred.get("guard_passed", True)) for pred in predictions),
         },
         "metric_policy": {
-            "benchmark_compatible_primary": list(LOCOMO_MAIN_METRICS) if dataset == "locomo" else [],
+            "benchmark_compatible_primary": ["answer_accuracy", "evidence_recall_at5"],
             "locomo_category_breakdown": dataset == "locomo",
             "auxiliary_audit_only": list(LOCOMO_AUXILIARY_METRICS) if dataset == "locomo" else [],
             "official_style_additional": list(LOCOMO_OFFICIAL_STYLE_METRICS) if dataset == "locomo" else [],
@@ -1672,9 +2301,10 @@ def run_native_benchmark(
         "baseline_reproduction_level": baseline_reproduction_level,
         "pipeline_policies": {
             "direct": "Question-only QA baseline with no retrieved long-term memory.",
-            "medimem": "LoCoMo turns -> entity/time-aware JSONL MemoryStore cards -> expanded-query coarse retrieval -> rerank to top-k -> QA over retrieved memory cards only.",
+            "static_rag": "Frozen timeline chunks -> lexical top-k retrieval -> QA over retrieved chunks only.",
+            "medimem": "Timeline turns -> entity/time-aware JSONL MemoryStore cards -> expanded-query coarse retrieval -> rerank to top-k -> QA over retrieved memory cards only.",
             "ours": "Backward-compatible alias for medimem.",
-            "amem": "LoCoMo turns -> SourceAlignedAMEMSystem.add_note/process_memory -> find_related_memories_raw top-k -> QA.",
+            "amem": "Timeline turns -> SourceAlignedAMEMSystem.add_note/process_memory -> find_related_memories_raw top-k -> QA.",
         },
     }
     write_text(run_dir / "benchmark_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")

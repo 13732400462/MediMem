@@ -8,13 +8,20 @@ from mem_ehr_agent.benchmark import (
     locomo_expanded_query,
     evaluate_benchmark_predictions,
     evaluate_locomo_benchmark_predictions,
+    evidence_recall_at5,
+    load_longmemeval_samples,
     load_locomo_samples,
+    load_rhelm_samples,
     locomo_memory_path,
+    load_frozen_sample_ids,
     parse_int_list,
     parse_methods,
+    qa_prompt,
     retrieve_locomo_memories,
     run_locomo_official_wrapper,
     run_locomo_ours_memory_pipeline,
+    static_rag_retrieved_context,
+    select_frozen_samples,
     validate_horizontal_run,
 )
 from mem_ehr_agent.memory import MemoryStore
@@ -22,6 +29,94 @@ from mem_ehr_agent.memory import MemoryStore
 
 def test_parse_methods_normalizes_comma_list():
     assert parse_methods("ours, amem") == ["ours", "amem"]
+
+
+def test_qa_prompt_is_blind_to_method_name():
+    sample = {"dataset": "longmemeval", "question": "When?"}
+    prompt = qa_prompt(sample, "secret_method", "Timeline context")
+    assert "secret_method" not in prompt[1]["content"]
+    assert "[METHOD]" not in prompt[1]["content"]
+
+
+def test_frozen_sample_manifest_preserves_declared_order(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"sample_ids": ["s2", "s1"]}), encoding="utf-8")
+    ids = load_frozen_sample_ids(path)
+    samples = [{"sample_id": "s1"}, {"sample_id": "s2"}]
+    assert [row["sample_id"] for row in select_frozen_samples(samples, ids)] == ["s2", "s1"]
+
+
+def test_load_longmemeval_preserves_sessions_dates_and_evidence(tmp_path):
+    path = tmp_path / "longmemeval_s_cleaned.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "temporal-reasoning",
+                    "question": "When was the trip?",
+                    "answer": "Monday",
+                    "question_date": "2025-01-02",
+                    "haystack_session_ids": ["s1"],
+                    "haystack_dates": ["2025-01-01"],
+                    "haystack_sessions": [[{"role": "user", "content": "The trip was Monday."}]],
+                    "answer_session_ids": ["s1"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    samples = load_longmemeval_samples(path)
+    assert samples[0]["sample_id"] == "q1"
+    assert samples[0]["evidence"] == ["s1"]
+    assert samples[0]["turns"][0]["evidence_refs"] == ["s1", "s1:0"]
+    assert samples[0]["turns"][0]["session_date"] == "2025-01-01"
+
+
+def test_load_rhelm_combines_conversation_email_attachment_and_qa(tmp_path):
+    root = tmp_path / "data"
+    for name in ("QA_final", "conversations/Alice", "emails/Alice", "attachments/Alice"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    (root / "conversations/Alice/2025-01-01.json").write_text(
+        json.dumps({"messages": [{"role": "user", "content": "I moved to Boston."}]}), encoding="utf-8"
+    )
+    (root / "emails/Alice/mail.txt").write_text("Subject: travel\nBoston plans", encoding="utf-8")
+    (root / "attachments/Alice/note.md").write_text("# Note\nBoston", encoding="utf-8")
+    (root / "QA_final/low_score_qa_Alice_all_validated.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "fact_1",
+                "question": "Where did I move?",
+                "answer": "Boston",
+                "question_date": "2025-02-01",
+                "question_type": "fact",
+                "supporting_evidence": ["2025-01-01:0"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    samples = load_rhelm_samples(root)
+    assert len(samples) == 1
+    assert samples[0]["evidence"] == ["2025-01-01:0"]
+    assert {turn["speaker"] for turn in samples[0]["turns"]} >= {"user", "email", "attachment"}
+
+
+def test_static_rag_and_evidence_recall_use_actual_top_five_refs():
+    sample = {
+        "sample_id": "q1",
+        "dataset": "longmemeval",
+        "question": "Where did Alice move?",
+        "answer": "Boston",
+        "evidence": ["s2"],
+        "turns": [
+            {"text": "Unrelated note.", "evidence_refs": ["s1"]},
+            {"text": "Alice moved to Boston.", "evidence_refs": ["s2"]},
+        ],
+    }
+    _, refs, refs_at5 = static_rag_retrieved_context(sample, top_k=2)
+    assert "s2" in refs
+    assert evidence_recall_at5(sample, {"retrieved_evidence_refs_at5": refs_at5}) == 1.0
 
 
 def test_load_locomo_samples_from_official_json(tmp_path):
@@ -180,7 +275,13 @@ def test_full_context_guard_rejects_marker_and_gives_advice():
 def test_full_context_guard_rejects_retrieved_count_matching_context_lines():
     sample = {"context_line_count": 3, "turns": []}
     try:
-        assert_no_full_context_shortcut("ours_locomo_memory_pipeline", "[RETRIEVED_MEMORY_CARDS]\n...", sample, retrieved_memory_count=3)
+        assert_no_full_context_shortcut(
+            "ours_locomo_memory_pipeline",
+            "[RETRIEVED_MEMORY_CARDS]\n...",
+            sample,
+            retrieved_memory_count=3,
+            retrieval_budget=2,
+        )
     except RuntimeError as exc:
         assert "retrieved_memory_count equals original context_line_count" in str(exc)
         assert FULL_CONTEXT_SHORTCUT_ADVICE in str(exc)
