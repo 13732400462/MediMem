@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -239,7 +240,10 @@ def main() -> None:
     }
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     results: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # DialSim is loaded through pyarrow in the parent process.  Spawn clean
+    # workers so pyarrow's system C++ runtime is not inherited before Mem0/ICU
+    # imports the Conda runtime it was built against.
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
         futures = [
             pool.submit(run_worker, index, args.dataset, shard, str(run_dir), args.endpoint, args.top_k, args.require_api, args.reset_store)
             for index, shard in enumerate(shard_groups(groups, workers))

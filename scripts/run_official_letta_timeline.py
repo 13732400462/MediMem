@@ -89,9 +89,30 @@ def successful_memory_tools(dump: dict[str, Any]) -> list[str]:
         str(message.get("name"))
         for message in dump.get("messages") or []
         if message.get("message_type") == "tool_return_message"
-        and message.get("name") in {"memory_insert", "memory_replace"}
+        and message.get("name") in {"memory_insert", "memory_replace", "memory_rethink"}
         and message.get("status") == "success"
     ]
+
+
+def memory_tool_diagnostics(dump: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for message in dump.get("messages") or []:
+        message_type = str(message.get("message_type") or "")
+        name = str(message.get("name") or "")
+        if message_type not in {"assistant_message", "tool_call_message", "tool_return_message"}:
+            continue
+        if message_type != "assistant_message" and name not in {"memory_insert", "memory_replace", "memory_rethink"}:
+            continue
+        diagnostics.append(
+            {
+                "message_type": message_type,
+                "name": name or None,
+                "status": message.get("status"),
+                "content": str(message.get("content") or "")[:2000],
+                "tool_call": message.get("tool_call"),
+            }
+        )
+    return diagnostics
 
 
 def chunk_timeline(turns: list[dict[str, Any]], max_chars: int = 5000) -> list[str]:
@@ -157,7 +178,7 @@ async def run_worker_async(
     from letta.agents.agent_loop import AgentLoop
     from letta.config import LettaConfig
     from letta.schemas.agent import CreateAgent
-    from letta.schemas.block import CreateBlock
+    from letta.schemas.block import BlockUpdate, CreateBlock
     from letta.schemas.embedding_config import EmbeddingConfig
     from letta.schemas.llm_config import LLMConfig
     from letta.schemas.message import MessageCreate, MessageRole
@@ -197,7 +218,7 @@ async def run_worker_async(
                     CreateBlock(
                         label="timeline_memory",
                         value="No timeline facts stored yet.",
-                        limit=14000,
+                        limit=10000,
                         description="Compact dated facts and source refs from the current frozen timeline.",
                     ),
                 ],
@@ -212,20 +233,64 @@ async def run_worker_async(
             )
             with letta_metadata_lock():
                 agent = await server.create_agent_async(request, actor=actor)
-            loop = AgentLoop.load(agent_state=agent, actor=actor)
+            os.environ["DEEPSEEK_API_KEY"] = "EMPTY"
+            os.environ["DEEPSEEK_BASE_URL"] = endpoint
+            os.environ["DEEPSEEK_MODEL"] = "qwen3-vl-8b"
+            client, blocker = build_client_for_base_url(endpoint, require_api=require_api)
+            if client is None:
+                raise RuntimeError(blocker or "Letta timeline compaction client unavailable")
+            timeline_block = next(block for block in agent.blocks if block.label == "timeline_memory")
+            timeline_memory = ""
             chunks = chunk_timeline(list(samples[0].get("turns") or []))
             for chunk_index, chunk in enumerate(chunks):
-                prompt = (
-                    "Update timeline_memory with the durable dated facts in this segment. Preserve compact refs tokens. "
-                    "Use memory_insert for new facts; if the block is crowded, use memory_replace to consolidate before inserting. "
-                    "Do not answer a question and execute at least one memory tool.\n\n" + chunk
+                combined = (timeline_memory + "\n" + chunk).strip()
+                compacted = False
+                if len(combined) > 9000:
+                    result = client.chat(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Maintain a bounded long-term timeline. Rewrite the supplied existing memory plus new segment "
+                                    "into a factual chronological memory of at most 8500 characters. Preserve important names, "
+                                    "dates, events, preferences, relationships, and compact source refs for retained facts. "
+                                    "Return only the rewritten memory, with no commentary."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": f"[EXISTING_MEMORY]\n{timeline_memory}\n\n[NEW_SEGMENT]\n{chunk}",
+                            },
+                        ],
+                        temperature=0.0,
+                        max_tokens=2600,
+                    )
+                    timeline_memory = str(result.text or "").strip()
+                    compacted = True
+                    if not timeline_memory:
+                        raise RuntimeError(f"Letta block compaction returned empty output for {conversation_id} chunk {chunk_index}")
+                    if len(timeline_memory) > 9000:
+                        timeline_memory = timeline_memory[:9000]
+                else:
+                    timeline_memory = combined
+                timeline_block = await server.block_manager.update_block_async(
+                    block_id=timeline_block.id,
+                    block_update=BlockUpdate(value=timeline_memory),
+                    actor=actor,
                 )
-                run = await create_run(server, actor, agent.id, "timeline_ingest", f"{conversation_id}:{chunk_index}")
-                response = await loop.step([MessageCreate(role=MessageRole.user, content=prompt)], max_steps=max_steps, run_id=run.id)
-                tools = successful_memory_tools(response.model_dump(mode="json"))
-                append_jsonl(worker_dir / "progress.jsonl", {"stage": "ingest", "conversation_id": conversation_id, "chunk": chunk_index, "tools": tools})
-                if require_api and not tools:
-                    raise RuntimeError(f"Letta executed no successful memory tool for {conversation_id} chunk {chunk_index}")
+                append_jsonl(
+                    worker_dir / "progress.jsonl",
+                    {
+                        "stage": "ingest",
+                        "conversation_id": conversation_id,
+                        "chunk": chunk_index,
+                        "mode": "official_block_update",
+                        "compacted": compacted,
+                        "block_chars": len(timeline_memory),
+                    },
+                )
+            agent = await server.agent_manager.get_agent_by_id_async(agent_id=agent.id, actor=actor)
+            loop = AgentLoop.load(agent_state=agent, actor=actor)
             for sample in samples:
                 started = time.time()
                 prompt = (
@@ -267,7 +332,7 @@ async def run_worker_async(
                     "guard_passed": True,
                     "official_baseline": "letta_memgpt",
                     "official_repo": "https://github.com/letta-ai/letta",
-                    "baseline_reproduction_level": "official_core_memory_timeline_adapter",
+                    "baseline_reproduction_level": "official_core_memory_block_api_timeline_adapter",
                     "conversation_id": conversation_id,
                     "agent_id": str(agent.id),
                     "worker_id": worker_id,
@@ -325,7 +390,7 @@ def main() -> None:
         "method": METHOD,
         "workers": workers,
         "endpoint": args.endpoint,
-        "adapter_note": "Official SyncServer/CreateAgent/AgentLoop and core-memory tools; Evidence R@5 is not reported because core memory is not ranked retrieval.",
+        "adapter_note": "Official SyncServer/CreateAgent/AgentLoop with deterministic BlockUpdate ingestion and bounded model compaction; Evidence R@5 is not reported because core memory is not ranked retrieval.",
     }
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     results: list[dict[str, Any]] = []
@@ -343,6 +408,9 @@ def main() -> None:
                 pred = json.loads(line)
                 by_id[str(pred["sample_id"])] = pred
     predictions = [by_id[str(sample["sample_id"])] for sample in samples if str(sample["sample_id"]) in by_id]
+    os.environ["DEEPSEEK_API_KEY"] = "EMPTY"
+    os.environ["DEEPSEEK_BASE_URL"] = args.endpoint
+    os.environ["DEEPSEEK_MODEL"] = "qwen3-vl-8b"
     client, blocker = build_client_for_base_url(args.endpoint, require_api=args.require_api)
     judges = judge_predictions(samples, predictions, client, require_api=args.require_api, max_workers=workers) if args.judge_answers else []
     write_jsonl(run_dir / "predictions" / f"letta_{args.dataset}.jsonl", predictions)

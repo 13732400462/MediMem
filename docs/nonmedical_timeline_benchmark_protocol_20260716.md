@@ -31,6 +31,7 @@ DialSim 仅纳入 `easy_qs_ans_w_time`、`easy_qs_ans_wo_time`、`easy_qs_before
 10. MediMem (Ours)
 
 表格方法单元格不增加 `adapter`、`official` 或符号。DDO、G-Memory、MemInsight 的统一协议适配性质只在 caption 或正文表外说明，不把适配结果称为原论文在四数据集上的官方原生复现。
+Letta/MemGPT 使用官方 `SyncServer`、`CreateAgent`、`BlockUpdate` 与 `AgentLoop` 适配器：时间线通过有界 core-memory block 写入，超出预算时使用同一冻结模型压缩，QA 仍由 Letta agent 从 core memory 回答。该说明只放在 caption 或正文表外，不改写表内方法名。
 
 ## 模型与运行约束
 

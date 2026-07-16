@@ -23,6 +23,7 @@ from mem_ehr_agent.benchmark import (
     static_rag_retrieved_context,
     select_frozen_samples,
     validate_horizontal_run,
+    judge_prediction,
 )
 from mem_ehr_agent.memory import MemoryStore
 
@@ -323,6 +324,37 @@ def test_full_context_guard_rejects_retrieved_count_matching_context_lines():
         assert FULL_CONTEXT_SHORTCUT_ADVICE in str(exc)
     else:
         raise AssertionError("guard should reject context-line-count shortcut")
+
+
+def test_full_context_guard_allows_budgeted_retrieval_on_short_timeline():
+    turns = [{"text": "x" * 100}, {"text": "brief"}]
+    sample = {"context_line_count": 2, "turns": turns}
+    assert_no_full_context_shortcut(
+        "medimem_dialsim_memory_pipeline",
+        "[RETRIEVED_MEMORY_CARDS]\n" + turns[0]["text"],
+        sample,
+        retrieved_memory_count=1,
+        retrieval_budget=32,
+    )
+
+
+def test_judge_recovers_unambiguous_boolean_from_truncated_json():
+    class Result:
+        text = '{"correct": true, "reason": "A reason that never closes'
+        usage = {"total_tokens": 20}
+
+    class Client:
+        def chat(self, *_args, **_kwargs):
+            return Result()
+
+    result = judge_prediction(
+        {"sample_id": "s1", "question": "Q", "answer": "A"},
+        {"method": "m", "answer": "A"},
+        Client(),
+        require_api=True,
+    )
+    assert result["judge_correct"] is True
+    assert result["judge_parse_recovered"] is True
 
 
 def test_run_locomo_ours_memory_pipeline_uses_retrieved_cards_not_full_context(tmp_path):

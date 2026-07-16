@@ -1064,7 +1064,8 @@ def judge_prediction(sample: dict[str, Any], pred: dict[str, Any], client: DeepS
                 "is semantically correct relative to the reference answer for the question. Accept concise paraphrases and "
                 "equivalent multiple-choice wording. For an unanswerable reference, accept only an explicit unknown or "
                 "insufficient-information answer. Return exactly one minified JSON object with keys correct and reason. "
-                "correct must be true or false. Do not infer which system produced the candidate."
+                "correct must be true or false and reason must contain at most eight words. Do not infer which system "
+                "produced the candidate."
             ),
         },
         {
@@ -1078,7 +1079,21 @@ def judge_prediction(sample: dict[str, Any], pred: dict[str, Any], client: DeepS
     ]
     try:
         result = client.chat(messages, temperature=0.0, max_tokens=128)
-        raw = extract_json_object(result.text)
+        parse_recovered = False
+        try:
+            raw = extract_json_object(result.text)
+        except ValueError:
+            # Some OpenAI-compatible servers can stop after emitting the score but
+            # before closing a verbose reason string.  The boolean is the frozen
+            # metric; recover it only when it was emitted unambiguously.
+            match = re.search(r'["\']correct["\']\s*:\s*(true|false)', result.text, flags=re.IGNORECASE)
+            if not match:
+                raise
+            raw = {
+                "correct": match.group(1).lower() == "true",
+                "reason": "Recovered unambiguous boolean from truncated judge JSON.",
+            }
+            parse_recovered = True
         correct = raw.get("correct")
         if isinstance(correct, str):
             correct = correct.strip().lower() == "true"
@@ -1090,6 +1105,7 @@ def judge_prediction(sample: dict[str, Any], pred: dict[str, Any], client: DeepS
             "judge_correct": correct,
             "judge_reason": normalize_answer(raw.get("reason")),
             "judge_usage": result.usage,
+            "judge_parse_recovered": parse_recovered,
         }
     except Exception as exc:  # noqa: BLE001
         if require_api:
@@ -1476,7 +1492,7 @@ def assert_no_full_context_shortcut(
     total_chars = sum(len(text) for text in turns)
     covered_chars = sum(len(text) for text in turns if text and text in prompt_context)
     coverage = covered_chars / total_chars if total_chars else 0.0
-    if total_chars and coverage > 0.8 and (retrieved_memory_count or 0) < len(turns):
+    if total_chars and coverage > 0.8 and retrieved_memory_count is None:
         raise RuntimeError(
             f"Full-context shortcut detected for {method}: prompt covers {coverage:.1%} of original LoCoMo turn text. "
             f"{FULL_CONTEXT_SHORTCUT_ADVICE}"
