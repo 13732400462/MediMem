@@ -38,13 +38,15 @@ run_step() {
 
 core_methods="direct,static_rag,amem,ddo,gmemory,meminsight,memoryos,medimem"
 
-run_step core_locomo \
-  "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
-  --dataset locomo --methods "$core_methods" \
-  --dataset-path "$ROOT/datasets/amem_original/locomo/locomo10.official.json" \
-  --sample-manifest "$ROOT/data/processed/locomo_dev_selection_20260715/split_manifest.json" \
-  --max-workers 8 --output-root "$RUN_ROOT/core" --require-api \
-  --locomo-top-k 32 --locomo-coarse-k 32 --judge-answers
+if [ "${SKIP_CORE_LOCOMO:-0}" != 1 ]; then
+  run_step core_locomo \
+    "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
+    --dataset locomo --methods "$core_methods" \
+    --dataset-path "$ROOT/datasets/amem_original/locomo/locomo10.official.json" \
+    --sample-manifest "$ROOT/data/processed/locomo_dev_selection_20260715/split_manifest.json" \
+    --max-workers 8 --output-root "$RUN_ROOT/core" --require-api \
+    --locomo-top-k 32 --locomo-coarse-k 32 --judge-answers
+fi
 
 run_step core_dialsim \
   "$CORE_PY" -m mem_ehr_agent.cli benchmark run \

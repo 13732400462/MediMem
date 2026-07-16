@@ -1,4 +1,12 @@
-from mem_ehr_agent.amem_baseline import SourceAlignedAMEMSystem, build_amem_context, event_to_note_fields, run_amem_adapter
+from mem_ehr_agent.amem_baseline import (
+    SourceAlignedAMEMSystem,
+    SourceAlignedEmbeddingRetriever,
+    build_amem_context,
+    cosine,
+    event_to_note_fields,
+    hash_embedding,
+    run_amem_adapter,
+)
 from mem_ehr_agent.data_builder import build_case
 from mem_ehr_agent.data_sources import fallback_pmc_rows, fallback_pmoa_rows
 
@@ -12,6 +20,20 @@ def test_source_aligned_amem_system_links_and_retrieves_notes():
     assert "memory content:" in memory_text
     assert "memory context:" in memory_text
     assert len(system.retriever.search("diagnosis", k=3)) <= 3
+
+
+def test_vectorized_retriever_preserves_stable_cosine_ranking():
+    retriever = SourceAlignedEmbeddingRetriever()
+    retriever.model = None
+    documents = ["alpha beta", "alpha gamma", "delta epsilon", "alpha beta"]
+    retriever.add_documents(documents)
+    query = "alpha beta"
+    query_embedding = hash_embedding(query)
+    expected = sorted(
+        range(len(documents)),
+        key=lambda index: (-cosine(query_embedding, retriever.embeddings[index]), index),
+    )[:3]
+    assert retriever.search(query, 3) == expected
 
 
 def test_amem_adapter_prediction_schema_without_client():

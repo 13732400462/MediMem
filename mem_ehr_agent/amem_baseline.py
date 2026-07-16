@@ -6,6 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import Lock
 from typing import Any
 
 from .agents import case_context, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
@@ -15,6 +16,11 @@ from .llm import DeepSeekClient
 AMEM_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 AMEM_PROMPT_MEMORY_CHAR_BUDGET = 6000
 AMEM_LINKED_NEIGHBOR_LIMIT = 2
+
+
+_SHARED_ENCODERS: dict[str, Any | None] = {}
+_SHARED_ENCODERS_LOCK = Lock()
+_SHARED_ENCODE_LOCK = Lock()
 
 
 def simple_tokenize(text: str) -> list[str]:
@@ -91,17 +97,28 @@ class SourceAlignedEmbeddingRetriever:
         self.document_ids: dict[str, int] = {}
         self.backend = "hash"
         self.model = None
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
+        self._matrix: Any | None = None
+        self._matrix_size = 0
+        self._matrix_capacity = 0
+        with _SHARED_ENCODERS_LOCK:
+            if model_name not in _SHARED_ENCODERS:
+                try:
+                    from sentence_transformers import SentenceTransformer  # type: ignore
 
-            self.model = SentenceTransformer(model_name)
+                    _SHARED_ENCODERS[model_name] = SentenceTransformer(model_name)
+                except Exception:
+                    _SHARED_ENCODERS[model_name] = None
+            self.model = _SHARED_ENCODERS[model_name]
+        if self.model is not None:
             self.backend = "sentence-transformers"
-        except Exception:
-            self.model = None
 
     def _encode(self, documents: list[str]) -> list[list[float]]:
         if self.model is not None:
-            encoded = self.model.encode(documents)
+            # One shared encoder avoids loading the same model once per
+            # conversation.  Serialize encode calls because formal benchmark
+            # methods retrieve concurrently from the shared instance.
+            with _SHARED_ENCODE_LOCK:
+                encoded = self.model.encode(documents)
             return [list(map(float, row)) for row in encoded]
         return [hash_embedding(document) for document in documents]
 
@@ -110,7 +127,26 @@ class SourceAlignedEmbeddingRetriever:
             return
         start_idx = len(self.corpus)
         self.corpus.extend(documents)
-        self.embeddings.extend(self._encode(documents))
+        encoded = self._encode(documents)
+        self.embeddings.extend(encoded)
+        try:
+            import numpy as np  # type: ignore
+
+            rows = np.asarray(encoded, dtype=np.float32)
+            required = self._matrix_size + len(rows)
+            if self._matrix is None or required > self._matrix_capacity:
+                capacity = max(required, max(16, self._matrix_capacity * 2))
+                matrix = np.empty((capacity, rows.shape[1]), dtype=np.float32)
+                if self._matrix is not None and self._matrix_size:
+                    matrix[: self._matrix_size] = self._matrix[: self._matrix_size]
+                self._matrix = matrix
+                self._matrix_capacity = capacity
+            self._matrix[self._matrix_size : required] = rows
+            self._matrix_size = required
+        except Exception:
+            self._matrix = None
+            self._matrix_size = 0
+            self._matrix_capacity = 0
         for idx, doc in enumerate(documents):
             self.document_ids[doc] = start_idx + idx
 
@@ -118,6 +154,21 @@ class SourceAlignedEmbeddingRetriever:
         if not self.corpus:
             return []
         query_embedding = self._encode([query])[0]
+        if self._matrix is not None and self._matrix_size == len(self.embeddings):
+            try:
+                import numpy as np  # type: ignore
+
+                scores = self._matrix[: self._matrix_size] @ np.asarray(query_embedding, dtype=np.float32)
+                count = min(max(0, int(k)), self._matrix_size)
+                if not count:
+                    return []
+                indices = np.arange(self._matrix_size)
+                # Match Python's stable descending score order, including the
+                # earlier-index tie break used by the original implementation.
+                ranked = np.lexsort((indices, -scores))
+                return [int(index) for index in ranked[:count]]
+            except Exception:
+                pass
         scored = [(cosine(query_embedding, embedding), idx) for idx, embedding in enumerate(self.embeddings)]
         scored.sort(key=lambda item: item[0], reverse=True)
         return [idx for _, idx in scored[:k]]
