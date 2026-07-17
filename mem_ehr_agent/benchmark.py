@@ -1204,10 +1204,9 @@ def build_cached_locomo_memory_store(
             os.close(fd)
             break
         except FileExistsError:
-            if memory_path.exists():
-                store = MemoryStore.load(str(sample.get("conversation_id") or sample["sample_id"]), memory_path)
-                if store.cards:
-                    return store
+            # A concurrent writer appends this JSONL file card by card.  Do not
+            # attempt to load it until that writer releases the lock; otherwise
+            # a reader can observe a partially written final line.
             time.sleep(0.05)
     try:
         return build_locomo_memory_store(sample, memory_path)
@@ -2151,7 +2150,14 @@ def run_native_benchmark(
             conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
             if conversation_id in seen_conversations:
                 continue
-            build_locomo_memory_store(sample, locomo_memory_path(run_dir, conversation_id))
+            build_cached_locomo_memory_store(
+                sample,
+                memory_cache_dir,
+                dataset_hash=dataset_hash,
+                top_k=locomo_top_k,
+                coarse_k=locomo_coarse_k,
+                fallback_path=locomo_memory_path(run_dir, conversation_id),
+            )
             seen_conversations.add(conversation_id)
     if "amem" in methods:
         seen_conversations: set[str] = set()

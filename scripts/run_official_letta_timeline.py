@@ -34,6 +34,10 @@ from mem_ehr_agent.llm import extract_json_object
 
 
 METHOD = "official_letta_memgpt_timeline_adapter"
+TIMELINE_CHUNK_MAX_CHARS = 36000
+CORE_MEMORY_LIMIT_CHARS = 7500
+CORE_MEMORY_TARGET_CHARS = 6500
+COMPACTION_MAX_TOKENS = 1800
 
 
 @contextmanager
@@ -115,7 +119,7 @@ def memory_tool_diagnostics(dump: dict[str, Any]) -> list[dict[str, Any]]:
     return diagnostics
 
 
-def chunk_timeline(turns: list[dict[str, Any]], max_chars: int = 5000) -> list[str]:
+def chunk_timeline(turns: list[dict[str, Any]], max_chars: int = TIMELINE_CHUNK_MAX_CHARS) -> list[str]:
     by_session: dict[str, list[str]] = defaultdict(list)
     for turn in turns:
         text = str(turn.get("text") or "").strip()
@@ -123,19 +127,27 @@ def chunk_timeline(turns: list[dict[str, Any]], max_chars: int = 5000) -> list[s
             continue
         refs = ",".join(str(ref) for ref in turn.get("evidence_refs", []) if str(ref).strip())
         session = str(turn.get("session") or turn.get("time") or "unknown")
-        by_session[session].append(
-            f"date={turn.get('session_date') or turn.get('time') or ''} speaker={turn.get('speaker') or ''} refs={refs} text={text}"
-        )
+        prefix = f"date={turn.get('session_date') or turn.get('time') or ''} speaker={turn.get('speaker') or ''} refs={refs}"
+        payload_chars = max(1000, max_chars - len(prefix) - 100)
+        parts = [text[index : index + payload_chars] for index in range(0, len(text), payload_chars)] or [""]
+        for part_index, part in enumerate(parts):
+            marker = f" part={part_index + 1}/{len(parts)}" if len(parts) > 1 else ""
+            by_session[session].append(f"{prefix}{marker} text={part}")
     chunks: list[str] = []
+    current = ""
     for session, lines in by_session.items():
-        current = f"Session {session}\n"
+        header = f"Session {session}\n"
+        session_started = False
         for line in lines:
-            if len(current) + len(line) + 1 > max_chars and current.strip() != f"Session {session}":
+            addition = (header if not session_started else "") + line + "\n"
+            if current and len(current) + len(addition) > max_chars:
                 chunks.append(current.strip())
-                current = f"Session {session} continued\n"
-            current += line + "\n"
-        if current.strip():
-            chunks.append(current.strip())
+                current = ""
+                addition = f"Session {session} continued\n{line}\n"
+            current += addition
+            session_started = True
+    if current.strip():
+        chunks.append(current.strip())
     return chunks
 
 
@@ -218,7 +230,7 @@ async def run_worker_async(
                     CreateBlock(
                         label="timeline_memory",
                         value="No timeline facts stored yet.",
-                        limit=10000,
+                        limit=CORE_MEMORY_LIMIT_CHARS,
                         description="Compact dated facts and source refs from the current frozen timeline.",
                     ),
                 ],
@@ -245,14 +257,14 @@ async def run_worker_async(
             for chunk_index, chunk in enumerate(chunks):
                 combined = (timeline_memory + "\n" + chunk).strip()
                 compacted = False
-                if len(combined) > 9000:
+                if len(combined) > CORE_MEMORY_TARGET_CHARS:
                     result = client.chat(
                         [
                             {
                                 "role": "system",
                                 "content": (
                                     "Maintain a bounded long-term timeline. Rewrite the supplied existing memory plus new segment "
-                                    "into a factual chronological memory of at most 8500 characters. Preserve important names, "
+                                    f"into a factual chronological memory of at most {CORE_MEMORY_TARGET_CHARS} characters. Preserve important names, "
                                     "dates, events, preferences, relationships, and compact source refs for retained facts. "
                                     "Return only the rewritten memory, with no commentary."
                                 ),
@@ -263,14 +275,14 @@ async def run_worker_async(
                             },
                         ],
                         temperature=0.0,
-                        max_tokens=2600,
+                        max_tokens=COMPACTION_MAX_TOKENS,
                     )
                     timeline_memory = str(result.text or "").strip()
                     compacted = True
                     if not timeline_memory:
                         raise RuntimeError(f"Letta block compaction returned empty output for {conversation_id} chunk {chunk_index}")
-                    if len(timeline_memory) > 9000:
-                        timeline_memory = timeline_memory[:9000]
+                    if len(timeline_memory) > CORE_MEMORY_TARGET_CHARS:
+                        timeline_memory = timeline_memory[:CORE_MEMORY_TARGET_CHARS]
                 else:
                     timeline_memory = combined
                 timeline_block = await server.block_manager.update_block_async(
@@ -299,6 +311,8 @@ async def run_worker_async(
                     + str(sample["question"])
                 )
                 raw = None
+                parse_mode = "json"
+                plain_candidate = ""
                 dump: dict[str, Any] = {}
                 for attempt in range(3):
                     run = await create_run(server, actor, agent.id, "timeline_qa", f"{sample['sample_id']}:{attempt}")
@@ -310,7 +324,16 @@ async def run_worker_async(
                             raw = parse_json(texts[-1])
                             break
                         except Exception:
-                            pass
+                            text = str(texts[-1]).strip().strip("`").strip()
+                            match = re.search(r'["\']answer["\']\s*:\s*["\']([^"\']+)', text, flags=re.IGNORECASE)
+                            if match:
+                                plain_candidate = match.group(1).strip()
+                                parse_mode = "recovered_answer_field"
+                            elif text and "<tool_call>" not in text and len(text) <= 2000:
+                                plain_candidate = text
+                                parse_mode = "plain_assistant_answer"
+                if raw is None and plain_candidate:
+                    raw = {"answer": plain_candidate, "confidence": 0.5}
                 if raw is None:
                     raise RuntimeError(f"Letta returned no parseable answer for {sample['sample_id']}")
                 usage = dump.get("usage") or {}
@@ -321,6 +344,7 @@ async def run_worker_async(
                     "method": METHOD,
                     "answer": str(raw.get("answer") or "").strip(),
                     "confidence": float(raw.get("confidence") or 0.5),
+                    "answer_parse_mode": parse_mode,
                     "evidence": [],
                     "usage": {
                         "prompt_tokens": int(usage.get("prompt_tokens") or 0),
@@ -353,8 +377,12 @@ def run_worker(*args: Any) -> dict[str, Any]:
 def load_samples(args: argparse.Namespace) -> tuple[Path, list[dict[str, Any]], int]:
     source = Path(args.dataset_path or NATIVE_BENCHMARKS[args.dataset].default_path)
     if args.dataset == "dialsim":
-        samples = load_dialsim_samples(source, sample_n=args.sample_n, random_seed=args.random_seed)
-        return source, samples, len(samples)
+        loaded = load_dialsim_samples(source, sample_n=args.sample_n, random_seed=args.random_seed)
+        if args.sample_manifest:
+            samples = select_frozen_samples(loaded, load_frozen_sample_ids(args.sample_manifest))
+        else:
+            samples = loaded
+        return source, samples, len(loaded)
     loaded = load_native_samples(args.dataset, source)
     samples = sample_benchmark_rows(loaded, sample_n=args.sample_n, random_seed=args.random_seed)
     if args.sample_manifest:
@@ -391,6 +419,10 @@ def main() -> None:
         "workers": workers,
         "endpoint": args.endpoint,
         "adapter_note": "Official SyncServer/CreateAgent/AgentLoop with deterministic BlockUpdate ingestion and bounded model compaction; Evidence R@5 is not reported because core memory is not ranked retrieval.",
+        "timeline_chunk_max_chars": TIMELINE_CHUNK_MAX_CHARS,
+        "core_memory_limit_chars": CORE_MEMORY_LIMIT_CHARS,
+        "core_memory_target_chars": CORE_MEMORY_TARGET_CHARS,
+        "compaction_max_tokens": COMPACTION_MAX_TOKENS,
     }
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     results: list[dict[str, Any]] = []
