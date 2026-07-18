@@ -31,6 +31,7 @@ from mem_ehr_agent.benchmark import (
 )
 from mem_ehr_agent.io_utils import append_jsonl, ensure_dir, write_jsonl, write_text
 from mem_ehr_agent.llm import extract_json_object
+from mem_ehr_agent.resume import load_valid_resume_predictions
 
 
 METHOD = "official_letta_memgpt_timeline_adapter"
@@ -56,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, choices=("locomo", "longmemeval", "dialsim", "rhelm"))
     parser.add_argument("--dataset-path")
     parser.add_argument("--sample-manifest")
+    parser.add_argument("--resume-predictions", action="append", default=[])
+    parser.add_argument("--resume-allowed-endpoint", action="append", default=[])
     parser.add_argument("--sample-n", type=int)
     parser.add_argument("--random-seed", type=int, default=20260716)
     parser.add_argument("--workers", type=int, default=4)
@@ -463,11 +466,20 @@ def main() -> None:
     source, samples, available = load_samples(args)
     if not samples:
         raise RuntimeError("No benchmark samples selected.")
+    resumed, resume_diagnostics = load_valid_resume_predictions(
+        samples,
+        args.resume_predictions,
+        dataset=args.dataset,
+        method=METHOD,
+        endpoint=args.endpoint,
+        allowed_endpoints=args.resume_allowed_endpoint,
+    )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
-        grouped[str(sample.get("conversation_id") or sample["sample_id"])].append(sample)
+        if str(sample["sample_id"]) not in resumed:
+            grouped[str(sample.get("conversation_id") or sample["sample_id"])].append(sample)
     groups = sorted(grouped.items())
-    workers = max(1, min(args.workers, len(groups)))
+    workers = min(args.workers, len(groups)) if groups else 0
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = Path(args.output_root) / f"letta_{args.dataset}_{stamp}_pid{os.getpid()}"
     ensure_dir(run_dir / "predictions")
@@ -485,7 +497,9 @@ def main() -> None:
         "random_seed": args.random_seed,
         "method": METHOD,
         "workers": workers,
+        "requested_workers": args.workers,
         "endpoint": args.endpoint,
+        "resume": resume_diagnostics,
         "adapter_note": "Official SyncServer/CreateAgent/AgentLoop with deterministic BlockUpdate ingestion and bounded model compaction; Evidence R@5 is not reported because core memory is not ranked retrieval.",
         "timeline_chunk_max_chars": TIMELINE_CHUNK_MAX_CHARS,
         "core_memory_limit_chars": CORE_MEMORY_LIMIT_CHARS,
@@ -494,14 +508,15 @@ def main() -> None:
     }
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     results: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(run_worker, index, args.dataset, shard, str(run_dir), args.endpoint, args.max_steps, args.qa_max_steps, args.max_tokens, args.require_api)
-            for index, shard in enumerate(shard_groups(groups, workers))
-        ]
-        for future in as_completed(futures):
-            results.append(future.result())
-    by_id: dict[str, dict[str, Any]] = {}
+    if groups:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(run_worker, index, args.dataset, shard, str(run_dir), args.endpoint, args.max_steps, args.qa_max_steps, args.max_tokens, args.require_api)
+                for index, shard in enumerate(shard_groups(groups, workers))
+            ]
+            for future in as_completed(futures):
+                results.append(future.result())
+    by_id: dict[str, dict[str, Any]] = dict(resumed)
     for result in results:
         for line in Path(result["predictions"]).read_text(encoding="utf-8").splitlines():
             if line.strip():
@@ -512,7 +527,11 @@ def main() -> None:
     os.environ["DEEPSEEK_BASE_URL"] = args.endpoint
     os.environ["DEEPSEEK_MODEL"] = "qwen3-vl-8b"
     client, blocker = build_client_for_base_url(args.endpoint, require_api=args.require_api)
-    judges = judge_predictions(samples, predictions, client, require_api=args.require_api, max_workers=workers) if args.judge_answers else []
+    judges = (
+        judge_predictions(samples, predictions, client, require_api=args.require_api, max_workers=max(1, args.workers))
+        if args.judge_answers
+        else []
+    )
     write_jsonl(run_dir / "predictions" / f"letta_{args.dataset}.jsonl", predictions)
     write_jsonl(run_dir / "judge_results.jsonl", judges)
     write_csv(run_dir / f"{args.dataset}_metrics.csv", evaluate_benchmark_predictions(samples, predictions))
@@ -523,6 +542,7 @@ def main() -> None:
             "validation": validation,
             "fallback_count": sum("fallback_reason" in pred for pred in predictions),
             "judge_missing_count": sum(pred.get("judge_correct") is None for pred in predictions) if args.judge_answers else None,
+            "new_prediction_count": len(predictions) - len(resumed),
         }
     )
     write_text(run_dir / "experiment_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
