@@ -90,3 +90,18 @@ def test_resume_accepts_explicit_equivalent_endpoint(tmp_path):
         "http://127.0.0.1:8001/v1",
         "http://127.0.0.1:8002/v1",
     ]
+
+
+def test_resume_rejects_a_different_ingestion_mode(tmp_path):
+    source = tmp_path / "predictions.jsonl"
+    row = {**prediction("s1"), "ingestion_mode": "rolling_llm"}
+    source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="wrong ingestion mode"):
+        load_valid_resume_predictions(
+            [{"sample_id": "s1"}],
+            [source],
+            dataset="rhelm",
+            method="official_letta_memgpt_timeline_adapter",
+            endpoint="http://127.0.0.1:8001/v1",
+            expected_ingestion_mode="extractive",
+        )

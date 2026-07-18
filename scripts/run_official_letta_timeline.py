@@ -31,6 +31,7 @@ from mem_ehr_agent.benchmark import (
 )
 from mem_ehr_agent.io_utils import append_jsonl, ensure_dir, write_jsonl, write_text
 from mem_ehr_agent.llm import extract_json_object
+from mem_ehr_agent.extractive_timeline import EXTRACTION_VERSION, build_extractive_timeline
 from mem_ehr_agent.resume import load_valid_resume_predictions
 
 
@@ -69,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=3)
     parser.add_argument("--qa-max-steps", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--ingestion-mode", choices=("rolling_llm", "extractive"), default="rolling_llm")
     return parser.parse_args()
 
 
@@ -222,6 +224,7 @@ async def run_worker_async(
     qa_max_steps: int,
     max_tokens: int,
     require_api: bool,
+    ingestion_mode: str,
 ) -> dict[str, Any]:
     os.environ["LETTA_PG_URI"] = os.environ.get("LETTA_PG_URI", "postgresql://ymu@127.0.0.1:55432/letta")
     os.environ["OPENAI_API_KEY"] = "EMPTY"
@@ -291,46 +294,13 @@ async def run_worker_async(
             )
             with letta_metadata_lock():
                 agent = await server.create_agent_async(request, actor=actor)
-            os.environ["DEEPSEEK_API_KEY"] = "EMPTY"
-            os.environ["DEEPSEEK_BASE_URL"] = endpoint
-            os.environ["DEEPSEEK_MODEL"] = "qwen3-vl-8b"
-            client, blocker = build_client_for_base_url(endpoint, require_api=require_api)
-            if client is None:
-                raise RuntimeError(blocker or "Letta timeline compaction client unavailable")
             timeline_block = next(block for block in agent.blocks if block.label == "timeline_memory")
-            timeline_memory = ""
-            chunks = chunk_timeline(list(samples[0].get("turns") or []))
-            for chunk_index, chunk in enumerate(chunks):
-                combined = (timeline_memory + "\n" + chunk).strip()
-                compacted = False
-                if len(combined) > CORE_MEMORY_TARGET_CHARS:
-                    result = client.chat(
-                        [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Maintain a bounded long-term timeline. Rewrite the supplied existing memory plus new segment "
-                                    f"into a factual chronological memory of at most {CORE_MEMORY_TARGET_CHARS} characters. Preserve important names, "
-                                    "dates, events, preferences, relationships, and compact source refs for retained facts. "
-                                    "Return only the rewritten memory, with no commentary."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": f"[EXISTING_MEMORY]\n{timeline_memory}\n\n[NEW_SEGMENT]\n{chunk}",
-                            },
-                        ],
-                        temperature=0.0,
-                        max_tokens=COMPACTION_MAX_TOKENS,
-                    )
-                    timeline_memory = str(result.text or "").strip()
-                    compacted = True
-                    if not timeline_memory:
-                        raise RuntimeError(f"Letta block compaction returned empty output for {conversation_id} chunk {chunk_index}")
-                    if len(timeline_memory) > CORE_MEMORY_TARGET_CHARS:
-                        timeline_memory = timeline_memory[:CORE_MEMORY_TARGET_CHARS]
-                else:
-                    timeline_memory = combined
+            timeline_turns = list(samples[0].get("turns") or [])
+            if ingestion_mode == "extractive":
+                timeline_memory, extraction_diagnostics = build_extractive_timeline(
+                    timeline_turns,
+                    max_chars=CORE_MEMORY_TARGET_CHARS,
+                )
                 timeline_block = await server.block_manager.update_block_async(
                     block_id=timeline_block.id,
                     block_update=BlockUpdate(value=timeline_memory),
@@ -341,12 +311,68 @@ async def run_worker_async(
                     {
                         "stage": "ingest",
                         "conversation_id": conversation_id,
-                        "chunk": chunk_index,
-                        "mode": "official_block_update",
-                        "compacted": compacted,
+                        "chunk": 0,
+                        "mode": "official_block_update_extractive",
                         "block_chars": len(timeline_memory),
+                        **extraction_diagnostics,
                     },
                 )
+            else:
+                os.environ["DEEPSEEK_API_KEY"] = "EMPTY"
+                os.environ["DEEPSEEK_BASE_URL"] = endpoint
+                os.environ["DEEPSEEK_MODEL"] = "qwen3-vl-8b"
+                client, blocker = build_client_for_base_url(endpoint, require_api=require_api)
+                if client is None:
+                    raise RuntimeError(blocker or "Letta timeline compaction client unavailable")
+                timeline_memory = ""
+                chunks = chunk_timeline(timeline_turns)
+                for chunk_index, chunk in enumerate(chunks):
+                    combined = (timeline_memory + "\n" + chunk).strip()
+                    compacted = False
+                    if len(combined) > CORE_MEMORY_TARGET_CHARS:
+                        result = client.chat(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Maintain a bounded long-term timeline. Rewrite the supplied existing memory plus new segment "
+                                        f"into a factual chronological memory of at most {CORE_MEMORY_TARGET_CHARS} characters. Preserve important names, "
+                                        "dates, events, preferences, relationships, and compact source refs for retained facts. "
+                                        "Return only the rewritten memory, with no commentary."
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": f"[EXISTING_MEMORY]\n{timeline_memory}\n\n[NEW_SEGMENT]\n{chunk}",
+                                },
+                            ],
+                            temperature=0.0,
+                            max_tokens=COMPACTION_MAX_TOKENS,
+                        )
+                        timeline_memory = str(result.text or "").strip()
+                        compacted = True
+                        if not timeline_memory:
+                            raise RuntimeError(f"Letta block compaction returned empty output for {conversation_id} chunk {chunk_index}")
+                        if len(timeline_memory) > CORE_MEMORY_TARGET_CHARS:
+                            timeline_memory = timeline_memory[:CORE_MEMORY_TARGET_CHARS]
+                    else:
+                        timeline_memory = combined
+                    timeline_block = await server.block_manager.update_block_async(
+                        block_id=timeline_block.id,
+                        block_update=BlockUpdate(value=timeline_memory),
+                        actor=actor,
+                    )
+                    append_jsonl(
+                        worker_dir / "progress.jsonl",
+                        {
+                            "stage": "ingest",
+                            "conversation_id": conversation_id,
+                            "chunk": chunk_index,
+                            "mode": "official_block_update_rolling_llm",
+                            "compacted": compacted,
+                            "block_chars": len(timeline_memory),
+                        },
+                    )
             agent = await server.agent_manager.get_agent_by_id_async(agent_id=agent.id, actor=actor)
             loop = AgentLoop.load(agent_state=agent, actor=actor)
             for sample in samples:
@@ -428,6 +454,7 @@ async def run_worker_async(
                     "official_baseline": "letta_memgpt",
                     "official_repo": "https://github.com/letta-ai/letta",
                     "baseline_reproduction_level": "official_core_memory_block_api_timeline_adapter",
+                    "ingestion_mode": ingestion_mode,
                     "conversation_id": conversation_id,
                     "agent_id": str(agent.id),
                     "worker_id": worker_id,
@@ -473,6 +500,7 @@ def main() -> None:
         method=METHOD,
         endpoint=args.endpoint,
         allowed_endpoints=args.resume_allowed_endpoint,
+        expected_ingestion_mode=args.ingestion_mode if args.ingestion_mode != "rolling_llm" else None,
     )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
@@ -499,8 +527,16 @@ def main() -> None:
         "workers": workers,
         "requested_workers": args.workers,
         "endpoint": args.endpoint,
+        "ingestion_mode": args.ingestion_mode,
+        "extraction_algorithm_version": EXTRACTION_VERSION if args.ingestion_mode == "extractive" else None,
         "resume": resume_diagnostics,
-        "adapter_note": "Official SyncServer/CreateAgent/AgentLoop with deterministic BlockUpdate ingestion and bounded model compaction; Evidence R@5 is not reported because core memory is not ranked retrieval.",
+        "adapter_note": (
+            "Official SyncServer/CreateAgent/AgentLoop with deterministic query-independent extractive BlockUpdate ingestion; "
+            "Evidence R@5 is not reported because core memory is not ranked retrieval."
+            if args.ingestion_mode == "extractive"
+            else "Official SyncServer/CreateAgent/AgentLoop with deterministic BlockUpdate ingestion and bounded model compaction; "
+            "Evidence R@5 is not reported because core memory is not ranked retrieval."
+        ),
         "timeline_chunk_max_chars": TIMELINE_CHUNK_MAX_CHARS,
         "core_memory_limit_chars": CORE_MEMORY_LIMIT_CHARS,
         "core_memory_target_chars": CORE_MEMORY_TARGET_CHARS,
@@ -511,7 +547,19 @@ def main() -> None:
     if groups:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = [
-                pool.submit(run_worker, index, args.dataset, shard, str(run_dir), args.endpoint, args.max_steps, args.qa_max_steps, args.max_tokens, args.require_api)
+                pool.submit(
+                    run_worker,
+                    index,
+                    args.dataset,
+                    shard,
+                    str(run_dir),
+                    args.endpoint,
+                    args.max_steps,
+                    args.qa_max_steps,
+                    args.max_tokens,
+                    args.require_api,
+                    args.ingestion_mode,
+                )
                 for index, shard in enumerate(shard_groups(groups, workers))
             ]
             for future in as_completed(futures):

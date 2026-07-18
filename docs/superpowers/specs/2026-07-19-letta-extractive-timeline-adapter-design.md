@@ -18,9 +18,9 @@ Each turn is converted to a dated chronological record containing its session/da
 
 1. reserves a small header describing the extraction;
 2. groups records by session so every session receives chronological coverage;
-3. assigns a minimum per-session character budget;
+3. assigns a minimum per-session character budget when all sessions fit;
 4. distributes remaining capacity by session content size;
-5. samples records uniformly within each session when all records do not fit;
+5. samples sessions uniformly when the memory cannot represent every session, then samples records uniformly within retained sessions;
 6. truncates individual records only after session and temporal coverage are preserved;
 7. emits selected records in global chronological order at no more than 6500 characters.
 

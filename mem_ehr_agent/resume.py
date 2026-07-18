@@ -26,6 +26,7 @@ def load_valid_resume_predictions(
     method: str,
     endpoint: str,
     allowed_endpoints: Iterable[str] = (),
+    expected_ingestion_mode: str | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     sample_ids = {str(sample["sample_id"]) for sample in samples}
     accepted: dict[str, dict[str, Any]] = {}
@@ -51,6 +52,10 @@ def load_valid_resume_predictions(
                 raise ValueError(f"Resume row has the wrong endpoint at {location}: {row.get('endpoint')}")
             if row.get("guard_passed") is not True:
                 raise ValueError(f"Resume row did not pass its guard at {location}")
+            if expected_ingestion_mode is not None and row.get("ingestion_mode") != expected_ingestion_mode:
+                raise ValueError(
+                    f"Resume row has the wrong ingestion mode at {location}: {row.get('ingestion_mode')}"
+                )
             if not str(row.get("answer") or "").strip():
                 raise ValueError(f"Resume row has an empty answer at {location}")
             previous = accepted.get(sample_id)
@@ -67,5 +72,6 @@ def load_valid_resume_predictions(
         "accepted_count": len(accepted),
         "duplicate_count": duplicates,
         "allowed_endpoints": sorted(accepted_endpoints),
+        "expected_ingestion_mode": expected_ingestion_mode,
     }
     return accepted, diagnostics
