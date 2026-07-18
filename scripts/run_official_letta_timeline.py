@@ -81,11 +81,54 @@ def parse_json(text: str) -> dict[str, Any]:
 
 
 def assistant_texts(dump: dict[str, Any]) -> list[str]:
-    return [
-        str(message.get("content"))
-        for message in dump.get("messages") or []
-        if message.get("message_type") == "assistant_message" and message.get("content")
-    ]
+    texts: list[str] = []
+    for message in dump.get("messages") or []:
+        message_type = str(message.get("message_type") or "")
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if content and ("assistant" in message_type or role == "assistant"):
+            texts.append(str(content))
+    return texts
+
+
+def recover_plain_answer(text: str) -> tuple[str | None, str]:
+    """Recover a safe answer from a non-JSON assistant reply.
+
+    This is intentionally conservative: tool calls and long explanations remain
+    invalid, while a short answer (including an ``answer:`` field) is retained
+    as a valid model prediction for downstream judging.
+    """
+    cleaned = text.strip().strip("`").strip()
+    if not cleaned or "<tool_call>" in cleaned or len(cleaned) > 2000:
+        return None, "json"
+    match = re.search(r'["\']answer["\']\s*:\s*["\']([^"\']+)', cleaned, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip(), "recovered_answer_field"
+    label_match = re.fullmatch(r"(?:answer\s*:\s*)?(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if label_match:
+        answer = label_match.group(1).strip()
+        if answer:
+            return answer, "plain_assistant_answer"
+    return None, "json"
+
+
+def qa_parse_diagnostics(dump: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep compact model-return evidence when a QA turn cannot be parsed."""
+    diagnostics: list[dict[str, Any]] = []
+    for message in dump.get("messages") or []:
+        content = str(message.get("content") or "")
+        if not content:
+            continue
+        diagnostics.append(
+            {
+                "message_type": str(message.get("message_type") or ""),
+                "role": message.get("role"),
+                "name": message.get("name"),
+                "status": message.get("status"),
+                "content": content[:2000],
+            }
+        )
+    return diagnostics
 
 
 def successful_memory_tools(dump: dict[str, Any]) -> list[str]:
@@ -314,6 +357,7 @@ async def run_worker_async(
                 parse_mode = "json"
                 plain_candidate = ""
                 dump: dict[str, Any] = {}
+                failed_attempts: list[dict[str, Any]] = []
                 for attempt in range(3):
                     run = await create_run(server, actor, agent.id, "timeline_qa", f"{sample['sample_id']}:{attempt}")
                     response = await loop.step([MessageCreate(role=MessageRole.user, content=prompt)], max_steps=qa_max_steps, run_id=run.id)
@@ -324,17 +368,41 @@ async def run_worker_async(
                             raw = parse_json(texts[-1])
                             break
                         except Exception:
-                            text = str(texts[-1]).strip().strip("`").strip()
-                            match = re.search(r'["\']answer["\']\s*:\s*["\']([^"\']+)', text, flags=re.IGNORECASE)
-                            if match:
-                                plain_candidate = match.group(1).strip()
-                                parse_mode = "recovered_answer_field"
-                            elif text and "<tool_call>" not in text and len(text) <= 2000:
-                                plain_candidate = text
-                                parse_mode = "plain_assistant_answer"
+                            candidate, candidate_mode = recover_plain_answer(texts[-1])
+                            if candidate:
+                                plain_candidate = candidate
+                                parse_mode = candidate_mode
+                    failed_attempts.append({"attempt": attempt, "messages": qa_parse_diagnostics(dump)})
+                if raw is None and not plain_candidate:
+                    plain_prompt = (
+                        "Answer the question from timeline_memory only. Do not call tools and do not modify memory. "
+                        "Return only the concise answer text: no JSON, label, explanation, markdown, or tool call.\nQuestion: "
+                        + str(sample["question"])
+                    )
+                    plain_run = await create_run(server, actor, agent.id, "timeline_qa_plain_retry", f"{sample['sample_id']}:plain")
+                    plain_response = await loop.step(
+                        [MessageCreate(role=MessageRole.user, content=plain_prompt)], max_steps=1, run_id=plain_run.id
+                    )
+                    dump = plain_response.model_dump(mode="json")
+                    texts = assistant_texts(dump)
+                    if texts:
+                        candidate, candidate_mode = recover_plain_answer(texts[-1])
+                        if candidate:
+                            plain_candidate = candidate
+                            parse_mode = "plain_retry_" + candidate_mode
+                    failed_attempts.append({"attempt": "plain_retry", "messages": qa_parse_diagnostics(dump)})
                 if raw is None and plain_candidate:
                     raw = {"answer": plain_candidate, "confidence": 0.5}
                 if raw is None:
+                    append_jsonl(
+                        worker_dir / "qa_parse_failures.jsonl",
+                        {
+                            "sample_id": sample["sample_id"],
+                            "dataset": sample["dataset"],
+                            "conversation_id": conversation_id,
+                            "attempts": failed_attempts,
+                        },
+                    )
                     raise RuntimeError(f"Letta returned no parseable answer for {sample['sample_id']}")
                 usage = dump.get("usage") or {}
                 pred = {
