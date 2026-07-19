@@ -152,6 +152,10 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         sample_manifest=args.sample_manifest,
         timeline_card_granularity=args.timeline_card_granularity,
         timeline_card_max_chars=args.timeline_card_max_chars,
+        timeline_retriever=args.timeline_retriever,
+        timeline_embedding_model=args.timeline_embedding_model,
+        timeline_semantic_rrf_weight=args.timeline_semantic_rrf_weight,
+        timeline_embedding_window_tokens=args.timeline_embedding_window_tokens,
     )
     print(f"run_dir={run_dir}")
 
@@ -379,6 +383,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4000,
         help="Maximum visible characters per session_chunk card; ignored for turn cards.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-retriever",
+        choices=("lexical", "hybrid_bge"),
+        default="lexical",
+        help="Opt-in timeline-card retriever; lexical preserves historical behavior.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-embedding-model",
+        default="BAAI/bge-small-en-v1.5",
+        help="Frozen sentence-transformers encoder used only by hybrid_bge.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-semantic-rrf-weight",
+        type=float,
+        default=1.0,
+        help="Semantic rank weight in hybrid_bge reciprocal-rank fusion.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-embedding-window-tokens",
+        type=int,
+        default=256,
+        help="Deterministic encoder-token window for long timeline cards.",
     )
     benchmark_run.set_defaults(func=cmd_benchmark_run)
     locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")

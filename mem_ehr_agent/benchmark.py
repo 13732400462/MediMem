@@ -45,8 +45,81 @@ LOCOMO_OFFICIAL_STYLE_METRICS = (
     "sbert_similarity",
 )
 TIMELINE_CARD_GRANULARITIES = {"turn", "session_chunk"}
+TIMELINE_RETRIEVERS = {"lexical", "hybrid_bge"}
+DEFAULT_TIMELINE_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS = 256
+BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 _SBERT_MODEL: Any | None = None
 _SBERT_UNAVAILABLE_REASON: str | None = None
+_TIMELINE_SEMANTIC_INDEX_CACHE: dict[str, dict[str, list[list[float]]]] = {}
+_TIMELINE_SEMANTIC_INDEX_LOCK = Lock()
+
+
+class TimelineSemanticEncoder:
+    def __init__(self, model_name: str) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "hybrid_bge retrieval requires sentence-transformers; "
+                "install the semantic optional dependency."
+            ) from exc
+        self.model_name = str(model_name).strip()
+        self.model = SentenceTransformer(self.model_name, device="cpu")
+        self.tokenizer = getattr(self.model, "tokenizer", None)
+        self._encode_lock = Lock()
+        first_module = self.model[0] if len(self.model) else None
+        auto_model = getattr(first_module, "auto_model", None)
+        config = getattr(auto_model, "config", None)
+        self.revision = str(getattr(config, "_commit_hash", None) or "unresolved")
+        model_path = Path(self.model_name)
+        if model_path.is_dir():
+            artifact_hash = hashlib.sha256()
+            for path in sorted(item for item in model_path.rglob("*") if item.is_file()):
+                artifact_hash.update(str(path.relative_to(model_path)).replace("\\", "/").encode("utf-8"))
+                with path.open("rb") as model_file:
+                    for block in iter(lambda: model_file.read(1024 * 1024), b""):
+                        artifact_hash.update(block)
+            self.artifact_sha256 = artifact_hash.hexdigest()
+        else:
+            identity_payload = f"{self.model_name}@{self.revision}"
+            self.artifact_sha256 = hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+
+    @property
+    def identity(self) -> dict[str, str]:
+        return {
+            "model": self.model_name,
+            "revision": self.revision,
+            "artifact_sha256": self.artifact_sha256,
+        }
+
+    def encode(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
+        inputs = [f"{BGE_QUERY_INSTRUCTION}{text}" if is_query else text for text in texts]
+        with self._encode_lock:
+            vectors = self.model.encode(
+                inputs,
+                batch_size=32,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        return [[float(value) for value in vector] for vector in vectors]
+
+    def windows(self, text: str, *, max_tokens: int) -> list[str]:
+        with self._encode_lock:
+            return timeline_card_windows(
+                text,
+                max_tokens=max_tokens,
+                tokenizer=self.tokenizer,
+            )
+
+    def windows(self, text: str, *, max_tokens: int) -> list[str]:
+        with self._encode_lock:
+            return timeline_card_windows(
+                text,
+                max_tokens=max_tokens,
+                tokenizer=self.tokenizer,
+            )
 
 
 @dataclass(frozen=True)
@@ -1167,6 +1240,30 @@ def normalize_timeline_card_config(card_granularity: str, card_max_chars: int) -
     return granularity, max_chars
 
 
+def normalize_timeline_retriever_config(
+    retriever: str,
+    embedding_model: str,
+    semantic_rrf_weight: float,
+    embedding_window_tokens: int,
+) -> tuple[str, str, float, int]:
+    normalized_retriever = str(retriever or "lexical").strip().lower()
+    if normalized_retriever not in TIMELINE_RETRIEVERS:
+        raise ValueError(
+            f"Unsupported timeline retriever {retriever!r}; "
+            f"expected one of {sorted(TIMELINE_RETRIEVERS)}."
+        )
+    normalized_model = str(embedding_model or DEFAULT_TIMELINE_EMBEDDING_MODEL).strip()
+    if not normalized_model:
+        raise ValueError("timeline embedding model must not be empty.")
+    normalized_weight = float(semantic_rrf_weight)
+    if normalized_weight <= 0:
+        raise ValueError("timeline semantic RRF weight must be positive.")
+    normalized_window = int(embedding_window_tokens)
+    if normalized_window <= 0:
+        raise ValueError("timeline embedding window tokens must be positive.")
+    return normalized_retriever, normalized_model, normalized_weight, normalized_window
+
+
 def current_git_commit() -> str | None:
     configured = str(os.getenv("MEDIMEM_GIT_COMMIT") or "").strip()
     if configured:
@@ -1190,13 +1287,35 @@ def locomo_cache_key(
     coarse_k: int,
     card_granularity: str = "turn",
     card_max_chars: int = 4000,
+    retriever: str = "lexical",
+    embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    semantic_rrf_weight: float = 1.0,
+    embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
 ) -> str:
     granularity, max_chars = normalize_timeline_card_config(card_granularity, card_max_chars)
+    normalized_retriever, normalized_model, normalized_weight, normalized_window = normalize_timeline_retriever_config(
+        retriever,
+        embedding_model,
+        semantic_rrf_weight,
+        embedding_window_tokens,
+    )
     raw_id = str(sample.get("conversation_id") or sample.get("sample_id") or "")
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
+    retriever_payload = json.dumps(
+        {
+            "retriever": normalized_retriever,
+            "embedding_model": normalized_model,
+            "semantic_rrf_weight": normalized_weight,
+            "embedding_window_tokens": normalized_window,
+            "code_commit": current_git_commit() or "unknown",
+        },
+        sort_keys=True,
+    )
+    retriever_hash = hashlib.sha256(retriever_payload.encode("utf-8")).hexdigest()[:12]
     return (
         f"{safe_id}__turns{len(sample.get('turns') or [])}__{dataset_hash[:12]}"
         f"__top{top_k}__coarse{coarse_k}__cards-{granularity}-{max_chars}"
+        f"__retriever-{normalized_retriever}-{retriever_hash}"
     )
 
 
@@ -1224,9 +1343,13 @@ def locomo_cached_memory_path(
     coarse_k: int,
     card_granularity: str = "turn",
     card_max_chars: int = 4000,
+    retriever: str = "lexical",
+    embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    semantic_rrf_weight: float = 1.0,
+    embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
 ) -> Path:
     return Path(cache_dir) / "locomo_memory_store" / (
-        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars)}"
+        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars, retriever=retriever, embedding_model=embedding_model, semantic_rrf_weight=semantic_rrf_weight, embedding_window_tokens=embedding_window_tokens)}"
         ".memory.jsonl"
     )
 
@@ -1241,6 +1364,10 @@ def build_cached_locomo_memory_store(
     fallback_path: str | Path,
     card_granularity: str = "turn",
     card_max_chars: int = 4000,
+    retriever: str = "lexical",
+    embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    semantic_rrf_weight: float = 1.0,
+    embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
 ) -> MemoryStore:
     if cache_dir is None:
         return build_locomo_memory_store(
@@ -1257,6 +1384,10 @@ def build_cached_locomo_memory_store(
         coarse_k=coarse_k,
         card_granularity=card_granularity,
         card_max_chars=card_max_chars,
+        retriever=retriever,
+        embedding_model=embedding_model,
+        semantic_rrf_weight=semantic_rrf_weight,
+        embedding_window_tokens=embedding_window_tokens,
     )
     ensure_dir(memory_path.parent)
     lock_path = memory_path.with_suffix(memory_path.suffix + ".lock")
@@ -1602,12 +1733,164 @@ def locomo_retrieval_score(query: str, sample: dict[str, Any], memory: dict[str,
     return score
 
 
+def timeline_card_windows(
+    text: str,
+    *,
+    max_tokens: int,
+    tokenizer: Any | None = None,
+) -> list[str]:
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive.")
+    normalized = str(text or "").strip()
+    if not normalized:
+        return []
+    if tokenizer is not None:
+        token_ids = tokenizer.encode(normalized, add_special_tokens=False)
+        windows = [
+            tokenizer.decode(
+                token_ids[start : start + max_tokens],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            for start in range(0, len(token_ids), max_tokens)
+        ]
+        return [window for window in windows if window]
+    tokens = normalized.split()
+    return [" ".join(tokens[start : start + max_tokens]) for start in range(0, len(tokens), max_tokens)]
+
+
+def normalized_vector_cosine(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+
+
+def maximum_window_similarity(query_vector: list[float], window_vectors: list[list[float]]) -> float:
+    if not window_vectors:
+        return 0.0
+    return max(normalized_vector_cosine(query_vector, vector) for vector in window_vectors)
+
+
+def weighted_rrf_scores(
+    lexical_order: list[str],
+    semantic_order: list[str],
+    *,
+    semantic_weight: float,
+    rank_constant: int = 60,
+) -> dict[str, float]:
+    if semantic_weight <= 0:
+        raise ValueError("semantic_weight must be positive.")
+    if rank_constant < 0:
+        raise ValueError("rank_constant must not be negative.")
+    scores: dict[str, float] = {}
+    for rank, memory_id in enumerate(lexical_order, start=1):
+        scores[memory_id] = scores.get(memory_id, 0.0) + 1.0 / (rank_constant + rank)
+    for rank, memory_id in enumerate(semantic_order, start=1):
+        scores[memory_id] = scores.get(memory_id, 0.0) + semantic_weight / (rank_constant + rank)
+    return scores
+
+
+def timeline_semantic_cache_path(
+    store: MemoryStore,
+    *,
+    encoder_identity: dict[str, str],
+    embedding_window_tokens: int,
+) -> Path:
+    payload = json.dumps(
+        {
+            "encoder": encoder_identity,
+            "embedding_window_tokens": int(embedding_window_tokens),
+        },
+        sort_keys=True,
+    )
+    fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return store.path.with_suffix(store.path.suffix + f".semantic-{fingerprint}.json")
+
+
+def build_timeline_semantic_index(
+    store: MemoryStore,
+    encoder: Any,
+    *,
+    embedding_window_tokens: int,
+) -> dict[str, list[list[float]]]:
+    identity = dict(encoder.identity)
+    cache_path = timeline_semantic_cache_path(
+        store,
+        encoder_identity=identity,
+        embedding_window_tokens=embedding_window_tokens,
+    )
+    memory_key = str(cache_path.resolve())
+    with _TIMELINE_SEMANTIC_INDEX_LOCK:
+        cached = _TIMELINE_SEMANTIC_INDEX_CACHE.get(memory_key)
+        if cached is not None:
+            return cached
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("encoder") == identity
+                and int(payload.get("embedding_window_tokens") or 0) == int(embedding_window_tokens)
+            ):
+                index = {
+                    str(memory_id): [[float(value) for value in vector] for vector in vectors]
+                    for memory_id, vectors in dict(payload.get("cards") or {}).items()
+                }
+                _TIMELINE_SEMANTIC_INDEX_CACHE[memory_key] = index
+                return index
+
+        card_windows: dict[str, list[str]] = {}
+        flat_windows: list[str] = []
+        flat_owners: list[str] = []
+        for card in store.cards:
+            if card.get("status") not in {"active", "flagged"}:
+                continue
+            memory_id = str(card.get("memory_id") or "")
+            if hasattr(encoder, "windows"):
+                windows = encoder.windows(
+                    locomo_memory_retrieval_text(card),
+                    max_tokens=embedding_window_tokens,
+                )
+            else:
+                windows = timeline_card_windows(
+                    locomo_memory_retrieval_text(card),
+                    max_tokens=embedding_window_tokens,
+                    tokenizer=getattr(encoder, "tokenizer", None),
+                )
+            card_windows[memory_id] = windows
+            flat_windows.extend(windows)
+            flat_owners.extend([memory_id] * len(windows))
+
+        vectors = encoder.encode(flat_windows, is_query=False) if flat_windows else []
+        index: dict[str, list[list[float]]] = {memory_id: [] for memory_id in card_windows}
+        for memory_id, vector in zip(flat_owners, vectors):
+            index[memory_id].append(vector)
+        payload = {
+            "encoder": identity,
+            "embedding_window_tokens": int(embedding_window_tokens),
+            "card_count": len(index),
+            "cards": index,
+        }
+        ensure_dir(cache_path.parent)
+        temp_path = cache_path.with_suffix(cache_path.suffix + f".tmp-{os.getpid()}")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(temp_path, cache_path)
+        _TIMELINE_SEMANTIC_INDEX_CACHE[memory_key] = index
+        return index
+
+
 def retrieve_locomo_memories(
     store: MemoryStore,
     sample: dict[str, Any],
     *,
     top_k: int = 8,
     coarse_k: int = 32,
+    retriever: str = "lexical",
+    semantic_encoder: Any | None = None,
+    semantic_rrf_weight: float = 1.0,
+    embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
 ) -> list[dict[str, Any]]:
     query = locomo_expanded_query(sample)
     scored: list[tuple[float, dict[str, Any]]] = []
@@ -1624,6 +1907,54 @@ def retrieve_locomo_memories(
         ),
         reverse=True,
     )
+    if retriever == "hybrid_bge":
+        if semantic_encoder is None:
+            raise RuntimeError("hybrid_bge retrieval requires a semantic encoder.")
+        semantic_index = build_timeline_semantic_index(
+            store,
+            semantic_encoder,
+            embedding_window_tokens=embedding_window_tokens,
+        )
+        query_vector = semantic_encoder.encode([query], is_query=True)[0]
+        semantic_scores = {
+            str(card.get("memory_id") or ""): maximum_window_similarity(
+                query_vector,
+                semantic_index.get(str(card.get("memory_id") or ""), []),
+            )
+            for _, card in scored
+        }
+        semantic_order = sorted(
+            semantic_scores,
+            key=lambda memory_id: (semantic_scores[memory_id], memory_id),
+            reverse=True,
+        )
+        lexical_order = [str(card.get("memory_id") or "") for _, card in scored]
+        fused_scores = weighted_rrf_scores(
+            lexical_order,
+            semantic_order,
+            semantic_weight=semantic_rrf_weight,
+        )
+        lexical_scores = {str(card.get("memory_id") or ""): score for score, card in scored}
+        cards_by_id = {str(card.get("memory_id") or ""): card for _, card in scored}
+        fused_order = sorted(
+            cards_by_id,
+            key=lambda memory_id: (
+                fused_scores[memory_id],
+                lexical_scores[memory_id],
+                semantic_scores[memory_id],
+                memory_id,
+            ),
+            reverse=True,
+        )
+        return [
+            cards_by_id[memory_id]
+            | {
+                "retrieval_score": fused_scores[memory_id],
+                "lexical_retrieval_score": lexical_scores[memory_id],
+                "semantic_retrieval_score": semantic_scores[memory_id],
+            }
+            for memory_id in fused_order[:top_k]
+        ]
     coarse = scored[: max(top_k, coarse_k)]
     return [card | {"retrieval_score": score} for score, card in coarse[:top_k]]
 
@@ -1674,6 +2005,11 @@ def run_locomo_ours_memory_pipeline(
     dataset_hash: str = "",
     card_granularity: str = "turn",
     card_max_chars: int = 4000,
+    timeline_retriever: str = "lexical",
+    timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    timeline_semantic_rrf_weight: float = 1.0,
+    timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    semantic_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
@@ -1688,8 +2024,21 @@ def run_locomo_ours_memory_pipeline(
         fallback_path=memory_path,
         card_granularity=card_granularity,
         card_max_chars=card_max_chars,
+        retriever=timeline_retriever,
+        embedding_model=timeline_embedding_model,
+        semantic_rrf_weight=timeline_semantic_rrf_weight,
+        embedding_window_tokens=timeline_embedding_window_tokens,
     )
-    retrieved = retrieve_locomo_memories(store, sample, top_k=top_k, coarse_k=coarse_k)
+    retrieved = retrieve_locomo_memories(
+        store,
+        sample,
+        top_k=top_k,
+        coarse_k=coarse_k,
+        retriever=timeline_retriever,
+        semantic_encoder=semantic_encoder,
+        semantic_rrf_weight=timeline_semantic_rrf_weight,
+        embedding_window_tokens=timeline_embedding_window_tokens,
+    )
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
     prompt_context = (
         "[RETRIEVED_MEMORY_CARDS]\n"
@@ -1717,6 +2066,17 @@ def run_locomo_ours_memory_pipeline(
     pred["locomo_coarse_k"] = coarse_k
     pred["timeline_card_granularity"] = card_granularity
     pred["timeline_card_max_chars"] = card_max_chars
+    pred["timeline_retriever"] = timeline_retriever
+    pred["timeline_embedding_model"] = timeline_embedding_model if timeline_retriever == "hybrid_bge" else None
+    pred["timeline_semantic_rrf_weight"] = (
+        timeline_semantic_rrf_weight if timeline_retriever == "hybrid_bge" else None
+    )
+    pred["timeline_embedding_window_tokens"] = (
+        timeline_embedding_window_tokens if timeline_retriever == "hybrid_bge" else None
+    )
+    pred["timeline_encoder_identity"] = (
+        dict(semantic_encoder.identity) if timeline_retriever == "hybrid_bge" and semantic_encoder is not None else None
+    )
     pred["retrieval_query"] = locomo_expanded_query(sample)
     pred["retrieved_evidence_refs"] = sorted(
         {str(ref) for memory in retrieved for ref in memory.get("evidence_refs", []) if str(ref).strip()}
@@ -1727,7 +2087,7 @@ def run_locomo_ours_memory_pipeline(
     pred["retrieved_memory_ids"] = [str(memory.get("memory_id") or "") for memory in retrieved]
     pred["pipeline_note"] = (
         f"{dataset} timeline items are written to {card_granularity} JSONL memory cards with entity/time metadata; "
-        "QA prompt receives only two-stage retrieved memory cards."
+        f"{timeline_retriever} retrieval selects the cards; QA prompt receives only retrieved memory cards."
     )
     return pred
 
@@ -1954,6 +2314,11 @@ def run_local_method(
     dataset_hash: str = "",
     timeline_card_granularity: str = "turn",
     timeline_card_max_chars: int = 4000,
+    timeline_retriever: str = "lexical",
+    timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    timeline_semantic_rrf_weight: float = 1.0,
+    timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    semantic_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     if method == "direct":
@@ -2000,6 +2365,11 @@ def run_local_method(
             dataset_hash=dataset_hash,
             card_granularity=timeline_card_granularity,
             card_max_chars=timeline_card_max_chars,
+            timeline_retriever=timeline_retriever,
+            timeline_embedding_model=timeline_embedding_model,
+            timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
+            timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+            semantic_encoder=semantic_encoder,
         )
         if method_label:
             pred["method"] = method_label
@@ -2296,10 +2666,25 @@ def run_native_benchmark(
     sample_manifest: str | Path | None = None,
     timeline_card_granularity: str = "turn",
     timeline_card_max_chars: int = 4000,
+    timeline_retriever: str = "lexical",
+    timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
+    timeline_semantic_rrf_weight: float = 1.0,
+    timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
 ) -> Path:
     timeline_card_granularity, timeline_card_max_chars = normalize_timeline_card_config(
         timeline_card_granularity,
         timeline_card_max_chars,
+    )
+    (
+        timeline_retriever,
+        timeline_embedding_model,
+        timeline_semantic_rrf_weight,
+        timeline_embedding_window_tokens,
+    ) = normalize_timeline_retriever_config(
+        timeline_retriever,
+        timeline_embedding_model,
+        timeline_semantic_rrf_weight,
+        timeline_embedding_window_tokens,
     )
     source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
     if dataset == "dialsim":
@@ -2324,6 +2709,9 @@ def run_native_benchmark(
     predictions: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     amem_runtimes: dict[str, LocomoAMEMRuntime] = {}
+    semantic_encoder: TimelineSemanticEncoder | None = None
+    if timeline_retriever == "hybrid_bge" and ("ours" in methods or "medimem" in methods):
+        semantic_encoder = TimelineSemanticEncoder(timeline_embedding_model)
     if ("ours" in methods or "medimem" in methods) and samples:
         seen_conversations: set[str] = set()
         for sample in samples:
@@ -2339,6 +2727,10 @@ def run_native_benchmark(
                 fallback_path=locomo_memory_path(run_dir, conversation_id),
                 card_granularity=timeline_card_granularity,
                 card_max_chars=timeline_card_max_chars,
+                retriever=timeline_retriever,
+                embedding_model=timeline_embedding_model,
+                semantic_rrf_weight=timeline_semantic_rrf_weight,
+                embedding_window_tokens=timeline_embedding_window_tokens,
             )
             seen_conversations.add(conversation_id)
     if "amem" in methods:
@@ -2375,6 +2767,11 @@ def run_native_benchmark(
                                     method_label=label,
                                     timeline_card_granularity=timeline_card_granularity,
                                     timeline_card_max_chars=timeline_card_max_chars,
+                                    timeline_retriever=timeline_retriever,
+                                    timeline_embedding_model=timeline_embedding_model,
+                                    timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
+                                    timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+                                    semantic_encoder=semantic_encoder,
                                 )
                             ] = f"{sample['sample_id']}:{label}"
                 else:
@@ -2393,6 +2790,11 @@ def run_native_benchmark(
                             dataset_hash=dataset_hash,
                             timeline_card_granularity=timeline_card_granularity,
                             timeline_card_max_chars=timeline_card_max_chars,
+                            timeline_retriever=timeline_retriever,
+                            timeline_embedding_model=timeline_embedding_model,
+                            timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
+                            timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+                            semantic_encoder=semantic_encoder,
                         ): sample["sample_id"]
                         for sample in samples
                     }
@@ -2482,7 +2884,7 @@ def run_native_benchmark(
             "official_repo": None,
             "core_flow": (
                 f"Entity/time-aware {timeline_card_granularity} JSONL memory cards, expanded-query "
-                "retrieval, rerank to top-k, QA over retrieved memories only."
+                f"{timeline_retriever} retrieval, rerank to top-k, QA over retrieved memories only."
             ),
         },
         amem_label: {
@@ -2527,6 +2929,15 @@ def run_native_benchmark(
         "locomo_coarse_k": locomo_coarse_k,
         "timeline_card_granularity": timeline_card_granularity,
         "timeline_card_max_chars": timeline_card_max_chars,
+        "timeline_retriever": timeline_retriever,
+        "timeline_embedding_model": timeline_embedding_model if timeline_retriever == "hybrid_bge" else None,
+        "timeline_semantic_rrf_weight": (
+            timeline_semantic_rrf_weight if timeline_retriever == "hybrid_bge" else None
+        ),
+        "timeline_embedding_window_tokens": (
+            timeline_embedding_window_tokens if timeline_retriever == "hybrid_bge" else None
+        ),
+        "timeline_encoder_identity": dict(semantic_encoder.identity) if semantic_encoder is not None else None,
         "git_commit": current_git_commit(),
         "top_k_sweep": sweep_values,
         "judge_answers": judge_answers,
@@ -2566,7 +2977,8 @@ def run_native_benchmark(
             "static_rag": "Frozen timeline chunks -> lexical top-k retrieval -> QA over retrieved chunks only.",
             "medimem": (
                 f"Timeline turns -> entity/time-aware {timeline_card_granularity} JSONL MemoryStore cards "
-                "-> expanded-query coarse retrieval -> rerank to top-k -> QA over retrieved memory cards only."
+                f"-> {timeline_retriever} expanded-query retrieval -> rerank to top-k -> "
+                "QA over retrieved memory cards only."
             ),
             "ours": "Backward-compatible alias for medimem.",
             "amem": "Timeline turns -> SourceAlignedAMEMSystem.add_note/process_memory -> find_related_memories_raw top-k -> QA.",

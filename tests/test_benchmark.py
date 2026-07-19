@@ -4,6 +4,7 @@ from mem_ehr_agent.benchmark import (
     FULL_CONTEXT_SHORTCUT_ADVICE,
     amem_retrieved_context,
     assert_no_full_context_shortcut,
+    build_timeline_semantic_index,
     build_locomo_memory_store,
     locomo_expanded_query,
     evaluate_benchmark_predictions,
@@ -15,6 +16,9 @@ from mem_ehr_agent.benchmark import (
     locomo_cache_key,
     locomo_memory_path,
     load_frozen_sample_ids,
+    maximum_window_similarity,
+    normalize_timeline_retriever_config,
+    normalized_vector_cosine,
     parse_int_list,
     parse_methods,
     qa_prompt,
@@ -22,10 +26,13 @@ from mem_ehr_agent.benchmark import (
     run_locomo_official_wrapper,
     run_locomo_ours_memory_pipeline,
     static_rag_retrieved_context,
+    timeline_card_windows,
     select_frozen_samples,
     validate_horizontal_run,
+    weighted_rrf_scores,
     judge_prediction,
 )
+from mem_ehr_agent.cli import build_parser
 from mem_ehr_agent.memory import MemoryStore
 
 
@@ -362,8 +369,145 @@ def test_locomo_cache_key_isolates_card_granularity_and_size():
         card_granularity="session_chunk",
         card_max_chars=6500,
     )
+    hybrid_weight_1 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+        retriever="hybrid_bge",
+        semantic_rrf_weight=1.0,
+    )
+    hybrid_weight_3 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+        retriever="hybrid_bge",
+        semantic_rrf_weight=3.0,
+    )
 
-    assert len({turn_key, session_4000, session_6500}) == 3
+    assert len({turn_key, session_4000, session_6500, hybrid_weight_1, hybrid_weight_3}) == 5
+
+
+def test_timeline_retriever_config_normalization_and_validation():
+    assert normalize_timeline_retriever_config("HYBRID_BGE", "model", 2, 128) == (
+        "hybrid_bge",
+        "model",
+        2.0,
+        128,
+    )
+    try:
+        normalize_timeline_retriever_config("unknown", "model", 1, 128)
+    except ValueError as exc:
+        assert "Unsupported timeline retriever" in str(exc)
+    else:
+        raise AssertionError("unknown retriever should fail")
+
+
+def test_timeline_card_windows_are_stable_and_lossless():
+    text = "one two three four five"
+    assert timeline_card_windows(text, max_tokens=2) == ["one two", "three four", "five"]
+    assert " ".join(timeline_card_windows(text, max_tokens=2)) == text
+
+
+def test_semantic_similarity_and_weighted_rrf_are_deterministic():
+    assert normalized_vector_cosine([1.0, 0.0], [2.0, 0.0]) == 1.0
+    assert maximum_window_similarity([1.0, 0.0], [[0.0, 1.0], [3.0, 0.0]]) == 1.0
+    scores = weighted_rrf_scores(["lex", "sem"], ["sem", "lex"], semantic_weight=3.0)
+    assert scores["sem"] > scores["lex"]
+    assert scores == weighted_rrf_scores(["lex", "sem"], ["sem", "lex"], semantic_weight=3.0)
+
+
+class FakeSemanticEncoder:
+    tokenizer = None
+    identity = {
+        "model": "fake-bge",
+        "revision": "test",
+        "artifact_sha256": "0" * 64,
+    }
+
+    def encode(self, texts, *, is_query=False):
+        vectors = []
+        for text in texts:
+            lower = text.lower()
+            semantic = 1.0 if any(term in lower for term in ("automobile", "car", "vehicle")) else 0.0
+            distractor = 1.0 if "rumor" in lower else 0.0
+            vectors.append([semantic, distractor])
+        return vectors
+
+
+def test_hybrid_retrieval_uses_static_semantic_index_without_labels(tmp_path):
+    sample = {
+        "sample_id": "q1",
+        "conversation_id": "c1",
+        "dataset": "locomo",
+        "question": "Which automobile was purchased?",
+        "answer": "SECRET ANSWER",
+        "evidence": ["SECRET REF"],
+        "turns": [
+            {
+                "speaker": "A",
+                "text": "A rumor mentioned the automobile.",
+                "session": "1",
+                "evidence_refs": ["D1"],
+            },
+            {
+                "speaker": "B",
+                "text": "Maya purchased a red car.",
+                "session": "2",
+                "evidence_refs": ["D2"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "hybrid.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    encoder = FakeSemanticEncoder()
+    index = build_timeline_semantic_index(store, encoder, embedding_window_tokens=16)
+    serialized = json.dumps(index)
+    assert "SECRET ANSWER" not in serialized
+    assert "SECRET REF" not in serialized
+    retrieved = retrieve_locomo_memories(
+        store,
+        sample,
+        top_k=1,
+        coarse_k=2,
+        retriever="hybrid_bge",
+        semantic_encoder=encoder,
+        semantic_rrf_weight=3.0,
+        embedding_window_tokens=16,
+    )
+    assert retrieved[0]["evidence_refs"] == ["D2"]
+    assert "semantic_retrieval_score" in retrieved[0]
+
+
+def test_benchmark_cli_exposes_hybrid_retrieval_flags():
+    args = build_parser().parse_args(
+        [
+            "benchmark",
+            "run",
+            "--dataset",
+            "locomo",
+            "--methods",
+            "medimem",
+            "--timeline-retriever",
+            "hybrid_bge",
+            "--timeline-semantic-rrf-weight",
+            "2",
+            "--timeline-embedding-window-tokens",
+            "128",
+        ]
+    )
+    assert args.timeline_retriever == "hybrid_bge"
+    assert args.timeline_semantic_rrf_weight == 2.0
+    assert args.timeline_embedding_window_tokens == 128
 
 
 def test_parse_int_list_for_top_k_sweep():
