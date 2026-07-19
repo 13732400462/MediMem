@@ -113,14 +113,6 @@ class TimelineSemanticEncoder:
                 tokenizer=self.tokenizer,
             )
 
-    def windows(self, text: str, *, max_tokens: int) -> list[str]:
-        with self._encode_lock:
-            return timeline_card_windows(
-                text,
-                max_tokens=max_tokens,
-                tokenizer=self.tokenizer,
-            )
-
 
 @dataclass(frozen=True)
 class NativeBenchmarkSpec:
