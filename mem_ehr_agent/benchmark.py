@@ -7,6 +7,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ LOCOMO_OFFICIAL_STYLE_METRICS = (
     "meteor",
     "sbert_similarity",
 )
+TIMELINE_CARD_GRANULARITIES = {"turn", "session_chunk"}
 _SBERT_MODEL: Any | None = None
 _SBERT_UNAVAILABLE_REASON: str | None = None
 
@@ -1152,10 +1154,50 @@ def locomo_memory_path(run_dir: str | Path, conversation_id: str) -> Path:
     return Path(run_dir) / "memory" / "ours" / f"{safe_id}.memory.jsonl"
 
 
-def locomo_cache_key(sample: dict[str, Any], *, dataset_hash: str, top_k: int, coarse_k: int) -> str:
+def normalize_timeline_card_config(card_granularity: str, card_max_chars: int) -> tuple[str, int]:
+    granularity = str(card_granularity or "turn").strip().lower()
+    if granularity not in TIMELINE_CARD_GRANULARITIES:
+        raise ValueError(
+            f"Unsupported timeline card granularity {card_granularity!r}; "
+            f"expected one of {sorted(TIMELINE_CARD_GRANULARITIES)}."
+        )
+    max_chars = int(card_max_chars)
+    if max_chars <= 0:
+        raise ValueError("timeline card max chars must be a positive integer.")
+    return granularity, max_chars
+
+
+def current_git_commit() -> str | None:
+    configured = str(os.getenv("MEDIMEM_GIT_COMMIT") or "").strip()
+    if configured:
+        return configured
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def locomo_cache_key(
+    sample: dict[str, Any],
+    *,
+    dataset_hash: str,
+    top_k: int,
+    coarse_k: int,
+    card_granularity: str = "turn",
+    card_max_chars: int = 4000,
+) -> str:
+    granularity, max_chars = normalize_timeline_card_config(card_granularity, card_max_chars)
     raw_id = str(sample.get("conversation_id") or sample.get("sample_id") or "")
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
-    return f"{safe_id}__turns{len(sample.get('turns') or [])}__{dataset_hash[:12]}__top{top_k}__coarse{coarse_k}"
+    return (
+        f"{safe_id}__turns{len(sample.get('turns') or [])}__{dataset_hash[:12]}"
+        f"__top{top_k}__coarse{coarse_k}__cards-{granularity}-{max_chars}"
+    )
 
 
 def locomo_dataset_hash(samples: list[dict[str, Any]]) -> str:
@@ -1180,8 +1222,13 @@ def locomo_cached_memory_path(
     dataset_hash: str,
     top_k: int,
     coarse_k: int,
+    card_granularity: str = "turn",
+    card_max_chars: int = 4000,
 ) -> Path:
-    return Path(cache_dir) / "locomo_memory_store" / f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k)}.memory.jsonl"
+    return Path(cache_dir) / "locomo_memory_store" / (
+        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars)}"
+        ".memory.jsonl"
+    )
 
 
 def build_cached_locomo_memory_store(
@@ -1192,10 +1239,25 @@ def build_cached_locomo_memory_store(
     top_k: int,
     coarse_k: int,
     fallback_path: str | Path,
+    card_granularity: str = "turn",
+    card_max_chars: int = 4000,
 ) -> MemoryStore:
     if cache_dir is None:
-        return build_locomo_memory_store(sample, fallback_path)
-    memory_path = locomo_cached_memory_path(cache_dir, sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k)
+        return build_locomo_memory_store(
+            sample,
+            fallback_path,
+            card_granularity=card_granularity,
+            card_max_chars=card_max_chars,
+        )
+    memory_path = locomo_cached_memory_path(
+        cache_dir,
+        sample,
+        dataset_hash=dataset_hash,
+        top_k=top_k,
+        coarse_k=coarse_k,
+        card_granularity=card_granularity,
+        card_max_chars=card_max_chars,
+    )
     ensure_dir(memory_path.parent)
     lock_path = memory_path.with_suffix(memory_path.suffix + ".lock")
     while True:
@@ -1209,7 +1271,12 @@ def build_cached_locomo_memory_store(
             # a reader can observe a partially written final line.
             time.sleep(0.05)
     try:
-        return build_locomo_memory_store(sample, memory_path)
+        return build_locomo_memory_store(
+            sample,
+            memory_path,
+            card_granularity=card_granularity,
+            card_max_chars=card_max_chars,
+        )
     finally:
         try:
             lock_path.unlink()
@@ -1217,48 +1284,145 @@ def build_cached_locomo_memory_store(
             pass
 
 
-def build_locomo_memory_store(sample: dict[str, Any], memory_path: str | Path) -> MemoryStore:
-    store = MemoryStore.load(str(sample.get("conversation_id") or sample["sample_id"]), memory_path)
-    if store.cards:
-        return store
-    wrote_card = False
+def stable_unique(values: list[Any]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
+
+
+def timeline_turn_refs(turn: dict[str, Any]) -> list[str]:
+    explicit_refs = turn.get("evidence_refs") or []
+    if isinstance(explicit_refs, str):
+        explicit_refs = [explicit_refs]
+    refs = stable_unique(list(explicit_refs))
+    if refs:
+        return refs
+    return stable_unique([turn.get("dia_id") or turn.get("event_id") or turn.get("session")])
+
+
+def session_chunk_groups(sample: dict[str, Any], *, max_chars: int) -> list[dict[str, Any]]:
+    sessions: dict[str, list[dict[str, Any]]] = {}
     for turn in sample.get("turns", []):
         text = normalize_answer(turn.get("text"))
         if not text:
             continue
-        explicit_refs = turn.get("evidence_refs") or []
-        if isinstance(explicit_refs, str):
-            explicit_refs = [explicit_refs]
-        refs = [str(item) for item in explicit_refs if str(item).strip()]
-        if not refs:
-            value = str(turn.get("dia_id") or turn.get("event_id") or turn.get("session") or "").strip()
-            if value:
-                refs.append(value)
-        dataset = str(sample.get("dataset") or ("locomo" if "locomo" in turn.get("tags", []) else "native_benchmark"))
-        card_tags = [str(tag) for tag in turn.get("tags", []) if str(tag).strip()]
-        for tag in ("dialogue", dataset, str(turn.get("speaker") or "").strip()):
+        session = str(turn.get("session") or turn.get("session_date") or "unknown")
+        sessions.setdefault(session, []).append(turn)
+
+    chunks: list[dict[str, Any]] = []
+    for session, turns in sessions.items():
+        lines: list[str] = []
+        chunk_turns: list[dict[str, Any]] = []
+        current_chars = 0
+
+        def emit() -> None:
+            if not chunk_turns:
+                return
+            chunks.append(
+                {
+                    "session": session,
+                    "chunk_index": sum(1 for chunk in chunks if chunk["session"] == session),
+                    "summary": "\n".join(lines),
+                    "turns": list(chunk_turns),
+                }
+            )
+
+        for turn in turns:
+            line = (
+                f"speaker={str(turn.get('speaker') or '').strip()} "
+                f"text={normalize_answer(turn.get('text'))}"
+            ).strip()
+            added_chars = len(line) + (1 if lines else 0)
+            if lines and current_chars + added_chars > max_chars:
+                emit()
+                lines = []
+                chunk_turns = []
+                current_chars = 0
+                added_chars = len(line)
+            lines.append(line)
+            chunk_turns.append(turn)
+            current_chars += added_chars
+        emit()
+    return chunks
+
+
+def build_locomo_memory_store(
+    sample: dict[str, Any],
+    memory_path: str | Path,
+    *,
+    card_granularity: str = "turn",
+    card_max_chars: int = 4000,
+) -> MemoryStore:
+    granularity, max_chars = normalize_timeline_card_config(card_granularity, card_max_chars)
+    store = MemoryStore.load(str(sample.get("conversation_id") or sample["sample_id"]), memory_path)
+    if store.cards:
+        return store
+    wrote_card = False
+    if granularity == "session_chunk":
+        card_inputs = session_chunk_groups(sample, max_chars=max_chars)
+    else:
+        card_inputs = [
+            {
+                "session": turn.get("session"),
+                "chunk_index": 0,
+                "summary": normalize_answer(turn.get("text")),
+                "turns": [turn],
+            }
+            for turn in sample.get("turns", [])
+            if normalize_answer(turn.get("text"))
+        ]
+    for card_input in card_inputs:
+        card_turns = list(card_input["turns"])
+        first_turn = card_turns[0]
+        last_turn = card_turns[-1]
+        text = str(card_input["summary"]).strip()
+        if not text:
+            continue
+        refs = stable_unique([ref for card_turn in card_turns for ref in timeline_turn_refs(card_turn)])
+        dataset = str(
+            sample.get("dataset")
+            or ("locomo" if any("locomo" in card_turn.get("tags", []) for card_turn in card_turns) else "native_benchmark")
+        )
+        speakers = stable_unique([card_turn.get("speaker") for card_turn in card_turns])
+        card_tags = stable_unique([tag for card_turn in card_turns for tag in card_turn.get("tags", [])])
+        for tag in ("dialogue", dataset, *speakers):
             if tag and tag not in card_tags:
                 card_tags.append(tag)
         store.write_card(
             summary=text,
             evidence_refs=refs,
             time_scope={
-                "session": turn.get("session"),
-                "time": turn.get("time"),
-                "date": turn.get("session_date"),
+                "session": card_input["session"],
+                "time": first_turn.get("time"),
+                "date": first_turn.get("session_date"),
+                "end_time": last_turn.get("time"),
+                "end_date": last_turn.get("session_date"),
             },
             confidence=0.72,
             tags=card_tags,
             status="active",
             op="Write",
         )
-        store.cards[-1]["speaker"] = str(turn.get("speaker") or "").strip()
+        store.cards[-1]["speaker"] = ", ".join(speakers)
+        store.cards[-1]["speakers"] = speakers
         store.cards[-1]["entities"] = extract_locomo_entities(text)
         store.cards[-1]["temporal_markers"] = extract_locomo_temporal_markers(
             text,
-            turn.get("session_date"),
-            turn.get("time"),
+            first_turn.get("session_date"),
+            first_turn.get("time"),
+            last_turn.get("session_date"),
+            last_turn.get("time"),
         )
+        store.cards[-1]["card_granularity"] = granularity
+        store.cards[-1]["chunk_index"] = int(card_input["chunk_index"])
+        store.cards[-1]["turn_count"] = len(card_turns)
+        store.cards[-1]["card_max_chars"] = max_chars
         wrote_card = True
     if wrote_card:
         store.save()
@@ -1508,6 +1672,8 @@ def run_locomo_ours_memory_pipeline(
     require_api: bool,
     memory_cache_dir: str | Path | None = None,
     dataset_hash: str = "",
+    card_granularity: str = "turn",
+    card_max_chars: int = 4000,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
@@ -1520,6 +1686,8 @@ def run_locomo_ours_memory_pipeline(
         top_k=top_k,
         coarse_k=coarse_k,
         fallback_path=memory_path,
+        card_granularity=card_granularity,
+        card_max_chars=card_max_chars,
     )
     retrieved = retrieve_locomo_memories(store, sample, top_k=top_k, coarse_k=coarse_k)
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
@@ -1547,6 +1715,8 @@ def run_locomo_ours_memory_pipeline(
     pred["guard_passed"] = True
     pred["locomo_top_k"] = top_k
     pred["locomo_coarse_k"] = coarse_k
+    pred["timeline_card_granularity"] = card_granularity
+    pred["timeline_card_max_chars"] = card_max_chars
     pred["retrieval_query"] = locomo_expanded_query(sample)
     pred["retrieved_evidence_refs"] = sorted(
         {str(ref) for memory in retrieved for ref in memory.get("evidence_refs", []) if str(ref).strip()}
@@ -1556,7 +1726,7 @@ def run_locomo_ours_memory_pipeline(
     )
     pred["retrieved_memory_ids"] = [str(memory.get("memory_id") or "") for memory in retrieved]
     pred["pipeline_note"] = (
-        f"{dataset} timeline items are written to JSONL memory cards with entity/time metadata; "
+        f"{dataset} timeline items are written to {card_granularity} JSONL memory cards with entity/time metadata; "
         "QA prompt receives only two-stage retrieved memory cards."
     )
     return pred
@@ -1782,6 +1952,8 @@ def run_local_method(
     method_label: str | None = None,
     memory_cache_dir: str | Path | None = None,
     dataset_hash: str = "",
+    timeline_card_granularity: str = "turn",
+    timeline_card_max_chars: int = 4000,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     if method == "direct":
@@ -1826,6 +1998,8 @@ def run_local_method(
             require_api=require_api,
             memory_cache_dir=memory_cache_dir,
             dataset_hash=dataset_hash,
+            card_granularity=timeline_card_granularity,
+            card_max_chars=timeline_card_max_chars,
         )
         if method_label:
             pred["method"] = method_label
@@ -2120,7 +2294,13 @@ def run_native_benchmark(
     top_k_sweep: list[int] | None = None,
     judge_answers: bool = False,
     sample_manifest: str | Path | None = None,
+    timeline_card_granularity: str = "turn",
+    timeline_card_max_chars: int = 4000,
 ) -> Path:
+    timeline_card_granularity, timeline_card_max_chars = normalize_timeline_card_config(
+        timeline_card_granularity,
+        timeline_card_max_chars,
+    )
     source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
     if dataset == "dialsim":
         loaded_samples = load_dialsim_samples(
@@ -2157,6 +2337,8 @@ def run_native_benchmark(
                 top_k=locomo_top_k,
                 coarse_k=locomo_coarse_k,
                 fallback_path=locomo_memory_path(run_dir, conversation_id),
+                card_granularity=timeline_card_granularity,
+                card_max_chars=timeline_card_max_chars,
             )
             seen_conversations.add(conversation_id)
     if "amem" in methods:
@@ -2191,6 +2373,8 @@ def run_native_benchmark(
                                     locomo_top_k=top_k,
                                     locomo_coarse_k=max(int(locomo_coarse_k), top_k),
                                     method_label=label,
+                                    timeline_card_granularity=timeline_card_granularity,
+                                    timeline_card_max_chars=timeline_card_max_chars,
                                 )
                             ] = f"{sample['sample_id']}:{label}"
                 else:
@@ -2207,6 +2391,8 @@ def run_native_benchmark(
                             locomo_coarse_k=locomo_coarse_k,
                             memory_cache_dir=memory_cache_dir,
                             dataset_hash=dataset_hash,
+                            timeline_card_granularity=timeline_card_granularity,
+                            timeline_card_max_chars=timeline_card_max_chars,
                         ): sample["sample_id"]
                         for sample in samples
                     }
@@ -2294,7 +2480,10 @@ def run_native_benchmark(
         medimem_label: {
             "level": "project_pipeline",
             "official_repo": None,
-            "core_flow": "Entity/time-aware JSONL memory cards, expanded-query coarse retrieval, rerank to top-k, QA over retrieved memories only.",
+            "core_flow": (
+                f"Entity/time-aware {timeline_card_granularity} JSONL memory cards, expanded-query "
+                "retrieval, rerank to top-k, QA over retrieved memories only."
+            ),
         },
         amem_label: {
             "level": "official_native_locomo_wrapper",
@@ -2336,6 +2525,9 @@ def run_native_benchmark(
         "max_workers": max_workers,
         "locomo_top_k": locomo_top_k,
         "locomo_coarse_k": locomo_coarse_k,
+        "timeline_card_granularity": timeline_card_granularity,
+        "timeline_card_max_chars": timeline_card_max_chars,
+        "git_commit": current_git_commit(),
         "top_k_sweep": sweep_values,
         "judge_answers": judge_answers,
         "total_available_qa_samples": len(loaded_samples),
@@ -2372,7 +2564,10 @@ def run_native_benchmark(
         "pipeline_policies": {
             "direct": "Question-only QA baseline with no retrieved long-term memory.",
             "static_rag": "Frozen timeline chunks -> lexical top-k retrieval -> QA over retrieved chunks only.",
-            "medimem": "Timeline turns -> entity/time-aware JSONL MemoryStore cards -> expanded-query coarse retrieval -> rerank to top-k -> QA over retrieved memory cards only.",
+            "medimem": (
+                f"Timeline turns -> entity/time-aware {timeline_card_granularity} JSONL MemoryStore cards "
+                "-> expanded-query coarse retrieval -> rerank to top-k -> QA over retrieved memory cards only."
+            ),
             "ours": "Backward-compatible alias for medimem.",
             "amem": "Timeline turns -> SourceAlignedAMEMSystem.add_note/process_memory -> find_related_memories_raw top-k -> QA.",
         },

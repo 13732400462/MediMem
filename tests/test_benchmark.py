@@ -12,6 +12,7 @@ from mem_ehr_agent.benchmark import (
     load_longmemeval_samples,
     load_locomo_samples,
     load_rhelm_samples,
+    locomo_cache_key,
     locomo_memory_path,
     load_frozen_sample_ids,
     parse_int_list,
@@ -255,6 +256,114 @@ def test_locomo_memory_store_saves_enriched_cards_once(tmp_path, monkeypatch):
     assert reloaded.cards == store.cards
     assert reloaded.cards[0]["entities"] == ["Alice", "Boston", "Monday"]
     assert "Tuesday" in reloaded.cards[1]["temporal_markers"]
+
+
+def test_session_chunk_memory_cards_preserve_order_refs_and_hide_labels(tmp_path):
+    sample = {
+        "sample_id": "conv-session__qa_0000",
+        "conversation_id": "conv-session",
+        "dataset": "locomo",
+        "question": "Where did Alice go?",
+        "answer": "SECRET GOLD ANSWER",
+        "evidence": ["SECRET GOLD REF"],
+        "turns": [
+            {
+                "speaker": "Alice",
+                "text": "First visible turn.",
+                "session": "1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "Bob",
+                "text": "Second visible turn.",
+                "session": "1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:1"],
+            },
+            {
+                "speaker": "Alice",
+                "text": "Third session turn.",
+                "session": "2",
+                "session_date": "2025-01-02",
+                "evidence_refs": ["D2:0"],
+            },
+        ],
+    }
+
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "session.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+
+    assert len(store.cards) == 2
+    first = store.cards[0]
+    assert first["time_scope"]["session"] == "1"
+    assert first["evidence_refs"] == ["D1:0", "D1:1"]
+    assert first["summary"].index("First visible turn.") < first["summary"].index("Second visible turn.")
+    serialized = json.dumps(store.cards, ensure_ascii=False)
+    assert "SECRET GOLD ANSWER" not in serialized
+    assert "SECRET GOLD REF" not in serialized
+
+
+def test_session_chunk_memory_cards_split_without_losing_turns(tmp_path):
+    sample = {
+        "sample_id": "conv-split__qa_0000",
+        "conversation_id": "conv-split",
+        "dataset": "locomo",
+        "turns": [
+            {
+                "speaker": "Alice",
+                "text": f"Visible turn {index} " + ("x" * 45),
+                "session": "1",
+                "evidence_refs": [f"D1:{index}"],
+            }
+            for index in range(4)
+        ],
+    }
+
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "split.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=100,
+    )
+
+    assert len(store.cards) == 4
+    assert [card["evidence_refs"] for card in store.cards] == [[f"D1:{index}"] for index in range(4)]
+    assert [card["chunk_index"] for card in store.cards] == [0, 1, 2, 3]
+
+
+def test_locomo_cache_key_isolates_card_granularity_and_size():
+    sample = {"sample_id": "q1", "conversation_id": "c1", "turns": [{"text": "visible"}]}
+    turn_key = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="turn",
+        card_max_chars=4000,
+    )
+    session_4000 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    session_6500 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=6500,
+    )
+
+    assert len({turn_key, session_4000, session_6500}) == 3
 
 
 def test_parse_int_list_for_top_k_sweep():

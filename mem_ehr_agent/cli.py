@@ -150,6 +150,8 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         top_k_sweep=parse_int_list(args.top_k_sweep),
         judge_answers=args.judge_answers,
         sample_manifest=args.sample_manifest,
+        timeline_card_granularity=args.timeline_card_granularity,
+        timeline_card_max_chars=args.timeline_card_max_chars,
     )
     print(f"run_dir={run_dir}")
 
@@ -366,6 +368,18 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_run.add_argument("--top-k-sweep", default=None, help="Comma-separated LoCoMo ours top-k sweep, e.g. 8,16,32.")
     benchmark_run.add_argument("--judge-answers", action="store_true", help="Run the frozen blinded semantic-correctness judge.")
     benchmark_run.add_argument("--sample-manifest", default=None, help="Frozen JSON sample-ID manifest; disables resampling.")
+    benchmark_run.add_argument(
+        "--timeline-card-granularity",
+        choices=("turn", "session_chunk"),
+        default="turn",
+        help="MediMem timeline memory-card unit; defaults to the historical per-turn behavior.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-card-max-chars",
+        type=int,
+        default=4000,
+        help="Maximum visible characters per session_chunk card; ignored for turn cards.",
+    )
     benchmark_run.set_defaults(func=cmd_benchmark_run)
     locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")
     locomo_parallel.add_argument("--methods-a", default="direct,amem,memoryos,medimem")
