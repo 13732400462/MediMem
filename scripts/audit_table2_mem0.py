@@ -241,6 +241,9 @@ def main() -> None:
             for marker in ("Memory.from_config", ".add(", ".search(")
         ),
         "memory_add_infer_false": "infer=False" in source_text,
+        "uses_shared_answer_function": "answer_with_context(" in source_text,
+        "uses_shared_judge_evaluator": "judge_predictions(" in source_text,
+        "qwen3_vl_8b_configured": '"model": "qwen3-vl-8b"' in source_text,
         "gold_answer_passed_to_memory": 'sample["answer"]' in source_text[
             source_text.find("def run_official_mem0") :
         ],
@@ -259,6 +262,15 @@ def main() -> None:
     all_operational_passed = all(
         item["operational_passed"] for item in datasets.values()
     )
+    static_protocol_passed = (
+        static_protocol["uses_official_memory_api"]
+        and static_protocol["memory_add_infer_false"]
+        and static_protocol["uses_shared_answer_function"]
+        and static_protocol["uses_shared_judge_evaluator"]
+        and static_protocol["qwen3_vl_8b_configured"]
+        and not static_protocol["gold_answer_passed_to_memory"]
+        and not static_protocol["gold_evidence_passed_to_memory"]
+    )
     same_endpoints = sorted(
         {
             endpoint
@@ -268,14 +280,16 @@ def main() -> None:
     )
     report = {
         "protocol": "frozen Table 2 Mem0 comparability audit",
-        "all_operational_gates_passed": all_operational_passed,
+        "all_operational_gates_passed": (
+            all_operational_passed and static_protocol_passed
+        ),
         "sample_total": sum(item["expected"] for item in datasets.values()),
         "prediction_endpoints": same_endpoints,
         "static_protocol": static_protocol,
         "datasets": datasets,
         "verdict": (
             "retain_mem0_in_shared_table"
-            if all_operational_passed
+            if all_operational_passed and static_protocol_passed
             else "separate_native_memory_protocol_pending_manual_review"
         ),
         "disclosure": (
