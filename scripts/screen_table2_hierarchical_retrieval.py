@@ -9,15 +9,24 @@ from pathlib import Path
 from typing import Any
 
 from mem_ehr_agent.benchmark import (
+    TEMPORAL_TERMS,
     TimelineSemanticEncoder,
+    _hierarchical_turn_bundle,
     build_locomo_memory_store,
     evidence_recall_at5,
+    extract_locomo_terms,
     format_locomo_memory_line,
     load_dialsim_samples,
     load_frozen_sample_ids,
     load_locomo_samples,
-    retrieve_hierarchical_timeline_bundles,
+    locomo_expanded_query,
+    locomo_memory_retrieval_text,
+    locomo_retrieval_score,
+    normalized_vector_cosine,
+    retrieve_locomo_memories,
     select_frozen_samples,
+    timeline_turn_refs,
+    weighted_rrf_scores,
 )
 
 
@@ -42,6 +51,181 @@ def load_development_samples(
     if dataset == "dialsim":
         return load_dialsim_samples(dataset_path, required_sample_ids=ids)
     return select_frozen_samples(load_locomo_samples(dataset_path), ids)
+
+
+def retrieve_hierarchical_grid(
+    store: Any,
+    sample: dict[str, Any],
+    *,
+    semantic_encoder: Any,
+    semantic_rrf_weight: float,
+    embedding_window_tokens: int,
+    parent_ks: list[int],
+    neighbor_radii: list[int],
+    bundle_max_chars_values: list[int],
+    bundle_k: int,
+) -> dict[tuple[int, int, int], list[dict[str, Any]]]:
+    """Evaluate a parameter grid while encoding each bundle shape only once."""
+    query = locomo_expanded_query(sample)
+    maximum_parent_k = max(parent_ks)
+    parents = retrieve_locomo_memories(
+        store,
+        sample,
+        top_k=maximum_parent_k,
+        coarse_k=max(maximum_parent_k, 32),
+        retriever="hybrid_bge",
+        semantic_encoder=semantic_encoder,
+        semantic_rrf_weight=semantic_rrf_weight,
+        embedding_window_tokens=embedding_window_tokens,
+    )
+    parent_ref_ranks: dict[str, int] = {}
+    parent_session_ranks: dict[str, int] = {}
+    for rank, parent in enumerate(parents, start=1):
+        for ref in parent.get("evidence_refs", []):
+            parent_ref_ranks.setdefault(str(ref), rank)
+        session = str((parent.get("time_scope") or {}).get("session") or "")
+        if session:
+            parent_session_ranks.setdefault(session, rank)
+    eligible_turns: list[tuple[int, int]] = []
+    for turn_index, turn in enumerate(sample.get("turns") or []):
+        refs = timeline_turn_refs(turn)
+        session = str(turn.get("session") or turn.get("session_date") or "unknown")
+        matching_ranks = [
+            parent_ref_ranks[ref] for ref in refs if ref in parent_ref_ranks
+        ]
+        parent_rank = (
+            min(matching_ranks)
+            if matching_ranks
+            else parent_session_ranks.get(session)
+        )
+        if parent_rank is not None:
+            eligible_turns.append((turn_index, parent_rank))
+    if not eligible_turns:
+        return {
+            (parent_k, neighbor_radius, bundle_max_chars): []
+            for parent_k in parent_ks
+            for neighbor_radius in neighbor_radii
+            for bundle_max_chars in bundle_max_chars_values
+        }
+
+    query_vector = semantic_encoder.encode([query], is_query=True)[0]
+    category = str(sample.get("category_name") or "").lower().replace("_", "-")
+    is_multi_hop = "multi-hop" in category or "multihop" in category
+    query_terms = set(extract_locomo_terms(query))
+    is_temporal = "temporal" in category or bool(query_terms & TEMPORAL_TERMS)
+    output: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for neighbor_radius in neighbor_radii:
+        for bundle_max_chars in bundle_max_chars_values:
+            candidates: list[dict[str, Any]] = []
+            for turn_index, parent_rank in eligible_turns:
+                bundle = _hierarchical_turn_bundle(
+                    sample,
+                    anchor_index=turn_index,
+                    query=query,
+                    neighbor_radius=neighbor_radius,
+                    bundle_max_chars=bundle_max_chars,
+                    parent_rank=parent_rank,
+                )
+                bundle["lexical_retrieval_score"] = locomo_retrieval_score(
+                    query, sample, bundle
+                )
+                candidates.append(bundle)
+            candidate_vectors = semantic_encoder.encode(
+                [locomo_memory_retrieval_text(candidate) for candidate in candidates],
+                is_query=False,
+            )
+            semantic_scores = {
+                str(candidate["memory_id"]): normalized_vector_cosine(
+                    query_vector, vector
+                )
+                for candidate, vector in zip(candidates, candidate_vectors)
+            }
+            for parent_k in parent_ks:
+                visible = [
+                    candidate
+                    for candidate in candidates
+                    if int(candidate["parent_rank"]) <= parent_k
+                ]
+                lexical_order = [
+                    str(candidate["memory_id"])
+                    for candidate in sorted(
+                        visible,
+                        key=lambda item: (
+                            float(item["lexical_retrieval_score"]),
+                            -int(item["parent_rank"]),
+                            str(item["memory_id"]),
+                        ),
+                        reverse=True,
+                    )
+                ]
+                semantic_order = sorted(
+                    (str(candidate["memory_id"]) for candidate in visible),
+                    key=lambda memory_id: (
+                        semantic_scores[memory_id],
+                        memory_id,
+                    ),
+                    reverse=True,
+                )
+                fused_scores = weighted_rrf_scores(
+                    lexical_order,
+                    semantic_order,
+                    semantic_weight=semantic_rrf_weight,
+                )
+                ranked = sorted(
+                    visible,
+                    key=lambda item: (
+                        fused_scores[str(item["memory_id"])]
+                        + 0.01 / int(item["parent_rank"]),
+                        float(item["lexical_retrieval_score"]),
+                        semantic_scores[str(item["memory_id"])],
+                        str(item["memory_id"]),
+                    ),
+                    reverse=True,
+                )
+                selected: list[dict[str, Any]] = []
+                seen_sessions: set[str] = set()
+                if is_multi_hop:
+                    for candidate in ranked:
+                        session = str(
+                            (candidate.get("time_scope") or {}).get("session")
+                            or ""
+                        )
+                        if session in seen_sessions:
+                            continue
+                        selected.append(candidate)
+                        seen_sessions.add(session)
+                        if len(selected) >= bundle_k:
+                            break
+                if len(selected) < bundle_k:
+                    selected_ids = {
+                        str(candidate["memory_id"]) for candidate in selected
+                    }
+                    selected.extend(
+                        candidate
+                        for candidate in ranked
+                        if str(candidate["memory_id"]) not in selected_ids
+                    )
+                selected = [dict(candidate) for candidate in selected[:bundle_k]]
+                if is_temporal:
+                    selected.sort(
+                        key=lambda item: (
+                            str(
+                                (item.get("time_scope") or {}).get("date") or ""
+                            ),
+                            str(
+                                (item.get("time_scope") or {}).get("time") or ""
+                            ),
+                            int(item.get("anchor_turn_index") or 0),
+                        )
+                    )
+                for candidate in selected:
+                    memory_id = str(candidate["memory_id"])
+                    candidate["retrieval_score"] = fused_scores[memory_id]
+                    candidate["semantic_retrieval_score"] = semantic_scores[
+                        memory_id
+                    ]
+                output[(parent_k, neighbor_radius, bundle_max_chars)] = selected
+    return output
 
 
 def main() -> None:
@@ -142,22 +326,34 @@ def main() -> None:
     ]
     maximum_bundle_k = max(parse_ints(args.bundle_k))
     retrieval_cache: dict[tuple[str, str, int, int, int], list[dict[str, Any]]] = {}
-    retrieval_shapes = sorted(
-        {
-            (
-                int(config["parent_k"]),
-                int(config["neighbor_radius"]),
-                int(config["bundle_max_chars"]),
-            )
-            for config in configs
-        }
+    parent_ks = sorted({int(config["parent_k"]) for config in configs})
+    neighbor_radii = sorted(
+        {int(config["neighbor_radius"]) for config in configs}
+    )
+    bundle_max_chars_values = sorted(
+        {int(config["bundle_max_chars"]) for config in configs}
     )
     for dataset, samples in samples_by_dataset.items():
         for sample in samples:
             conversation_id = str(
                 sample.get("conversation_id") or sample["sample_id"]
             )
-            for parent_k, neighbor_radius, bundle_max_chars in retrieval_shapes:
+            sample_grid = retrieve_hierarchical_grid(
+                stores[(dataset, conversation_id)],
+                sample,
+                semantic_encoder=encoder,
+                semantic_rrf_weight=args.semantic_rrf_weight,
+                embedding_window_tokens=args.embedding_window_tokens,
+                parent_ks=parent_ks,
+                neighbor_radii=neighbor_radii,
+                bundle_max_chars_values=bundle_max_chars_values,
+                bundle_k=maximum_bundle_k,
+            )
+            for (
+                parent_k,
+                neighbor_radius,
+                bundle_max_chars,
+            ), bundles in sample_grid.items():
                 cache_key = (
                     dataset,
                     str(sample["sample_id"]),
@@ -165,17 +361,7 @@ def main() -> None:
                     neighbor_radius,
                     bundle_max_chars,
                 )
-                retrieval_cache[cache_key] = retrieve_hierarchical_timeline_bundles(
-                    stores[(dataset, conversation_id)],
-                    sample,
-                    semantic_encoder=encoder,
-                    semantic_rrf_weight=args.semantic_rrf_weight,
-                    embedding_window_tokens=args.embedding_window_tokens,
-                    parent_k=parent_k,
-                    bundle_k=maximum_bundle_k,
-                    neighbor_radius=neighbor_radius,
-                    bundle_max_chars=bundle_max_chars,
-                )
+                retrieval_cache[cache_key] = bundles
 
     results: list[dict[str, Any]] = []
     for config in configs:

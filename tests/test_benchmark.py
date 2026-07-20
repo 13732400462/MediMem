@@ -39,6 +39,9 @@ from mem_ehr_agent.benchmark import (
 )
 from mem_ehr_agent.cli import build_parser
 from mem_ehr_agent.memory import MemoryStore
+from scripts.screen_table2_hierarchical_retrieval import (
+    retrieve_hierarchical_grid,
+)
 
 
 def test_parse_methods_normalizes_comma_list():
@@ -534,6 +537,75 @@ class FakeSemanticEncoder:
             distractor = 1.0 if "rumor" in lower else 0.0
             vectors.append([semantic, distractor])
         return vectors
+
+
+def test_offline_hierarchical_grid_matches_individual_retrievals(tmp_path):
+    sample = {
+        "sample_id": "q-grid",
+        "conversation_id": "c-grid",
+        "dataset": "locomo",
+        "category_name": "multi-hop",
+        "question": "How are the car and vehicle plans related?",
+        "turns": [
+            {
+                "speaker": "A",
+                "text": "The red car was purchased.",
+                "session": "s1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "A",
+                "text": "The vehicle needed repairs.",
+                "session": "s1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:1"],
+            },
+            {
+                "speaker": "B",
+                "text": "A later vehicle trip was planned.",
+                "session": "s2",
+                "session_date": "2025-02-01",
+                "evidence_refs": ["D2:0"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "grid.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    encoder = FakeSemanticEncoder()
+    grid = retrieve_hierarchical_grid(
+        store,
+        sample,
+        semantic_encoder=encoder,
+        semantic_rrf_weight=2.0,
+        embedding_window_tokens=16,
+        parent_ks=[1, 2],
+        neighbor_radii=[0, 1],
+        bundle_max_chars_values=[400, 900],
+        bundle_k=2,
+    )
+    for parent_k in (1, 2):
+        for neighbor_radius in (0, 1):
+            for bundle_max_chars in (400, 900):
+                expected = retrieve_hierarchical_timeline_bundles(
+                    store,
+                    sample,
+                    semantic_encoder=encoder,
+                    semantic_rrf_weight=2.0,
+                    embedding_window_tokens=16,
+                    parent_k=parent_k,
+                    bundle_k=2,
+                    neighbor_radius=neighbor_radius,
+                    bundle_max_chars=bundle_max_chars,
+                )
+                assert (
+                    grid[(parent_k, neighbor_radius, bundle_max_chars)]
+                    == expected
+                )
 
 
 def test_hybrid_retrieval_uses_static_semantic_index_without_labels(tmp_path):
