@@ -50,6 +50,7 @@ def run_candidate(
     candidate_root.mkdir(parents=True, exist_ok=True)
     run_records = []
     env = os.environ.copy()
+    embedding_gpu = "0" if ":8001/" in endpoint else "1"
     env.update(
         {
             "PYTHONPATH": str(project),
@@ -62,6 +63,8 @@ def run_candidate(
             "MEDIMEM_GIT_COMMIT": git_commit,
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "CUDA_VISIBLE_DEVICES": embedding_gpu,
+            "MEDIMEM_TIMELINE_EMBEDDING_DEVICE": "cuda",
         }
     )
     for dataset, spec in DATASETS.items():

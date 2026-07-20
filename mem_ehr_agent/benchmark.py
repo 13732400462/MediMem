@@ -65,7 +65,10 @@ class TimelineSemanticEncoder:
                 "install the semantic optional dependency."
             ) from exc
         self.model_name = str(model_name).strip()
-        self.model = SentenceTransformer(self.model_name, device="cpu")
+        self.device = os.environ.get(
+            "MEDIMEM_TIMELINE_EMBEDDING_DEVICE", "cpu"
+        ).strip() or "cpu"
+        self.model = SentenceTransformer(self.model_name, device=self.device)
         self.tokenizer = getattr(self.model, "tokenizer", None)
         self._encode_lock = Lock()
         first_module = self.model[0] if len(self.model) else None
@@ -91,6 +94,7 @@ class TimelineSemanticEncoder:
             "model": self.model_name,
             "revision": self.revision,
             "artifact_sha256": self.artifact_sha256,
+            "device": self.device,
         }
 
     def encode(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
