@@ -156,6 +156,10 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         timeline_embedding_model=args.timeline_embedding_model,
         timeline_semantic_rrf_weight=args.timeline_semantic_rrf_weight,
         timeline_embedding_window_tokens=args.timeline_embedding_window_tokens,
+        timeline_hierarchical_parent_k=args.timeline_hierarchical_parent_k,
+        timeline_hierarchical_bundle_k=args.timeline_hierarchical_bundle_k,
+        timeline_hierarchical_neighbor_radius=args.timeline_hierarchical_neighbor_radius,
+        timeline_hierarchical_bundle_max_chars=args.timeline_hierarchical_bundle_max_chars,
     )
     print(f"run_dir={run_dir}")
 
@@ -386,9 +390,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark_run.add_argument(
         "--timeline-retriever",
-        choices=("lexical", "hybrid_bge"),
+        choices=("lexical", "hybrid_bge", "hierarchical_bge"),
         default="lexical",
-        help="Opt-in timeline-card retriever; lexical preserves historical behavior.",
+        help="Opt-in timeline-card retriever; hierarchical_bge adds session-to-turn evidence packing.",
     )
     benchmark_run.add_argument(
         "--timeline-embedding-model",
@@ -406,6 +410,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help="Deterministic encoder-token window for long timeline cards.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-hierarchical-parent-k",
+        type=int,
+        default=8,
+        help="Session-card candidates retained by hierarchical_bge coarse retrieval.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-hierarchical-bundle-k",
+        type=int,
+        default=8,
+        help="Fine-grained turn bundles passed to QA by hierarchical_bge.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-hierarchical-neighbor-radius",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Whether each hierarchical anchor may include one adjacent turn.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-hierarchical-bundle-max-chars",
+        type=int,
+        default=900,
+        help="Maximum visible characters in each hierarchical evidence bundle.",
     )
     benchmark_run.set_defaults(func=cmd_benchmark_run)
     locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")

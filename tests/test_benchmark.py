@@ -17,12 +17,14 @@ from mem_ehr_agent.benchmark import (
     locomo_memory_path,
     load_frozen_sample_ids,
     maximum_window_similarity,
+    normalize_hierarchical_retriever_config,
     normalize_timeline_retriever_config,
     normalized_vector_cosine,
     parse_int_list,
     parse_methods,
     qa_prompt,
     retrieve_locomo_memories,
+    retrieve_hierarchical_timeline_bundles,
     run_locomo_official_wrapper,
     run_locomo_ours_memory_pipeline,
     static_rag_retrieved_context,
@@ -389,8 +391,38 @@ def test_locomo_cache_key_isolates_card_granularity_and_size():
         retriever="hybrid_bge",
         semantic_rrf_weight=3.0,
     )
+    hierarchical_bundle_5 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+        retriever="hierarchical_bge",
+        hierarchical_bundle_k=5,
+    )
+    hierarchical_bundle_8 = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+        retriever="hierarchical_bge",
+        hierarchical_bundle_k=8,
+    )
 
-    assert len({turn_key, session_4000, session_6500, hybrid_weight_1, hybrid_weight_3}) == 5
+    assert len(
+        {
+            turn_key,
+            session_4000,
+            session_6500,
+            hybrid_weight_1,
+            hybrid_weight_3,
+            hierarchical_bundle_5,
+            hierarchical_bundle_8,
+        }
+    ) == 7
 
 
 def test_timeline_retriever_config_normalization_and_validation():
@@ -406,6 +438,7 @@ def test_timeline_retriever_config_normalization_and_validation():
         assert "Unsupported timeline retriever" in str(exc)
     else:
         raise AssertionError("unknown retriever should fail")
+    assert normalize_hierarchical_retriever_config(8, 5, 1, 900) == (8, 5, 1, 900)
 
 
 def test_timeline_card_windows_are_stable_and_lossless():
@@ -488,7 +521,117 @@ def test_hybrid_retrieval_uses_static_semantic_index_without_labels(tmp_path):
     assert "semantic_retrieval_score" in retrieved[0]
 
 
-def test_benchmark_cli_exposes_hybrid_retrieval_flags():
+def test_hierarchical_retrieval_packs_visible_adjacent_turns_and_real_refs(tmp_path):
+    sample = {
+        "sample_id": "q-hierarchical",
+        "conversation_id": "c-hierarchical",
+        "dataset": "locomo",
+        "category_name": "temporal",
+        "question": "Which automobile was purchased before the later trip?",
+        "answer": "SECRET GOLD ANSWER",
+        "evidence": ["SECRET GOLD REF"],
+        "turns": [
+            {
+                "speaker": "Maya",
+                "text": "Maya purchased a red car.",
+                "session": "s1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "Lee",
+                "text": "Lee congratulated Maya on the vehicle.",
+                "session": "s1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:1"],
+            },
+            {
+                "speaker": "Maya",
+                "text": "A later trip included an unrelated rumor.",
+                "session": "s2",
+                "session_date": "2025-02-01",
+                "evidence_refs": ["D2:0"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "hierarchical.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    retrieved = retrieve_hierarchical_timeline_bundles(
+        store,
+        sample,
+        semantic_encoder=FakeSemanticEncoder(),
+        semantic_rrf_weight=2.0,
+        embedding_window_tokens=16,
+        parent_k=2,
+        bundle_k=2,
+        neighbor_radius=1,
+        bundle_max_chars=900,
+    )
+
+    assert len(retrieved) == 2
+    assert [item["time_scope"]["date"] for item in retrieved] == sorted(
+        item["time_scope"]["date"] for item in retrieved
+    )
+    assert any(item["evidence_refs"] == ["D1:0", "D1:1"] for item in retrieved)
+    assert all("D2:0" not in item["evidence_refs"] or "D1:1" not in item["evidence_refs"] for item in retrieved)
+    serialized = json.dumps(retrieved, ensure_ascii=False)
+    assert "SECRET GOLD ANSWER" not in serialized
+    assert "SECRET GOLD REF" not in serialized
+
+
+def test_hierarchical_multihop_prefers_distinct_sessions(tmp_path):
+    sample = {
+        "sample_id": "q-multihop",
+        "conversation_id": "c-multihop",
+        "dataset": "locomo",
+        "category_name": "multi-hop",
+        "question": "How are the car and vehicle plans related?",
+        "turns": [
+            {
+                "speaker": "A",
+                "text": "The red car was purchased.",
+                "session": "s1",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "A",
+                "text": "The vehicle needed repairs.",
+                "session": "s1",
+                "evidence_refs": ["D1:1"],
+            },
+            {
+                "speaker": "B",
+                "text": "A later vehicle trip was planned.",
+                "session": "s2",
+                "evidence_refs": ["D2:0"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "multihop.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    retrieved = retrieve_hierarchical_timeline_bundles(
+        store,
+        sample,
+        semantic_encoder=FakeSemanticEncoder(),
+        semantic_rrf_weight=2.0,
+        embedding_window_tokens=16,
+        parent_k=2,
+        bundle_k=2,
+        neighbor_radius=0,
+        bundle_max_chars=400,
+    )
+    assert {item["time_scope"]["session"] for item in retrieved} == {"s1", "s2"}
+
+
+def test_benchmark_cli_exposes_hierarchical_retrieval_flags():
     args = build_parser().parse_args(
         [
             "benchmark",
@@ -498,16 +641,28 @@ def test_benchmark_cli_exposes_hybrid_retrieval_flags():
             "--methods",
             "medimem",
             "--timeline-retriever",
-            "hybrid_bge",
+            "hierarchical_bge",
             "--timeline-semantic-rrf-weight",
             "2",
             "--timeline-embedding-window-tokens",
             "128",
+            "--timeline-hierarchical-parent-k",
+            "12",
+            "--timeline-hierarchical-bundle-k",
+            "8",
+            "--timeline-hierarchical-neighbor-radius",
+            "1",
+            "--timeline-hierarchical-bundle-max-chars",
+            "700",
         ]
     )
-    assert args.timeline_retriever == "hybrid_bge"
+    assert args.timeline_retriever == "hierarchical_bge"
     assert args.timeline_semantic_rrf_weight == 2.0
     assert args.timeline_embedding_window_tokens == 128
+    assert args.timeline_hierarchical_parent_k == 12
+    assert args.timeline_hierarchical_bundle_k == 8
+    assert args.timeline_hierarchical_neighbor_radius == 1
+    assert args.timeline_hierarchical_bundle_max_chars == 700
 
 
 def test_parse_int_list_for_top_k_sweep():

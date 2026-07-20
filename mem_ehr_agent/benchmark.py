@@ -45,7 +45,7 @@ LOCOMO_OFFICIAL_STYLE_METRICS = (
     "sbert_similarity",
 )
 TIMELINE_CARD_GRANULARITIES = {"turn", "session_chunk"}
-TIMELINE_RETRIEVERS = {"lexical", "hybrid_bge"}
+TIMELINE_RETRIEVERS = {"lexical", "hybrid_bge", "hierarchical_bge"}
 DEFAULT_TIMELINE_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS = 256
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -1256,6 +1256,32 @@ def normalize_timeline_retriever_config(
     return normalized_retriever, normalized_model, normalized_weight, normalized_window
 
 
+def normalize_hierarchical_retriever_config(
+    parent_k: int,
+    bundle_k: int,
+    neighbor_radius: int,
+    bundle_max_chars: int,
+) -> tuple[int, int, int, int]:
+    normalized_parent_k = int(parent_k)
+    normalized_bundle_k = int(bundle_k)
+    normalized_neighbor_radius = int(neighbor_radius)
+    normalized_bundle_max_chars = int(bundle_max_chars)
+    if normalized_parent_k <= 0:
+        raise ValueError("timeline hierarchical parent k must be positive.")
+    if normalized_bundle_k <= 0:
+        raise ValueError("timeline hierarchical bundle k must be positive.")
+    if normalized_neighbor_radius not in {0, 1}:
+        raise ValueError("timeline hierarchical neighbor radius must be 0 or 1.")
+    if normalized_bundle_max_chars <= 0:
+        raise ValueError("timeline hierarchical bundle max chars must be positive.")
+    return (
+        normalized_parent_k,
+        normalized_bundle_k,
+        normalized_neighbor_radius,
+        normalized_bundle_max_chars,
+    )
+
+
 def current_git_commit() -> str | None:
     configured = str(os.getenv("MEDIMEM_GIT_COMMIT") or "").strip()
     if configured:
@@ -1283,6 +1309,10 @@ def locomo_cache_key(
     embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     semantic_rrf_weight: float = 1.0,
     embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    hierarchical_parent_k: int = 8,
+    hierarchical_bundle_k: int = 8,
+    hierarchical_neighbor_radius: int = 1,
+    hierarchical_bundle_max_chars: int = 900,
 ) -> str:
     granularity, max_chars = normalize_timeline_card_config(card_granularity, card_max_chars)
     normalized_retriever, normalized_model, normalized_weight, normalized_window = normalize_timeline_retriever_config(
@@ -1290,6 +1320,14 @@ def locomo_cache_key(
         embedding_model,
         semantic_rrf_weight,
         embedding_window_tokens,
+    )
+    normalized_parent_k, normalized_bundle_k, normalized_neighbor_radius, normalized_bundle_max_chars = (
+        normalize_hierarchical_retriever_config(
+            hierarchical_parent_k,
+            hierarchical_bundle_k,
+            hierarchical_neighbor_radius,
+            hierarchical_bundle_max_chars,
+        )
     )
     raw_id = str(sample.get("conversation_id") or sample.get("sample_id") or "")
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
@@ -1299,6 +1337,10 @@ def locomo_cache_key(
             "embedding_model": normalized_model,
             "semantic_rrf_weight": normalized_weight,
             "embedding_window_tokens": normalized_window,
+            "hierarchical_parent_k": normalized_parent_k,
+            "hierarchical_bundle_k": normalized_bundle_k,
+            "hierarchical_neighbor_radius": normalized_neighbor_radius,
+            "hierarchical_bundle_max_chars": normalized_bundle_max_chars,
             "code_commit": current_git_commit() or "unknown",
         },
         sort_keys=True,
@@ -1339,9 +1381,13 @@ def locomo_cached_memory_path(
     embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     semantic_rrf_weight: float = 1.0,
     embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    hierarchical_parent_k: int = 8,
+    hierarchical_bundle_k: int = 8,
+    hierarchical_neighbor_radius: int = 1,
+    hierarchical_bundle_max_chars: int = 900,
 ) -> Path:
     return Path(cache_dir) / "locomo_memory_store" / (
-        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars, retriever=retriever, embedding_model=embedding_model, semantic_rrf_weight=semantic_rrf_weight, embedding_window_tokens=embedding_window_tokens)}"
+        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars, retriever=retriever, embedding_model=embedding_model, semantic_rrf_weight=semantic_rrf_weight, embedding_window_tokens=embedding_window_tokens, hierarchical_parent_k=hierarchical_parent_k, hierarchical_bundle_k=hierarchical_bundle_k, hierarchical_neighbor_radius=hierarchical_neighbor_radius, hierarchical_bundle_max_chars=hierarchical_bundle_max_chars)}"
         ".memory.jsonl"
     )
 
@@ -1360,6 +1406,10 @@ def build_cached_locomo_memory_store(
     embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     semantic_rrf_weight: float = 1.0,
     embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    hierarchical_parent_k: int = 8,
+    hierarchical_bundle_k: int = 8,
+    hierarchical_neighbor_radius: int = 1,
+    hierarchical_bundle_max_chars: int = 900,
 ) -> MemoryStore:
     if cache_dir is None:
         return build_locomo_memory_store(
@@ -1380,6 +1430,10 @@ def build_cached_locomo_memory_store(
         embedding_model=embedding_model,
         semantic_rrf_weight=semantic_rrf_weight,
         embedding_window_tokens=embedding_window_tokens,
+        hierarchical_parent_k=hierarchical_parent_k,
+        hierarchical_bundle_k=hierarchical_bundle_k,
+        hierarchical_neighbor_radius=hierarchical_neighbor_radius,
+        hierarchical_bundle_max_chars=hierarchical_bundle_max_chars,
     )
     ensure_dir(memory_path.parent)
     lock_path = memory_path.with_suffix(memory_path.suffix + ".lock")
@@ -1951,6 +2005,244 @@ def retrieve_locomo_memories(
     return [card | {"retrieval_score": score} for score, card in coarse[:top_k]]
 
 
+def _hierarchical_turn_bundle(
+    sample: dict[str, Any],
+    *,
+    anchor_index: int,
+    query: str,
+    neighbor_radius: int,
+    bundle_max_chars: int,
+    parent_rank: int,
+) -> dict[str, Any]:
+    turns = list(sample.get("turns") or [])
+    anchor = turns[anchor_index]
+    anchor_session = str(anchor.get("session") or anchor.get("session_date") or "unknown")
+    selected: list[tuple[int, dict[str, Any]]] = [(anchor_index, anchor)]
+    if neighbor_radius:
+        neighbors: list[tuple[float, int, dict[str, Any]]] = []
+        for candidate_index in (anchor_index - 1, anchor_index + 1):
+            if not 0 <= candidate_index < len(turns):
+                continue
+            candidate = turns[candidate_index]
+            candidate_session = str(candidate.get("session") or candidate.get("session_date") or "unknown")
+            if candidate_session != anchor_session:
+                continue
+            candidate_text = normalize_answer(candidate.get("text"))
+            if candidate_text:
+                neighbors.append((text_similarity(query, candidate_text), candidate_index, candidate))
+        if neighbors:
+            _, neighbor_index, neighbor = max(neighbors, key=lambda item: (item[0], item[1]))
+            selected.append((neighbor_index, neighbor))
+    selected.sort(key=lambda item: item[0])
+
+    lines: list[str] = []
+    visible_turns: list[dict[str, Any]] = []
+    for _, turn in selected:
+        line = (
+            f"speaker={str(turn.get('speaker') or '').strip()} "
+            f"date={str(turn.get('session_date') or turn.get('time') or '').strip()} "
+            f"text={normalize_answer(turn.get('text'))}"
+        ).strip()
+        remaining = bundle_max_chars - sum(len(item) + 1 for item in lines)
+        if remaining <= 0:
+            break
+        clipped = line[:remaining].rstrip()
+        if clipped:
+            lines.append(clipped)
+            visible_turns.append(turn)
+        if len(clipped) < len(line):
+            break
+    if not visible_turns:
+        visible_turns = [anchor]
+        lines = [normalize_answer(anchor.get("text"))[:bundle_max_chars]]
+
+    summary = "\n".join(lines)
+    refs = stable_unique([ref for turn in visible_turns for ref in timeline_turn_refs(turn)])
+    speakers = stable_unique([turn.get("speaker") for turn in visible_turns])
+    first_turn = visible_turns[0]
+    last_turn = visible_turns[-1]
+    return {
+        "memory_id": f"hierarchical:{sample.get('conversation_id') or sample['sample_id']}:{anchor_index}",
+        "summary": summary,
+        "evidence_refs": refs,
+        "time_scope": {
+            "session": anchor_session,
+            "time": first_turn.get("time"),
+            "date": first_turn.get("session_date"),
+            "end_time": last_turn.get("time"),
+            "end_date": last_turn.get("session_date"),
+        },
+        "confidence": 0.72,
+        "status": "active",
+        "tags": stable_unique(
+            [
+                "hierarchical_bundle",
+                str(sample.get("dataset") or "native_benchmark"),
+                *(tag for turn in visible_turns for tag in turn.get("tags", [])),
+                *speakers,
+            ]
+        ),
+        "speaker": ", ".join(speakers),
+        "speakers": speakers,
+        "entities": extract_locomo_entities(summary),
+        "temporal_markers": extract_locomo_temporal_markers(
+            summary,
+            first_turn.get("session_date"),
+            first_turn.get("time"),
+            last_turn.get("session_date"),
+            last_turn.get("time"),
+        ),
+        "card_granularity": "turn_bundle",
+        "turn_count": len(visible_turns),
+        "anchor_turn_index": anchor_index,
+        "parent_rank": parent_rank,
+        "bundle_max_chars": bundle_max_chars,
+    }
+
+
+def retrieve_hierarchical_timeline_bundles(
+    store: MemoryStore,
+    sample: dict[str, Any],
+    *,
+    semantic_encoder: Any,
+    semantic_rrf_weight: float,
+    embedding_window_tokens: int,
+    parent_k: int,
+    bundle_k: int,
+    neighbor_radius: int,
+    bundle_max_chars: int,
+) -> list[dict[str, Any]]:
+    parent_k, bundle_k, neighbor_radius, bundle_max_chars = normalize_hierarchical_retriever_config(
+        parent_k,
+        bundle_k,
+        neighbor_radius,
+        bundle_max_chars,
+    )
+    query = locomo_expanded_query(sample)
+    parents = retrieve_locomo_memories(
+        store,
+        sample,
+        top_k=parent_k,
+        coarse_k=max(parent_k, 32),
+        retriever="hybrid_bge",
+        semantic_encoder=semantic_encoder,
+        semantic_rrf_weight=semantic_rrf_weight,
+        embedding_window_tokens=embedding_window_tokens,
+    )
+    parent_ref_ranks: dict[str, int] = {}
+    parent_session_ranks: dict[str, int] = {}
+    for rank, parent in enumerate(parents, start=1):
+        for ref in parent.get("evidence_refs", []):
+            parent_ref_ranks.setdefault(str(ref), rank)
+        session = str((parent.get("time_scope") or {}).get("session") or "")
+        if session:
+            parent_session_ranks.setdefault(session, rank)
+
+    candidates: list[dict[str, Any]] = []
+    for turn_index, turn in enumerate(sample.get("turns") or []):
+        text = normalize_answer(turn.get("text"))
+        if not text:
+            continue
+        refs = timeline_turn_refs(turn)
+        session = str(turn.get("session") or turn.get("session_date") or "unknown")
+        matching_ranks = [parent_ref_ranks[ref] for ref in refs if ref in parent_ref_ranks]
+        parent_rank = min(matching_ranks) if matching_ranks else parent_session_ranks.get(session)
+        if parent_rank is None:
+            continue
+        bundle = _hierarchical_turn_bundle(
+            sample,
+            anchor_index=turn_index,
+            query=query,
+            neighbor_radius=neighbor_radius,
+            bundle_max_chars=bundle_max_chars,
+            parent_rank=parent_rank,
+        )
+        bundle["lexical_retrieval_score"] = locomo_retrieval_score(query, sample, bundle)
+        candidates.append(bundle)
+    if not candidates:
+        return []
+
+    query_vector = semantic_encoder.encode([query], is_query=True)[0]
+    candidate_vectors = semantic_encoder.encode(
+        [locomo_memory_retrieval_text(candidate) for candidate in candidates],
+        is_query=False,
+    )
+    semantic_scores = {
+        str(candidate["memory_id"]): normalized_vector_cosine(query_vector, vector)
+        for candidate, vector in zip(candidates, candidate_vectors)
+    }
+    lexical_order = [
+        str(candidate["memory_id"])
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                float(item["lexical_retrieval_score"]),
+                -int(item["parent_rank"]),
+                str(item["memory_id"]),
+            ),
+            reverse=True,
+        )
+    ]
+    semantic_order = sorted(
+        semantic_scores,
+        key=lambda memory_id: (semantic_scores[memory_id], memory_id),
+        reverse=True,
+    )
+    fused_scores = weighted_rrf_scores(
+        lexical_order,
+        semantic_order,
+        semantic_weight=semantic_rrf_weight,
+    )
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            fused_scores[str(item["memory_id"])] + 0.01 / int(item["parent_rank"]),
+            float(item["lexical_retrieval_score"]),
+            semantic_scores[str(item["memory_id"])],
+            str(item["memory_id"]),
+        ),
+        reverse=True,
+    )
+
+    category = str(sample.get("category_name") or "").lower().replace("_", "-")
+    is_multi_hop = "multi-hop" in category or "multihop" in category
+    selected: list[dict[str, Any]] = []
+    seen_sessions: set[str] = set()
+    if is_multi_hop:
+        for candidate in ranked:
+            session = str((candidate.get("time_scope") or {}).get("session") or "")
+            if session in seen_sessions:
+                continue
+            selected.append(candidate)
+            seen_sessions.add(session)
+            if len(selected) >= bundle_k:
+                break
+    if len(selected) < bundle_k:
+        selected_ids = {str(item["memory_id"]) for item in selected}
+        selected.extend(
+            candidate
+            for candidate in ranked
+            if str(candidate["memory_id"]) not in selected_ids
+        )
+    selected = selected[:bundle_k]
+
+    query_terms = set(extract_locomo_terms(query))
+    is_temporal = "temporal" in category or bool(query_terms & TEMPORAL_TERMS)
+    if is_temporal:
+        selected.sort(
+            key=lambda item: (
+                str((item.get("time_scope") or {}).get("date") or ""),
+                str((item.get("time_scope") or {}).get("time") or ""),
+                int(item.get("anchor_turn_index") or 0),
+            )
+        )
+    for candidate in selected:
+        memory_id = str(candidate["memory_id"])
+        candidate["retrieval_score"] = fused_scores[memory_id]
+        candidate["semantic_retrieval_score"] = semantic_scores[memory_id]
+    return selected
+
+
 def assert_no_full_context_shortcut(
     method: str,
     prompt_context: str,
@@ -2001,6 +2293,10 @@ def run_locomo_ours_memory_pipeline(
     timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     timeline_semantic_rrf_weight: float = 1.0,
     timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    timeline_hierarchical_parent_k: int = 8,
+    timeline_hierarchical_bundle_k: int = 8,
+    timeline_hierarchical_neighbor_radius: int = 1,
+    timeline_hierarchical_bundle_max_chars: int = 900,
     semantic_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
@@ -2020,17 +2316,36 @@ def run_locomo_ours_memory_pipeline(
         embedding_model=timeline_embedding_model,
         semantic_rrf_weight=timeline_semantic_rrf_weight,
         embedding_window_tokens=timeline_embedding_window_tokens,
+        hierarchical_parent_k=timeline_hierarchical_parent_k,
+        hierarchical_bundle_k=timeline_hierarchical_bundle_k,
+        hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
+        hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
     )
-    retrieved = retrieve_locomo_memories(
-        store,
-        sample,
-        top_k=top_k,
-        coarse_k=coarse_k,
-        retriever=timeline_retriever,
-        semantic_encoder=semantic_encoder,
-        semantic_rrf_weight=timeline_semantic_rrf_weight,
-        embedding_window_tokens=timeline_embedding_window_tokens,
-    )
+    if timeline_retriever == "hierarchical_bge":
+        if semantic_encoder is None:
+            raise RuntimeError("hierarchical_bge retrieval requires a semantic encoder.")
+        retrieved = retrieve_hierarchical_timeline_bundles(
+            store,
+            sample,
+            semantic_encoder=semantic_encoder,
+            semantic_rrf_weight=timeline_semantic_rrf_weight,
+            embedding_window_tokens=timeline_embedding_window_tokens,
+            parent_k=timeline_hierarchical_parent_k,
+            bundle_k=timeline_hierarchical_bundle_k,
+            neighbor_radius=timeline_hierarchical_neighbor_radius,
+            bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+        )
+    else:
+        retrieved = retrieve_locomo_memories(
+            store,
+            sample,
+            top_k=top_k,
+            coarse_k=coarse_k,
+            retriever=timeline_retriever,
+            semantic_encoder=semantic_encoder,
+            semantic_rrf_weight=timeline_semantic_rrf_weight,
+            embedding_window_tokens=timeline_embedding_window_tokens,
+        )
     memory_context = "\n".join(format_locomo_memory_line(memory) for memory in retrieved)
     prompt_context = (
         "[RETRIEVED_MEMORY_CARDS]\n"
@@ -2046,7 +2361,9 @@ def run_locomo_ours_memory_pipeline(
         prompt_context,
         sample,
         retrieved_memory_count=len(retrieved),
-        retrieval_budget=top_k,
+        retrieval_budget=(
+            timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else top_k
+        ),
     )
     pred = answer_with_context(sample, method_label, prompt_context, client, fail_on_llm_error=require_api)
     pred["retrieved_memory_count"] = len(retrieved)
@@ -2059,15 +2376,31 @@ def run_locomo_ours_memory_pipeline(
     pred["timeline_card_granularity"] = card_granularity
     pred["timeline_card_max_chars"] = card_max_chars
     pred["timeline_retriever"] = timeline_retriever
-    pred["timeline_embedding_model"] = timeline_embedding_model if timeline_retriever == "hybrid_bge" else None
+    pred["timeline_embedding_model"] = (
+        timeline_embedding_model if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+    )
     pred["timeline_semantic_rrf_weight"] = (
-        timeline_semantic_rrf_weight if timeline_retriever == "hybrid_bge" else None
+        timeline_semantic_rrf_weight if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
     )
     pred["timeline_embedding_window_tokens"] = (
-        timeline_embedding_window_tokens if timeline_retriever == "hybrid_bge" else None
+        timeline_embedding_window_tokens if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
     )
     pred["timeline_encoder_identity"] = (
-        dict(semantic_encoder.identity) if timeline_retriever == "hybrid_bge" and semantic_encoder is not None else None
+        dict(semantic_encoder.identity)
+        if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} and semantic_encoder is not None
+        else None
+    )
+    pred["timeline_hierarchical_parent_k"] = (
+        timeline_hierarchical_parent_k if timeline_retriever == "hierarchical_bge" else None
+    )
+    pred["timeline_hierarchical_bundle_k"] = (
+        timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else None
+    )
+    pred["timeline_hierarchical_neighbor_radius"] = (
+        timeline_hierarchical_neighbor_radius if timeline_retriever == "hierarchical_bge" else None
+    )
+    pred["timeline_hierarchical_bundle_max_chars"] = (
+        timeline_hierarchical_bundle_max_chars if timeline_retriever == "hierarchical_bge" else None
     )
     pred["retrieval_query"] = locomo_expanded_query(sample)
     pred["retrieved_evidence_refs"] = sorted(
@@ -2310,6 +2643,10 @@ def run_local_method(
     timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     timeline_semantic_rrf_weight: float = 1.0,
     timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    timeline_hierarchical_parent_k: int = 8,
+    timeline_hierarchical_bundle_k: int = 8,
+    timeline_hierarchical_neighbor_radius: int = 1,
+    timeline_hierarchical_bundle_max_chars: int = 900,
     semantic_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
@@ -2361,6 +2698,10 @@ def run_local_method(
             timeline_embedding_model=timeline_embedding_model,
             timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
             timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+            timeline_hierarchical_parent_k=timeline_hierarchical_parent_k,
+            timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
+            timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
+            timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
             semantic_encoder=semantic_encoder,
         )
         if method_label:
@@ -2662,6 +3003,10 @@ def run_native_benchmark(
     timeline_embedding_model: str = DEFAULT_TIMELINE_EMBEDDING_MODEL,
     timeline_semantic_rrf_weight: float = 1.0,
     timeline_embedding_window_tokens: int = DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS,
+    timeline_hierarchical_parent_k: int = 8,
+    timeline_hierarchical_bundle_k: int = 8,
+    timeline_hierarchical_neighbor_radius: int = 1,
+    timeline_hierarchical_bundle_max_chars: int = 900,
 ) -> Path:
     timeline_card_granularity, timeline_card_max_chars = normalize_timeline_card_config(
         timeline_card_granularity,
@@ -2678,6 +3023,19 @@ def run_native_benchmark(
         timeline_semantic_rrf_weight,
         timeline_embedding_window_tokens,
     )
+    (
+        timeline_hierarchical_parent_k,
+        timeline_hierarchical_bundle_k,
+        timeline_hierarchical_neighbor_radius,
+        timeline_hierarchical_bundle_max_chars,
+    ) = normalize_hierarchical_retriever_config(
+        timeline_hierarchical_parent_k,
+        timeline_hierarchical_bundle_k,
+        timeline_hierarchical_neighbor_radius,
+        timeline_hierarchical_bundle_max_chars,
+    )
+    if timeline_retriever == "hierarchical_bge":
+        timeline_card_granularity = "session_chunk"
     source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
     if dataset == "dialsim":
         loaded_samples = load_dialsim_samples(
@@ -2702,7 +3060,7 @@ def run_native_benchmark(
     blocked: list[dict[str, Any]] = []
     amem_runtimes: dict[str, LocomoAMEMRuntime] = {}
     semantic_encoder: TimelineSemanticEncoder | None = None
-    if timeline_retriever == "hybrid_bge" and ("ours" in methods or "medimem" in methods):
+    if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} and ("ours" in methods or "medimem" in methods):
         semantic_encoder = TimelineSemanticEncoder(timeline_embedding_model)
     if ("ours" in methods or "medimem" in methods) and samples:
         seen_conversations: set[str] = set()
@@ -2723,6 +3081,10 @@ def run_native_benchmark(
                 embedding_model=timeline_embedding_model,
                 semantic_rrf_weight=timeline_semantic_rrf_weight,
                 embedding_window_tokens=timeline_embedding_window_tokens,
+                hierarchical_parent_k=timeline_hierarchical_parent_k,
+                hierarchical_bundle_k=timeline_hierarchical_bundle_k,
+                hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
+                hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
             )
             seen_conversations.add(conversation_id)
     if "amem" in methods:
@@ -2763,6 +3125,10 @@ def run_native_benchmark(
                                     timeline_embedding_model=timeline_embedding_model,
                                     timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
                                     timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+                                    timeline_hierarchical_parent_k=timeline_hierarchical_parent_k,
+                                    timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
+                                    timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
+                                    timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
                                     semantic_encoder=semantic_encoder,
                                 )
                             ] = f"{sample['sample_id']}:{label}"
@@ -2786,6 +3152,10 @@ def run_native_benchmark(
                             timeline_embedding_model=timeline_embedding_model,
                             timeline_semantic_rrf_weight=timeline_semantic_rrf_weight,
                             timeline_embedding_window_tokens=timeline_embedding_window_tokens,
+                            timeline_hierarchical_parent_k=timeline_hierarchical_parent_k,
+                            timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
+                            timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
+                            timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
                             semantic_encoder=semantic_encoder,
                         ): sample["sample_id"]
                         for sample in samples
@@ -2922,12 +3292,26 @@ def run_native_benchmark(
         "timeline_card_granularity": timeline_card_granularity,
         "timeline_card_max_chars": timeline_card_max_chars,
         "timeline_retriever": timeline_retriever,
-        "timeline_embedding_model": timeline_embedding_model if timeline_retriever == "hybrid_bge" else None,
+        "timeline_embedding_model": (
+            timeline_embedding_model if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+        ),
         "timeline_semantic_rrf_weight": (
-            timeline_semantic_rrf_weight if timeline_retriever == "hybrid_bge" else None
+            timeline_semantic_rrf_weight if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
         ),
         "timeline_embedding_window_tokens": (
-            timeline_embedding_window_tokens if timeline_retriever == "hybrid_bge" else None
+            timeline_embedding_window_tokens if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+        ),
+        "timeline_hierarchical_parent_k": (
+            timeline_hierarchical_parent_k if timeline_retriever == "hierarchical_bge" else None
+        ),
+        "timeline_hierarchical_bundle_k": (
+            timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else None
+        ),
+        "timeline_hierarchical_neighbor_radius": (
+            timeline_hierarchical_neighbor_radius if timeline_retriever == "hierarchical_bge" else None
+        ),
+        "timeline_hierarchical_bundle_max_chars": (
+            timeline_hierarchical_bundle_max_chars if timeline_retriever == "hierarchical_bge" else None
         ),
         "timeline_encoder_identity": dict(semantic_encoder.identity) if semantic_encoder is not None else None,
         "git_commit": current_git_commit(),
