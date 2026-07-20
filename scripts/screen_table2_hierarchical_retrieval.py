@@ -140,6 +140,43 @@ def main() -> None:
             parse_ints(args.bundle_max_chars),
         )
     ]
+    maximum_bundle_k = max(parse_ints(args.bundle_k))
+    retrieval_cache: dict[tuple[str, str, int, int, int], list[dict[str, Any]]] = {}
+    retrieval_shapes = sorted(
+        {
+            (
+                int(config["parent_k"]),
+                int(config["neighbor_radius"]),
+                int(config["bundle_max_chars"]),
+            )
+            for config in configs
+        }
+    )
+    for dataset, samples in samples_by_dataset.items():
+        for sample in samples:
+            conversation_id = str(
+                sample.get("conversation_id") or sample["sample_id"]
+            )
+            for parent_k, neighbor_radius, bundle_max_chars in retrieval_shapes:
+                cache_key = (
+                    dataset,
+                    str(sample["sample_id"]),
+                    parent_k,
+                    neighbor_radius,
+                    bundle_max_chars,
+                )
+                retrieval_cache[cache_key] = retrieve_hierarchical_timeline_bundles(
+                    stores[(dataset, conversation_id)],
+                    sample,
+                    semantic_encoder=encoder,
+                    semantic_rrf_weight=args.semantic_rrf_weight,
+                    embedding_window_tokens=args.embedding_window_tokens,
+                    parent_k=parent_k,
+                    bundle_k=maximum_bundle_k,
+                    neighbor_radius=neighbor_radius,
+                    bundle_max_chars=bundle_max_chars,
+                )
+
     results: list[dict[str, Any]] = []
     for config in configs:
         dataset_summaries: dict[str, dict[str, Any]] = {}
@@ -149,20 +186,15 @@ def main() -> None:
             context_chars: list[float] = []
             retrieved_counts: list[float] = []
             for sample in samples:
-                conversation_id = str(
-                    sample.get("conversation_id") or sample["sample_id"]
-                )
-                bundles = retrieve_hierarchical_timeline_bundles(
-                    stores[(dataset, conversation_id)],
-                    sample,
-                    semantic_encoder=encoder,
-                    semantic_rrf_weight=args.semantic_rrf_weight,
-                    embedding_window_tokens=args.embedding_window_tokens,
-                    parent_k=config["parent_k"],
-                    bundle_k=config["bundle_k"],
-                    neighbor_radius=config["neighbor_radius"],
-                    bundle_max_chars=config["bundle_max_chars"],
-                )
+                bundles = retrieval_cache[
+                    (
+                        dataset,
+                        str(sample["sample_id"]),
+                        int(config["parent_k"]),
+                        int(config["neighbor_radius"]),
+                        int(config["bundle_max_chars"]),
+                    )
+                ][: int(config["bundle_k"])]
                 refs_at5 = sorted(
                     {
                         str(ref)
