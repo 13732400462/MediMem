@@ -635,6 +635,7 @@ def load_dialsim_samples(
     limit: int | None = None,
     sample_n: int | None = None,
     random_seed: int = 20260716,
+    required_sample_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         import pyarrow.parquet as pq  # type: ignore
@@ -646,14 +647,17 @@ def load_dialsim_samples(
         parquet_files_by_subset.setdefault(parquet_path.parent.name, []).append(parquet_path)
     if not parquet_files_by_subset:
         return []
+    required_ids = list(dict.fromkeys(required_sample_ids or []))
+    required_id_set = set(required_ids)
     target_total = sample_n or limit
-    if target_total is None:
+    if target_total is None and not required_ids:
         raise ValueError("DialSim loading requires sample_n or limit because the official parquet contains very large QA arrays.")
     subsets = sorted(parquet_files_by_subset)
-    base, remainder = divmod(target_total, len(subsets))
+    base, remainder = divmod(target_total or 0, len(subsets))
     quotas = {subset: base + (1 if idx < remainder else 0) for idx, subset in enumerate(subsets)}
     rng = random.Random(random_seed)
     reservoirs: dict[str, list[dict[str, Any]]] = {subset: [] for subset in subsets}
+    required_samples: dict[str, dict[str, Any]] = {}
     seen_by_subset = {subset: 0 for subset in subsets}
     question_families = (
         "easy_qs_ans_w_time",
@@ -744,6 +748,11 @@ def load_dialsim_samples(
                                     "evidence_note": "DialSim *_idxes is an official QA/oracle index, not a runtime timeline source ID.",
                                 },
                             }
+                            if required_ids:
+                                sample_id = str(candidate["sample_id"])
+                                if sample_id in required_id_set:
+                                    required_samples[sample_id] = candidate
+                                continue
                             seen_by_subset[subset] += 1
                             seen = seen_by_subset[subset]
                             reservoir = reservoirs[subset]
@@ -755,6 +764,11 @@ def load_dialsim_samples(
                                 if replacement < quota:
                                     reservoir[replacement] = candidate
                     global_row += 1
+    if required_ids:
+        missing = [sample_id for sample_id in required_ids if sample_id not in required_samples]
+        if missing:
+            raise ValueError(f"Frozen DialSim sample IDs not present in dataset: {missing[:10]}")
+        return [required_samples[sample_id] for sample_id in required_ids]
     return [sample for subset in subsets for sample in reservoirs[subset]]
 
 
@@ -3037,19 +3051,20 @@ def run_native_benchmark(
     if timeline_retriever == "hierarchical_bge":
         timeline_card_granularity = "session_chunk"
     source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
+    frozen_sample_ids = load_frozen_sample_ids(sample_manifest) if sample_manifest else None
     if dataset == "dialsim":
         loaded_samples = load_dialsim_samples(
             source_path,
             limit=limit,
             sample_n=sample_n,
             random_seed=int(random_seed or 20260716),
+            required_sample_ids=frozen_sample_ids,
         )
         samples = loaded_samples
     else:
         loaded_samples = load_native_samples(dataset, dataset_path, limit=limit)
         samples = sample_benchmark_rows(loaded_samples, sample_n=sample_n, random_seed=random_seed)
-    frozen_sample_ids = load_frozen_sample_ids(sample_manifest) if sample_manifest else None
-    if frozen_sample_ids is not None:
+    if frozen_sample_ids is not None and dataset != "dialsim":
         samples = select_frozen_samples(loaded_samples, frozen_sample_ids)
     prefix = f"{dataset}_memory_random{sample_n}" if sample_n else f"{dataset}_benchmark"
     run_dir = make_benchmark_run_dir(output_root, prefix=prefix)

@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 
 from mem_ehr_agent.benchmark import (
     FULL_CONTEXT_SHORTCUT_ADVICE,
@@ -11,6 +13,7 @@ from mem_ehr_agent.benchmark import (
     evaluate_locomo_benchmark_predictions,
     evidence_recall_at5,
     load_longmemeval_samples,
+    load_dialsim_samples,
     load_locomo_samples,
     load_rhelm_samples,
     locomo_cache_key,
@@ -61,6 +64,66 @@ def test_frozen_sample_manifest_accepts_nested_test_split(tmp_path):
     path = tmp_path / "split_manifest.json"
     path.write_text(json.dumps({"test": {"sample_ids": ["s1"]}}), encoding="utf-8")
     assert load_frozen_sample_ids(path) == ["s1"]
+
+
+def test_load_dialsim_can_resolve_frozen_ids_without_random_sample_size(
+    tmp_path, monkeypatch
+):
+    subset = tmp_path / "subset_a"
+    subset.mkdir()
+    parquet_path = subset / "part.parquet"
+    parquet_path.touch()
+    family = "easy_qs_ans_w_time"
+    rows = [
+        {
+            "Episode": "e0",
+            "Session": 1,
+            "Date": "2025-01-01",
+            "Script": "first",
+            f"{family}_questions": ["q0"],
+            f"{family}_answers": ["a0"],
+            f"{family}_options": [[]],
+            f"{family}_idxes": [0],
+        },
+        {
+            "Episode": "e1",
+            "Session": 2,
+            "Date": "2025-01-02",
+            "Script": "second",
+            f"{family}_questions": ["q1"],
+            f"{family}_answers": ["a1"],
+            f"{family}_options": [[]],
+            f"{family}_idxes": [1],
+        },
+    ]
+
+    class FakeBatch:
+        def __init__(self, row):
+            self.row = row
+
+        def to_pylist(self):
+            return [self.row]
+
+    class FakeParquet:
+        schema_arrow = types.SimpleNamespace(names=list(rows[0]))
+
+        def __init__(self, _path):
+            pass
+
+        def iter_batches(self, **_kwargs):
+            return [FakeBatch(row) for row in rows]
+
+    pyarrow = types.ModuleType("pyarrow")
+    parquet = types.ModuleType("pyarrow.parquet")
+    parquet.ParquetFile = FakeParquet
+    pyarrow.parquet = parquet
+    monkeypatch.setitem(sys.modules, "pyarrow", pyarrow)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", parquet)
+
+    frozen_id = f"subset_a__r00001__s0002__{family}__00000"
+    samples = load_dialsim_samples(tmp_path, required_sample_ids=[frozen_id])
+    assert [sample["sample_id"] for sample in samples] == [frozen_id]
+    assert samples[0]["turns"][-1]["text"] == "second"
 
 
 def test_load_longmemeval_preserves_sessions_dates_and_evidence(tmp_path):
