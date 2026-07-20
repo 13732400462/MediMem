@@ -43,7 +43,7 @@ wait_ready() {
   local pid_file="$2"
   local pid
   pid="$(cat "$pid_file")"
-  for _ in $(seq 1 180); do
+  for _ in $(seq 1 360); do
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "vLLM process ${pid} exited before port ${port} became ready." >&2
       return 1
