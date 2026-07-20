@@ -63,8 +63,8 @@ def retrieve_hierarchical_grid(
     parent_ks: list[int],
     neighbor_radii: list[int],
     bundle_max_chars_values: list[int],
-    bundle_k: int,
-) -> dict[tuple[int, int, int], list[dict[str, Any]]]:
+    bundle_ks: list[int],
+) -> dict[tuple[int, int, int, int], list[dict[str, Any]]]:
     """Evaluate a parameter grid while encoding each bundle shape only once."""
     query = locomo_expanded_query(sample)
     maximum_parent_k = max(parent_ks)
@@ -102,8 +102,9 @@ def retrieve_hierarchical_grid(
             eligible_turns.append((turn_index, parent_rank))
     if not eligible_turns:
         return {
-            (parent_k, neighbor_radius, bundle_max_chars): []
+            (parent_k, bundle_k, neighbor_radius, bundle_max_chars): []
             for parent_k in parent_ks
+            for bundle_k in bundle_ks
             for neighbor_radius in neighbor_radii
             for bundle_max_chars in bundle_max_chars_values
         }
@@ -113,7 +114,7 @@ def retrieve_hierarchical_grid(
     is_multi_hop = "multi-hop" in category or "multihop" in category
     query_terms = set(extract_locomo_terms(query))
     is_temporal = "temporal" in category or bool(query_terms & TEMPORAL_TERMS)
-    output: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    output: dict[tuple[int, int, int, int], list[dict[str, Any]]] = {}
     for neighbor_radius in neighbor_radii:
         for bundle_max_chars in bundle_max_chars_values:
             candidates: list[dict[str, Any]] = []
@@ -182,49 +183,61 @@ def retrieve_hierarchical_grid(
                     ),
                     reverse=True,
                 )
-                selected: list[dict[str, Any]] = []
-                seen_sessions: set[str] = set()
-                if is_multi_hop:
-                    for candidate in ranked:
-                        session = str(
-                            (candidate.get("time_scope") or {}).get("session")
-                            or ""
+                for bundle_k in bundle_ks:
+                    selected: list[dict[str, Any]] = []
+                    seen_sessions: set[str] = set()
+                    if is_multi_hop:
+                        for candidate in ranked:
+                            session = str(
+                                (candidate.get("time_scope") or {}).get("session")
+                                or ""
+                            )
+                            if session in seen_sessions:
+                                continue
+                            selected.append(candidate)
+                            seen_sessions.add(session)
+                            if len(selected) >= bundle_k:
+                                break
+                    if len(selected) < bundle_k:
+                        selected_ids = {
+                            str(candidate["memory_id"]) for candidate in selected
+                        }
+                        selected.extend(
+                            candidate
+                            for candidate in ranked
+                            if str(candidate["memory_id"]) not in selected_ids
                         )
-                        if session in seen_sessions:
-                            continue
-                        selected.append(candidate)
-                        seen_sessions.add(session)
-                        if len(selected) >= bundle_k:
-                            break
-                if len(selected) < bundle_k:
-                    selected_ids = {
-                        str(candidate["memory_id"]) for candidate in selected
-                    }
-                    selected.extend(
-                        candidate
-                        for candidate in ranked
-                        if str(candidate["memory_id"]) not in selected_ids
-                    )
-                selected = [dict(candidate) for candidate in selected[:bundle_k]]
-                if is_temporal:
-                    selected.sort(
-                        key=lambda item: (
-                            str(
-                                (item.get("time_scope") or {}).get("date") or ""
-                            ),
-                            str(
-                                (item.get("time_scope") or {}).get("time") or ""
-                            ),
-                            int(item.get("anchor_turn_index") or 0),
-                        )
-                    )
-                for candidate in selected:
-                    memory_id = str(candidate["memory_id"])
-                    candidate["retrieval_score"] = fused_scores[memory_id]
-                    candidate["semantic_retrieval_score"] = semantic_scores[
-                        memory_id
+                    selected = [
+                        dict(candidate) for candidate in selected[:bundle_k]
                     ]
-                output[(parent_k, neighbor_radius, bundle_max_chars)] = selected
+                    if is_temporal:
+                        selected.sort(
+                            key=lambda item: (
+                                str(
+                                    (item.get("time_scope") or {}).get("date")
+                                    or ""
+                                ),
+                                str(
+                                    (item.get("time_scope") or {}).get("time")
+                                    or ""
+                                ),
+                                int(item.get("anchor_turn_index") or 0),
+                            )
+                        )
+                    for candidate in selected:
+                        memory_id = str(candidate["memory_id"])
+                        candidate["retrieval_score"] = fused_scores[memory_id]
+                        candidate["semantic_retrieval_score"] = semantic_scores[
+                            memory_id
+                        ]
+                    output[
+                        (
+                            parent_k,
+                            bundle_k,
+                            neighbor_radius,
+                            bundle_max_chars,
+                        )
+                    ] = selected
     return output
 
 
@@ -324,8 +337,10 @@ def main() -> None:
             parse_ints(args.bundle_max_chars),
         )
     ]
-    maximum_bundle_k = max(parse_ints(args.bundle_k))
-    retrieval_cache: dict[tuple[str, str, int, int, int], list[dict[str, Any]]] = {}
+    bundle_ks = sorted({int(config["bundle_k"]) for config in configs})
+    retrieval_cache: dict[
+        tuple[str, str, int, int, int, int], list[dict[str, Any]]
+    ] = {}
     parent_ks = sorted({int(config["parent_k"]) for config in configs})
     neighbor_radii = sorted(
         {int(config["neighbor_radius"]) for config in configs}
@@ -347,10 +362,11 @@ def main() -> None:
                 parent_ks=parent_ks,
                 neighbor_radii=neighbor_radii,
                 bundle_max_chars_values=bundle_max_chars_values,
-                bundle_k=maximum_bundle_k,
+                bundle_ks=bundle_ks,
             )
             for (
                 parent_k,
+                bundle_k,
                 neighbor_radius,
                 bundle_max_chars,
             ), bundles in sample_grid.items():
@@ -358,6 +374,7 @@ def main() -> None:
                     dataset,
                     str(sample["sample_id"]),
                     parent_k,
+                    bundle_k,
                     neighbor_radius,
                     bundle_max_chars,
                 )
@@ -377,10 +394,11 @@ def main() -> None:
                         dataset,
                         str(sample["sample_id"]),
                         int(config["parent_k"]),
+                        int(config["bundle_k"]),
                         int(config["neighbor_radius"]),
                         int(config["bundle_max_chars"]),
                     )
-                ][: int(config["bundle_k"])]
+                ]
                 refs_at5 = sorted(
                     {
                         str(ref)
