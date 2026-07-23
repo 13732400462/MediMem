@@ -20,6 +20,7 @@ from mem_ehr_agent.benchmark import (
     locomo_memory_path,
     load_frozen_sample_ids,
     maximum_window_similarity,
+    normalize_evidence_rerank_config,
     normalize_hierarchical_retriever_config,
     normalize_timeline_retriever_config,
     normalized_vector_cosine,
@@ -28,6 +29,7 @@ from mem_ehr_agent.benchmark import (
     qa_prompt,
     retrieve_locomo_memories,
     retrieve_hierarchical_timeline_bundles,
+    retrieve_evidence_reranked_timeline_bundles,
     run_locomo_official_wrapper,
     run_locomo_ours_memory_pipeline,
     static_rag_retrieved_context,
@@ -477,6 +479,26 @@ def test_locomo_cache_key_isolates_card_granularity_and_size():
         retriever="hierarchical_bge",
         hierarchical_bundle_k=8,
     )
+    evidence_reranker_a = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        retriever="evidence_rerank",
+        cross_encoder_model="reranker-a",
+        evidence_candidate_k=16,
+        evidence_final_k=5,
+    )
+    evidence_reranker_b = locomo_cache_key(
+        sample,
+        dataset_hash="abc123",
+        top_k=5,
+        coarse_k=5,
+        retriever="evidence_rerank",
+        cross_encoder_model="reranker-b",
+        evidence_candidate_k=16,
+        evidence_final_k=5,
+    )
 
     assert len(
         {
@@ -487,8 +509,10 @@ def test_locomo_cache_key_isolates_card_granularity_and_size():
             hybrid_weight_3,
             hierarchical_bundle_5,
             hierarchical_bundle_8,
+            evidence_reranker_a,
+            evidence_reranker_b,
         }
-    ) == 7
+    ) == 9
 
 
 def test_timeline_retriever_config_normalization_and_validation():
@@ -537,6 +561,142 @@ class FakeSemanticEncoder:
             distractor = 1.0 if "rumor" in lower else 0.0
             vectors.append([semantic, distractor])
         return vectors
+
+
+class FakeCrossEncoder:
+    identity = {
+        "model": "fake-cross-encoder",
+        "revision": "test",
+        "artifact_sha256": "1" * 64,
+    }
+
+    def predict(self, pairs):
+        scores = []
+        for _query, passage in pairs:
+            lower = passage.lower()
+            score = 10.0 if "purchased a red car" in lower else 0.0
+            if "unrelated rumor" in lower:
+                score -= 5.0
+            scores.append(score)
+        return scores
+
+
+def test_evidence_rerank_config_validation():
+    assert normalize_evidence_rerank_config(16, 5, 0.9) == (16, 5, 0.9)
+    for values in ((0, 5, 0.9), (4, 5, 0.9), (16, 0, 0.9), (16, 5, 1.1)):
+        try:
+            normalize_evidence_rerank_config(*values)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid evidence-rerank config should fail: {values}")
+
+
+def test_evidence_rerank_prefers_cross_encoder_and_excludes_gold(tmp_path):
+    sample = {
+        "sample_id": "q-rerank",
+        "conversation_id": "c-rerank",
+        "dataset": "locomo",
+        "question": "Which automobile was purchased?",
+        "answer": "SECRET GOLD ANSWER",
+        "evidence": ["SECRET GOLD REF"],
+        "judge_correct": True,
+        "turns": [
+            {
+                "speaker": "A",
+                "text": "An unrelated rumor mentioned an automobile.",
+                "session": "s1",
+                "session_date": "2025-01-01",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "B",
+                "text": "Maya purchased a red car.",
+                "session": "s2",
+                "session_date": "2025-02-01",
+                "evidence_refs": ["D2:0"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "rerank.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    retrieved = retrieve_evidence_reranked_timeline_bundles(
+        store,
+        sample,
+        semantic_encoder=FakeSemanticEncoder(),
+        cross_encoder=FakeCrossEncoder(),
+        semantic_rrf_weight=2.0,
+        embedding_window_tokens=16,
+        parent_k=2,
+        candidate_k=2,
+        final_k=1,
+        neighbor_radius=0,
+        bundle_max_chars=500,
+        redundancy_threshold=0.9,
+    )
+    assert len(retrieved) == 1
+    assert retrieved[0]["evidence_refs"] == ["D2:0"]
+    assert retrieved[0]["cross_encoder_score"] == 10.0
+    serialized = json.dumps(retrieved, ensure_ascii=False)
+    assert "SECRET GOLD ANSWER" not in serialized
+    assert "SECRET GOLD REF" not in serialized
+    assert "judge_correct" not in serialized
+
+
+def test_evidence_rerank_removes_near_duplicates(tmp_path):
+    sample = {
+        "sample_id": "q-dedup",
+        "conversation_id": "c-dedup",
+        "dataset": "locomo",
+        "question": "What car did Maya purchase?",
+        "turns": [
+            {
+                "speaker": "A",
+                "text": "Maya purchased a red car yesterday.",
+                "session": "s1",
+                "evidence_refs": ["D1:0"],
+            },
+            {
+                "speaker": "A",
+                "text": "Maya purchased a red car yesterday.",
+                "session": "s2",
+                "evidence_refs": ["D2:0"],
+            },
+            {
+                "speaker": "B",
+                "text": "The vehicle later needed repairs.",
+                "session": "s3",
+                "evidence_refs": ["D3:0"],
+            },
+        ],
+    }
+    store = build_locomo_memory_store(
+        sample,
+        tmp_path / "dedup.memory.jsonl",
+        card_granularity="session_chunk",
+        card_max_chars=4000,
+    )
+    retrieved = retrieve_evidence_reranked_timeline_bundles(
+        store,
+        sample,
+        semantic_encoder=FakeSemanticEncoder(),
+        cross_encoder=FakeCrossEncoder(),
+        semantic_rrf_weight=2.0,
+        embedding_window_tokens=16,
+        parent_k=3,
+        candidate_k=3,
+        final_k=3,
+        neighbor_radius=0,
+        bundle_max_chars=500,
+        redundancy_threshold=0.8,
+    )
+    summaries = [item["summary"] for item in retrieved]
+    assert summaries.count("speaker=A date= text=Maya purchased a red car yesterday.") == 1
+    assert len(retrieved) == 2
 
 
 def test_offline_hierarchical_grid_matches_individual_retrievals(tmp_path):
@@ -806,6 +966,34 @@ def test_benchmark_cli_exposes_hierarchical_retrieval_flags():
     assert args.timeline_hierarchical_bundle_k == 8
     assert args.timeline_hierarchical_neighbor_radius == 1
     assert args.timeline_hierarchical_bundle_max_chars == 700
+
+
+def test_benchmark_cli_exposes_evidence_rerank_flags():
+    args = build_parser().parse_args(
+        [
+            "benchmark",
+            "run",
+            "--dataset",
+            "locomo",
+            "--methods",
+            "medimem",
+            "--timeline-retriever",
+            "evidence_rerank",
+            "--timeline-cross-encoder-model",
+            "reranker",
+            "--timeline-evidence-candidate-k",
+            "24",
+            "--timeline-evidence-final-k",
+            "6",
+            "--timeline-evidence-redundancy-threshold",
+            "0.85",
+        ]
+    )
+    assert args.timeline_retriever == "evidence_rerank"
+    assert args.timeline_cross_encoder_model == "reranker"
+    assert args.timeline_evidence_candidate_k == 24
+    assert args.timeline_evidence_final_k == 6
+    assert args.timeline_evidence_redundancy_threshold == 0.85
 
 
 def test_parse_int_list_for_top_k_sweep():

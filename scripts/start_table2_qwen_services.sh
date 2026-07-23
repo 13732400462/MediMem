@@ -6,6 +6,7 @@ RUN_ROOT="${RUN_ROOT:-$PROJECT/runs/table2_hierarchical_bge_20260720}"
 VLLM_PY="${VLLM_PY:-/root/miniconda3/envs/qwen3/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/root/models/qwen_vl_size_sweep/8b}"
 SERVED_MODEL="${SERVED_MODEL:-qwen3-vl-8b}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
 mkdir -p "$RUN_ROOT/services"
 
 for port in 8001 8002; do
@@ -30,7 +31,7 @@ start_one() {
       --host 127.0.0.1 \
       --port "$port" \
       --trust-remote-code \
-      --gpu-memory-utilization 0.88 \
+      --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
       --max-model-len 16384 \
       --max-num-seqs 16 \
       --enforce-eager

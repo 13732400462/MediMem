@@ -160,6 +160,10 @@ def cmd_benchmark_run(args: argparse.Namespace) -> None:
         timeline_hierarchical_bundle_k=args.timeline_hierarchical_bundle_k,
         timeline_hierarchical_neighbor_radius=args.timeline_hierarchical_neighbor_radius,
         timeline_hierarchical_bundle_max_chars=args.timeline_hierarchical_bundle_max_chars,
+        timeline_cross_encoder_model=args.timeline_cross_encoder_model,
+        timeline_evidence_candidate_k=args.timeline_evidence_candidate_k,
+        timeline_evidence_final_k=args.timeline_evidence_final_k,
+        timeline_evidence_redundancy_threshold=args.timeline_evidence_redundancy_threshold,
     )
     print(f"run_dir={run_dir}")
 
@@ -390,9 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark_run.add_argument(
         "--timeline-retriever",
-        choices=("lexical", "hybrid_bge", "hierarchical_bge"),
+        choices=("lexical", "hybrid_bge", "hierarchical_bge", "evidence_rerank"),
         default="lexical",
-        help="Opt-in timeline-card retriever; hierarchical_bge adds session-to-turn evidence packing.",
+        help="Opt-in timeline-card retriever; evidence_rerank adds frozen cross-encoder reranking.",
     )
     benchmark_run.add_argument(
         "--timeline-embedding-model",
@@ -435,6 +439,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=900,
         help="Maximum visible characters in each hierarchical evidence bundle.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-cross-encoder-model",
+        default="BAAI/bge-reranker-v2-m3",
+        help="Frozen cross-encoder used only by evidence_rerank.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-evidence-candidate-k",
+        type=int,
+        default=32,
+        help="Hierarchical candidates scored by the evidence_rerank cross-encoder.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-evidence-final-k",
+        type=int,
+        default=5,
+        help="Evidence units passed to QA by evidence_rerank.",
+    )
+    benchmark_run.add_argument(
+        "--timeline-evidence-redundancy-threshold",
+        type=float,
+        default=0.9,
+        help="Token-cosine threshold used to suppress near-duplicate evidence units.",
     )
     benchmark_run.set_defaults(func=cmd_benchmark_run)
     locomo_parallel = benchmark_sub.add_parser("run-locomo-parallel")

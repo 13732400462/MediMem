@@ -45,8 +45,10 @@ LOCOMO_OFFICIAL_STYLE_METRICS = (
     "sbert_similarity",
 )
 TIMELINE_CARD_GRANULARITIES = {"turn", "session_chunk"}
-TIMELINE_RETRIEVERS = {"lexical", "hybrid_bge", "hierarchical_bge"}
+TIMELINE_RETRIEVERS = {"lexical", "hybrid_bge", "hierarchical_bge", "evidence_rerank"}
+SEMANTIC_TIMELINE_RETRIEVERS = {"hybrid_bge", "hierarchical_bge", "evidence_rerank"}
 DEFAULT_TIMELINE_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_TIMELINE_CROSS_ENCODER_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_TIMELINE_EMBEDDING_WINDOW_TOKENS = 256
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 _SBERT_MODEL: Any | None = None
@@ -116,6 +118,55 @@ class TimelineSemanticEncoder:
                 max_tokens=max_tokens,
                 tokenizer=self.tokenizer,
             )
+
+
+class TimelineCrossEncoder:
+    def __init__(self, model_name: str) -> None:
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "evidence_rerank retrieval requires sentence-transformers; "
+                "install the semantic optional dependency."
+            ) from exc
+        self.model_name = str(model_name).strip()
+        self.device = os.environ.get(
+            "MEDIMEM_TIMELINE_RERANK_DEVICE", "cpu"
+        ).strip() or "cpu"
+        self.model = CrossEncoder(self.model_name, device=self.device)
+        self._predict_lock = Lock()
+        config = getattr(getattr(self.model, "model", None), "config", None)
+        self.revision = str(getattr(config, "_commit_hash", None) or "unresolved")
+        model_path = Path(self.model_name)
+        if model_path.is_dir():
+            artifact_hash = hashlib.sha256()
+            for path in sorted(item for item in model_path.rglob("*") if item.is_file()):
+                artifact_hash.update(str(path.relative_to(model_path)).replace("\\", "/").encode("utf-8"))
+                with path.open("rb") as model_file:
+                    for block in iter(lambda: model_file.read(1024 * 1024), b""):
+                        artifact_hash.update(block)
+            self.artifact_sha256 = artifact_hash.hexdigest()
+        else:
+            identity_payload = f"{self.model_name}@{self.revision}"
+            self.artifact_sha256 = hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+
+    @property
+    def identity(self) -> dict[str, str]:
+        return {
+            "model": self.model_name,
+            "revision": self.revision,
+            "artifact_sha256": self.artifact_sha256,
+            "device": self.device,
+        }
+
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        with self._predict_lock:
+            scores = self.model.predict(
+                pairs,
+                batch_size=32,
+                show_progress_bar=False,
+            )
+        return [float(score) for score in scores]
 
 
 @dataclass(frozen=True)
@@ -1300,6 +1351,29 @@ def normalize_hierarchical_retriever_config(
     )
 
 
+def normalize_evidence_rerank_config(
+    candidate_k: int,
+    final_k: int,
+    redundancy_threshold: float,
+) -> tuple[int, int, float]:
+    normalized_candidate_k = int(candidate_k)
+    normalized_final_k = int(final_k)
+    normalized_redundancy_threshold = float(redundancy_threshold)
+    if normalized_candidate_k <= 0:
+        raise ValueError("timeline evidence candidate k must be positive.")
+    if normalized_final_k <= 0:
+        raise ValueError("timeline evidence final k must be positive.")
+    if normalized_candidate_k < normalized_final_k:
+        raise ValueError("timeline evidence candidate k must be at least final k.")
+    if not 0.0 <= normalized_redundancy_threshold <= 1.0:
+        raise ValueError("timeline evidence redundancy threshold must be between 0 and 1.")
+    return (
+        normalized_candidate_k,
+        normalized_final_k,
+        normalized_redundancy_threshold,
+    )
+
+
 def current_git_commit() -> str | None:
     configured = str(os.getenv("MEDIMEM_GIT_COMMIT") or "").strip()
     if configured:
@@ -1331,6 +1405,10 @@ def locomo_cache_key(
     hierarchical_bundle_k: int = 8,
     hierarchical_neighbor_radius: int = 1,
     hierarchical_bundle_max_chars: int = 900,
+    cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    evidence_candidate_k: int = 32,
+    evidence_final_k: int = 5,
+    evidence_redundancy_threshold: float = 0.9,
 ) -> str:
     granularity, max_chars = normalize_timeline_card_config(card_granularity, card_max_chars)
     normalized_retriever, normalized_model, normalized_weight, normalized_window = normalize_timeline_retriever_config(
@@ -1347,6 +1425,18 @@ def locomo_cache_key(
             hierarchical_bundle_max_chars,
         )
     )
+    normalized_candidate_k, normalized_final_k, normalized_redundancy_threshold = (
+        normalize_evidence_rerank_config(
+            evidence_candidate_k,
+            evidence_final_k,
+            evidence_redundancy_threshold,
+        )
+    )
+    normalized_cross_encoder_model = str(
+        cross_encoder_model or DEFAULT_TIMELINE_CROSS_ENCODER_MODEL
+    ).strip()
+    if not normalized_cross_encoder_model:
+        raise ValueError("timeline cross-encoder model must not be empty.")
     raw_id = str(sample.get("conversation_id") or sample.get("sample_id") or "")
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_id).strip("_") or "sample"
     retriever_payload = json.dumps(
@@ -1359,6 +1449,10 @@ def locomo_cache_key(
             "hierarchical_bundle_k": normalized_bundle_k,
             "hierarchical_neighbor_radius": normalized_neighbor_radius,
             "hierarchical_bundle_max_chars": normalized_bundle_max_chars,
+            "cross_encoder_model": normalized_cross_encoder_model,
+            "evidence_candidate_k": normalized_candidate_k,
+            "evidence_final_k": normalized_final_k,
+            "evidence_redundancy_threshold": normalized_redundancy_threshold,
             "code_commit": current_git_commit() or "unknown",
         },
         sort_keys=True,
@@ -1403,9 +1497,13 @@ def locomo_cached_memory_path(
     hierarchical_bundle_k: int = 8,
     hierarchical_neighbor_radius: int = 1,
     hierarchical_bundle_max_chars: int = 900,
+    cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    evidence_candidate_k: int = 32,
+    evidence_final_k: int = 5,
+    evidence_redundancy_threshold: float = 0.9,
 ) -> Path:
     return Path(cache_dir) / "locomo_memory_store" / (
-        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars, retriever=retriever, embedding_model=embedding_model, semantic_rrf_weight=semantic_rrf_weight, embedding_window_tokens=embedding_window_tokens, hierarchical_parent_k=hierarchical_parent_k, hierarchical_bundle_k=hierarchical_bundle_k, hierarchical_neighbor_radius=hierarchical_neighbor_radius, hierarchical_bundle_max_chars=hierarchical_bundle_max_chars)}"
+        f"{locomo_cache_key(sample, dataset_hash=dataset_hash, top_k=top_k, coarse_k=coarse_k, card_granularity=card_granularity, card_max_chars=card_max_chars, retriever=retriever, embedding_model=embedding_model, semantic_rrf_weight=semantic_rrf_weight, embedding_window_tokens=embedding_window_tokens, hierarchical_parent_k=hierarchical_parent_k, hierarchical_bundle_k=hierarchical_bundle_k, hierarchical_neighbor_radius=hierarchical_neighbor_radius, hierarchical_bundle_max_chars=hierarchical_bundle_max_chars, cross_encoder_model=cross_encoder_model, evidence_candidate_k=evidence_candidate_k, evidence_final_k=evidence_final_k, evidence_redundancy_threshold=evidence_redundancy_threshold)}"
         ".memory.jsonl"
     )
 
@@ -1428,6 +1526,10 @@ def build_cached_locomo_memory_store(
     hierarchical_bundle_k: int = 8,
     hierarchical_neighbor_radius: int = 1,
     hierarchical_bundle_max_chars: int = 900,
+    cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    evidence_candidate_k: int = 32,
+    evidence_final_k: int = 5,
+    evidence_redundancy_threshold: float = 0.9,
 ) -> MemoryStore:
     if cache_dir is None:
         return build_locomo_memory_store(
@@ -1452,6 +1554,10 @@ def build_cached_locomo_memory_store(
         hierarchical_bundle_k=hierarchical_bundle_k,
         hierarchical_neighbor_radius=hierarchical_neighbor_radius,
         hierarchical_bundle_max_chars=hierarchical_bundle_max_chars,
+        cross_encoder_model=cross_encoder_model,
+        evidence_candidate_k=evidence_candidate_k,
+        evidence_final_k=evidence_final_k,
+        evidence_redundancy_threshold=evidence_redundancy_threshold,
     )
     ensure_dir(memory_path.parent)
     lock_path = memory_path.with_suffix(memory_path.suffix + ".lock")
@@ -2261,6 +2367,92 @@ def retrieve_hierarchical_timeline_bundles(
     return selected
 
 
+def retrieve_evidence_reranked_timeline_bundles(
+    store: MemoryStore,
+    sample: dict[str, Any],
+    *,
+    semantic_encoder: Any,
+    cross_encoder: Any,
+    semantic_rrf_weight: float,
+    embedding_window_tokens: int,
+    parent_k: int,
+    candidate_k: int,
+    final_k: int,
+    neighbor_radius: int,
+    bundle_max_chars: int,
+    redundancy_threshold: float,
+) -> list[dict[str, Any]]:
+    candidate_k, final_k, redundancy_threshold = normalize_evidence_rerank_config(
+        candidate_k,
+        final_k,
+        redundancy_threshold,
+    )
+    candidates = retrieve_hierarchical_timeline_bundles(
+        store,
+        sample,
+        semantic_encoder=semantic_encoder,
+        semantic_rrf_weight=semantic_rrf_weight,
+        embedding_window_tokens=embedding_window_tokens,
+        parent_k=parent_k,
+        bundle_k=candidate_k,
+        neighbor_radius=neighbor_radius,
+        bundle_max_chars=bundle_max_chars,
+    )
+    if not candidates:
+        return []
+    question = normalize_answer(sample.get("question"))
+    passages = [locomo_memory_retrieval_text(candidate) for candidate in candidates]
+    rerank_scores = cross_encoder.predict([(question, passage) for passage in passages])
+    if len(rerank_scores) != len(candidates):
+        raise RuntimeError(
+            "Timeline cross-encoder returned a score count that does not match the candidate count."
+        )
+    ranked = sorted(
+        (
+            candidate
+            | {
+                "cross_encoder_score": float(score),
+                "pre_rerank_rank": rank,
+            }
+            for rank, (candidate, score) in enumerate(
+                zip(candidates, rerank_scores),
+                start=1,
+            )
+        ),
+        key=lambda item: (
+            float(item["cross_encoder_score"]),
+            float(item.get("retrieval_score") or 0.0),
+            -int(item["pre_rerank_rank"]),
+            str(item["memory_id"]),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    for candidate in ranked:
+        candidate_text = normalize_answer(candidate.get("summary"))
+        if any(
+            text_similarity(candidate_text, normalize_answer(previous.get("summary")))
+            >= redundancy_threshold
+            for previous in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= final_k:
+            break
+
+    category = str(sample.get("category_name") or "").lower().replace("_", "-")
+    query_terms = set(extract_locomo_terms(question))
+    if "temporal" in category or bool(query_terms & TEMPORAL_TERMS):
+        selected.sort(
+            key=lambda item: (
+                str((item.get("time_scope") or {}).get("date") or ""),
+                str((item.get("time_scope") or {}).get("time") or ""),
+                int(item.get("anchor_turn_index") or 0),
+            )
+        )
+    return selected
+
+
 def assert_no_full_context_shortcut(
     method: str,
     prompt_context: str,
@@ -2315,7 +2507,12 @@ def run_locomo_ours_memory_pipeline(
     timeline_hierarchical_bundle_k: int = 8,
     timeline_hierarchical_neighbor_radius: int = 1,
     timeline_hierarchical_bundle_max_chars: int = 900,
+    timeline_cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    timeline_evidence_candidate_k: int = 32,
+    timeline_evidence_final_k: int = 5,
+    timeline_evidence_redundancy_threshold: float = 0.9,
     semantic_encoder: Any | None = None,
+    cross_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     conversation_id = str(sample.get("conversation_id") or sample["sample_id"])
@@ -2338,8 +2535,31 @@ def run_locomo_ours_memory_pipeline(
         hierarchical_bundle_k=timeline_hierarchical_bundle_k,
         hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
         hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+        cross_encoder_model=timeline_cross_encoder_model,
+        evidence_candidate_k=timeline_evidence_candidate_k,
+        evidence_final_k=timeline_evidence_final_k,
+        evidence_redundancy_threshold=timeline_evidence_redundancy_threshold,
     )
-    if timeline_retriever == "hierarchical_bge":
+    if timeline_retriever == "evidence_rerank":
+        if semantic_encoder is None or cross_encoder is None:
+            raise RuntimeError(
+                "evidence_rerank retrieval requires semantic and cross encoders."
+            )
+        retrieved = retrieve_evidence_reranked_timeline_bundles(
+            store,
+            sample,
+            semantic_encoder=semantic_encoder,
+            cross_encoder=cross_encoder,
+            semantic_rrf_weight=timeline_semantic_rrf_weight,
+            embedding_window_tokens=timeline_embedding_window_tokens,
+            parent_k=timeline_hierarchical_parent_k,
+            candidate_k=timeline_evidence_candidate_k,
+            final_k=timeline_evidence_final_k,
+            neighbor_radius=timeline_hierarchical_neighbor_radius,
+            bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+            redundancy_threshold=timeline_evidence_redundancy_threshold,
+        )
+    elif timeline_retriever == "hierarchical_bge":
         if semantic_encoder is None:
             raise RuntimeError("hierarchical_bge retrieval requires a semantic encoder.")
         retrieved = retrieve_hierarchical_timeline_bundles(
@@ -2380,7 +2600,11 @@ def run_locomo_ours_memory_pipeline(
         sample,
         retrieved_memory_count=len(retrieved),
         retrieval_budget=(
-            timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else top_k
+            timeline_evidence_final_k
+            if timeline_retriever == "evidence_rerank"
+            else timeline_hierarchical_bundle_k
+            if timeline_retriever == "hierarchical_bge"
+            else top_k
         ),
     )
     pred = answer_with_context(sample, method_label, prompt_context, client, fail_on_llm_error=require_api)
@@ -2395,30 +2619,47 @@ def run_locomo_ours_memory_pipeline(
     pred["timeline_card_max_chars"] = card_max_chars
     pred["timeline_retriever"] = timeline_retriever
     pred["timeline_embedding_model"] = (
-        timeline_embedding_model if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+        timeline_embedding_model if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
     )
     pred["timeline_semantic_rrf_weight"] = (
-        timeline_semantic_rrf_weight if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+        timeline_semantic_rrf_weight if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
     )
     pred["timeline_embedding_window_tokens"] = (
-        timeline_embedding_window_tokens if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+        timeline_embedding_window_tokens if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
     )
     pred["timeline_encoder_identity"] = (
         dict(semantic_encoder.identity)
-        if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} and semantic_encoder is not None
+        if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS and semantic_encoder is not None
         else None
     )
     pred["timeline_hierarchical_parent_k"] = (
-        timeline_hierarchical_parent_k if timeline_retriever == "hierarchical_bge" else None
+        timeline_hierarchical_parent_k if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
     )
     pred["timeline_hierarchical_bundle_k"] = (
         timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else None
     )
     pred["timeline_hierarchical_neighbor_radius"] = (
-        timeline_hierarchical_neighbor_radius if timeline_retriever == "hierarchical_bge" else None
+        timeline_hierarchical_neighbor_radius if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
     )
     pred["timeline_hierarchical_bundle_max_chars"] = (
-        timeline_hierarchical_bundle_max_chars if timeline_retriever == "hierarchical_bge" else None
+        timeline_hierarchical_bundle_max_chars if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
+    )
+    pred["timeline_cross_encoder_model"] = (
+        timeline_cross_encoder_model if timeline_retriever == "evidence_rerank" else None
+    )
+    pred["timeline_cross_encoder_identity"] = (
+        dict(cross_encoder.identity)
+        if timeline_retriever == "evidence_rerank" and cross_encoder is not None
+        else None
+    )
+    pred["timeline_evidence_candidate_k"] = (
+        timeline_evidence_candidate_k if timeline_retriever == "evidence_rerank" else None
+    )
+    pred["timeline_evidence_final_k"] = (
+        timeline_evidence_final_k if timeline_retriever == "evidence_rerank" else None
+    )
+    pred["timeline_evidence_redundancy_threshold"] = (
+        timeline_evidence_redundancy_threshold if timeline_retriever == "evidence_rerank" else None
     )
     pred["retrieval_query"] = locomo_expanded_query(sample)
     pred["retrieved_evidence_refs"] = sorted(
@@ -2665,7 +2906,12 @@ def run_local_method(
     timeline_hierarchical_bundle_k: int = 8,
     timeline_hierarchical_neighbor_radius: int = 1,
     timeline_hierarchical_bundle_max_chars: int = 900,
+    timeline_cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    timeline_evidence_candidate_k: int = 32,
+    timeline_evidence_final_k: int = 5,
+    timeline_evidence_redundancy_threshold: float = 0.9,
     semantic_encoder: Any | None = None,
+    cross_encoder: Any | None = None,
 ) -> dict[str, Any]:
     dataset = str(sample.get("dataset") or "native_benchmark")
     if method == "direct":
@@ -2720,7 +2966,12 @@ def run_local_method(
             timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
             timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
             timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+            timeline_cross_encoder_model=timeline_cross_encoder_model,
+            timeline_evidence_candidate_k=timeline_evidence_candidate_k,
+            timeline_evidence_final_k=timeline_evidence_final_k,
+            timeline_evidence_redundancy_threshold=timeline_evidence_redundancy_threshold,
             semantic_encoder=semantic_encoder,
+            cross_encoder=cross_encoder,
         )
         if method_label:
             pred["method"] = method_label
@@ -3025,6 +3276,10 @@ def run_native_benchmark(
     timeline_hierarchical_bundle_k: int = 8,
     timeline_hierarchical_neighbor_radius: int = 1,
     timeline_hierarchical_bundle_max_chars: int = 900,
+    timeline_cross_encoder_model: str = DEFAULT_TIMELINE_CROSS_ENCODER_MODEL,
+    timeline_evidence_candidate_k: int = 32,
+    timeline_evidence_final_k: int = 5,
+    timeline_evidence_redundancy_threshold: float = 0.9,
 ) -> Path:
     timeline_card_granularity, timeline_card_max_chars = normalize_timeline_card_config(
         timeline_card_granularity,
@@ -3052,7 +3307,21 @@ def run_native_benchmark(
         timeline_hierarchical_neighbor_radius,
         timeline_hierarchical_bundle_max_chars,
     )
-    if timeline_retriever == "hierarchical_bge":
+    (
+        timeline_evidence_candidate_k,
+        timeline_evidence_final_k,
+        timeline_evidence_redundancy_threshold,
+    ) = normalize_evidence_rerank_config(
+        timeline_evidence_candidate_k,
+        timeline_evidence_final_k,
+        timeline_evidence_redundancy_threshold,
+    )
+    timeline_cross_encoder_model = str(
+        timeline_cross_encoder_model or DEFAULT_TIMELINE_CROSS_ENCODER_MODEL
+    ).strip()
+    if not timeline_cross_encoder_model:
+        raise ValueError("timeline cross-encoder model must not be empty.")
+    if timeline_retriever in {"hierarchical_bge", "evidence_rerank"}:
         timeline_card_granularity = "session_chunk"
     source_path = Path(dataset_path or NATIVE_BENCHMARKS[dataset].default_path)
     frozen_sample_ids = load_frozen_sample_ids(sample_manifest) if sample_manifest else None
@@ -3079,8 +3348,11 @@ def run_native_benchmark(
     blocked: list[dict[str, Any]] = []
     amem_runtimes: dict[str, LocomoAMEMRuntime] = {}
     semantic_encoder: TimelineSemanticEncoder | None = None
-    if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} and ("ours" in methods or "medimem" in methods):
+    cross_encoder: TimelineCrossEncoder | None = None
+    if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS and ("ours" in methods or "medimem" in methods):
         semantic_encoder = TimelineSemanticEncoder(timeline_embedding_model)
+    if timeline_retriever == "evidence_rerank" and ("ours" in methods or "medimem" in methods):
+        cross_encoder = TimelineCrossEncoder(timeline_cross_encoder_model)
     if ("ours" in methods or "medimem" in methods) and samples:
         seen_conversations: set[str] = set()
         for sample in samples:
@@ -3104,6 +3376,10 @@ def run_native_benchmark(
                 hierarchical_bundle_k=timeline_hierarchical_bundle_k,
                 hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
                 hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+                cross_encoder_model=timeline_cross_encoder_model,
+                evidence_candidate_k=timeline_evidence_candidate_k,
+                evidence_final_k=timeline_evidence_final_k,
+                evidence_redundancy_threshold=timeline_evidence_redundancy_threshold,
             )
             seen_conversations.add(conversation_id)
     if "amem" in methods:
@@ -3148,7 +3424,12 @@ def run_native_benchmark(
                                     timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
                                     timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
                                     timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+                                    timeline_cross_encoder_model=timeline_cross_encoder_model,
+                                    timeline_evidence_candidate_k=timeline_evidence_candidate_k,
+                                    timeline_evidence_final_k=timeline_evidence_final_k,
+                                    timeline_evidence_redundancy_threshold=timeline_evidence_redundancy_threshold,
                                     semantic_encoder=semantic_encoder,
+                                    cross_encoder=cross_encoder,
                                 )
                             ] = f"{sample['sample_id']}:{label}"
                 else:
@@ -3175,7 +3456,12 @@ def run_native_benchmark(
                             timeline_hierarchical_bundle_k=timeline_hierarchical_bundle_k,
                             timeline_hierarchical_neighbor_radius=timeline_hierarchical_neighbor_radius,
                             timeline_hierarchical_bundle_max_chars=timeline_hierarchical_bundle_max_chars,
+                            timeline_cross_encoder_model=timeline_cross_encoder_model,
+                            timeline_evidence_candidate_k=timeline_evidence_candidate_k,
+                            timeline_evidence_final_k=timeline_evidence_final_k,
+                            timeline_evidence_redundancy_threshold=timeline_evidence_redundancy_threshold,
                             semantic_encoder=semantic_encoder,
+                            cross_encoder=cross_encoder,
                         ): sample["sample_id"]
                         for sample in samples
                     }
@@ -3312,27 +3598,44 @@ def run_native_benchmark(
         "timeline_card_max_chars": timeline_card_max_chars,
         "timeline_retriever": timeline_retriever,
         "timeline_embedding_model": (
-            timeline_embedding_model if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+            timeline_embedding_model if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
         ),
         "timeline_semantic_rrf_weight": (
-            timeline_semantic_rrf_weight if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+            timeline_semantic_rrf_weight if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
         ),
         "timeline_embedding_window_tokens": (
-            timeline_embedding_window_tokens if timeline_retriever in {"hybrid_bge", "hierarchical_bge"} else None
+            timeline_embedding_window_tokens if timeline_retriever in SEMANTIC_TIMELINE_RETRIEVERS else None
         ),
         "timeline_hierarchical_parent_k": (
-            timeline_hierarchical_parent_k if timeline_retriever == "hierarchical_bge" else None
+            timeline_hierarchical_parent_k if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
         ),
         "timeline_hierarchical_bundle_k": (
             timeline_hierarchical_bundle_k if timeline_retriever == "hierarchical_bge" else None
         ),
         "timeline_hierarchical_neighbor_radius": (
-            timeline_hierarchical_neighbor_radius if timeline_retriever == "hierarchical_bge" else None
+            timeline_hierarchical_neighbor_radius if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
         ),
         "timeline_hierarchical_bundle_max_chars": (
-            timeline_hierarchical_bundle_max_chars if timeline_retriever == "hierarchical_bge" else None
+            timeline_hierarchical_bundle_max_chars if timeline_retriever in {"hierarchical_bge", "evidence_rerank"} else None
         ),
         "timeline_encoder_identity": dict(semantic_encoder.identity) if semantic_encoder is not None else None,
+        "timeline_cross_encoder_model": (
+            timeline_cross_encoder_model if timeline_retriever == "evidence_rerank" else None
+        ),
+        "timeline_cross_encoder_identity": (
+            dict(cross_encoder.identity)
+            if timeline_retriever == "evidence_rerank" and cross_encoder is not None
+            else None
+        ),
+        "timeline_evidence_candidate_k": (
+            timeline_evidence_candidate_k if timeline_retriever == "evidence_rerank" else None
+        ),
+        "timeline_evidence_final_k": (
+            timeline_evidence_final_k if timeline_retriever == "evidence_rerank" else None
+        ),
+        "timeline_evidence_redundancy_threshold": (
+            timeline_evidence_redundancy_threshold if timeline_retriever == "evidence_rerank" else None
+        ),
         "git_commit": current_git_commit(),
         "top_k_sweep": sweep_values,
         "judge_answers": judge_answers,
