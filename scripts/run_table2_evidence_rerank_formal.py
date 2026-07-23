@@ -256,21 +256,24 @@ def main() -> None:
         "max_workers": args.max_workers,
     }
     records = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    dataset_endpoints = [
+        ("locomo", "http://127.0.0.1:8001/v1"),
+        ("longmemeval", "http://127.0.0.1:8001/v1"),
+        ("dialsim", "http://127.0.0.1:8002/v1"),
+        ("rhelm", "http://127.0.0.1:8002/v1"),
+    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
             pool.submit(
-                run_queue,
-                datasets,
+                run_dataset,
+                dataset,
                 endpoint=endpoint,
-                shared=shared,
+                **shared,
             )
-            for datasets, endpoint in [
-                (["locomo", "longmemeval"], "http://127.0.0.1:8001/v1"),
-                (["dialsim", "rhelm"], "http://127.0.0.1:8002/v1"),
-            ]
+            for dataset, endpoint in dataset_endpoints
         ]
         for future in as_completed(futures):
-            records.extend(future.result())
+            records.append(future.result())
     supervisor = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": args.git_commit,
