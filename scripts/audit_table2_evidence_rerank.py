@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from mem_ehr_agent.benchmark import (
-    evaluate_benchmark_predictions,
     evidence_recall_at5,
+    normalize_answer,
 )
+from mem_ehr_agent.metrics import token_f1
 
 
 EXPECTED = {
@@ -61,12 +62,13 @@ def metric_values(
         for sample_id, sample in sample_map.items()
     ]
     recall_values = [float(value) for value in recalls if value is not None]
-    aggregate_rows = evaluate_benchmark_predictions(samples, predictions)
-    overall = next(
-        row
-        for row in aggregate_rows
-        if row.get("split") == "overall"
-    )
+    qa_f1_values = [
+        token_f1(
+            normalize_answer(prediction_map[sample_id].get("answer")),
+            normalize_answer(sample.get("answer")),
+        )
+        for sample_id, sample in sample_map.items()
+    ]
     return {
         "answer_accuracy": sum(accuracies) / len(accuracies),
         "evidence_r5": (
@@ -74,7 +76,7 @@ def metric_values(
             if recall_values
             else None
         ),
-        "qa_f1": float(overall["qa_f1"]),
+        "qa_f1": sum(qa_f1_values) / len(qa_f1_values),
     }
 
 
