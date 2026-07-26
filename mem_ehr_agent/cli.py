@@ -293,8 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument(
         "--baseline-set",
         default=None,
-        choices=["all", "focused", "required", "none"],
-        help="all includes polluted variants; required runs direct/cot/amem/ddo/colacare only.",
+        choices=["all", "focused", "required", "backbone", "none"],
+        help="backbone runs direct/cot/amem/clincare; required also includes static RAG, DDO, and ColaCare.",
     )
     suite.add_argument(
         "--ablation-groups",

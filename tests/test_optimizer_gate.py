@@ -14,6 +14,7 @@ def _summaries() -> list[dict[str, object]]:
         "baseline_amem_adapter": 0.42,
         "baseline_ddo_adapter": 0.2,
         "baseline_colacare_adapter": 0.25,
+        "official_clincare_adapter": 0.28,
     }
     return [{"method": method, "primary_diag_objective": value} for method, value in methods.items()]
 

@@ -41,6 +41,9 @@ FAST_FORMAL_ABLATION_GROUPS = (
     "ablate_no_evidence_note_injection",
     "ablate_with_polluted_memory",
     "ablate_no_temporal_signal",
+    "ablate_no_evidence_no_cleaning",
+    "ablate_no_evidence_fixed_top_k",
+    "ablate_no_cleaning_fixed_top_k",
 )
 
 
@@ -121,8 +124,11 @@ def run_baselines(
         for case in cases:
             tasks.append(("direct", case["case_id"], pool.submit(run_direct, case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
             tasks.append(("single_cot", case["case_id"], pool.submit(run_single_cot_agent, case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
-            tasks.append(("static_rag", case["case_id"], pool.submit(run_static_rag_adapter, case, with_completion_budget(client, completion_token_budget), memory_dir=run_dir / "memory" / "baseline_static_rag", fail_on_llm_error=fail_on_llm_error)))
+            if baseline_set != "backbone":
+                tasks.append(("static_rag", case["case_id"], pool.submit(run_static_rag_adapter, case, with_completion_budget(client, completion_token_budget), memory_dir=run_dir / "memory" / "baseline_static_rag", fail_on_llm_error=fail_on_llm_error)))
             tasks.append(("amem", case["case_id"], pool.submit(run_baseline, "amem", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
+            if baseline_set == "backbone":
+                tasks.append(("clincare", case["case_id"], pool.submit(run_baseline, "clincare", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
             if baseline_set in {"all", "required"}:
                 tasks.append(("ddo", case["case_id"], pool.submit(run_baseline, "ddo", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
                 tasks.append(("colacare", case["case_id"], pool.submit(run_baseline, "colacare", case, with_completion_budget(client, completion_token_budget), fail_on_llm_error=fail_on_llm_error)))
@@ -182,6 +188,7 @@ FAST_FORMAL_PIPELINE_METHODS = {
     "baseline_amem_adapter",
     "baseline_ddo_adapter",
     "baseline_colacare_adapter",
+    "official_clincare_adapter",
     "full_medimem_merged",
 }
 FAST_FORMAL_MEDIMEM_METHODS = {
@@ -194,6 +201,9 @@ FAST_FORMAL_MEDIMEM_METHODS = {
     "ablate_no_sanitization_boundary_medimem_merged",
     "ablate_with_polluted_memory_medimem_merged",
     "ablate_no_temporal_signal_medimem_merged",
+    "ablate_no_evidence_no_cleaning_medimem_merged",
+    "ablate_no_evidence_fixed_top_k_medimem_merged",
+    "ablate_no_cleaning_fixed_top_k_medimem_merged",
 }
 
 
@@ -321,6 +331,7 @@ def write_fast_formal_gate(
         "baseline_amem_adapter",
         "baseline_ddo_adapter",
         "baseline_colacare_adapter",
+        "official_clincare_adapter",
     ]
     full_obj = summary_metric(summaries, "full_medimem_merged")
     best_baseline_obj = max(summary_metric(summaries, method) for method in baseline_methods)
@@ -520,6 +531,18 @@ def ablation_feature_sets() -> list[tuple[str, dict[str, bool]]]:
         ("ablate_no_evidence_note_injection", {"disable_evidence_note_injection": True}),
         ("ablate_no_counterfactual_verification", {"disable_counterfactual_verification": True}),
         ("ablate_no_sanitization_boundary", {"disable_sanitization_boundary": True}),
+        (
+            "ablate_no_evidence_no_cleaning",
+            {"disable_evidence_note_injection": True, "critic_audit_only": True},
+        ),
+        (
+            "ablate_no_evidence_fixed_top_k",
+            {"disable_evidence_note_injection": True, "disable_dynamic_top_k": True},
+        ),
+        (
+            "ablate_no_cleaning_fixed_top_k",
+            {"critic_audit_only": True, "disable_dynamic_top_k": True},
+        ),
     ]
 
 
@@ -561,6 +584,9 @@ def parse_ablation_groups(groups: str | None, *, default: list[tuple[str, dict[s
         "no_temporal_signal": "ablate_no_temporal_signal",
         "temporal_signal": "ablate_no_temporal_signal",
         "no_time_signal": "ablate_no_temporal_signal",
+        "no_evidence_no_cleaning": "ablate_no_evidence_no_cleaning",
+        "no_evidence_fixed_top_k": "ablate_no_evidence_fixed_top_k",
+        "no_cleaning_fixed_top_k": "ablate_no_cleaning_fixed_top_k",
     }
     selected: list[tuple[str, dict[str, bool]]] = []
     for raw in str(groups).split(","):
@@ -662,6 +688,7 @@ def optimize_suite(
             "baseline_amem_adapter",
             "baseline_ddo_adapter",
             "baseline_colacare_adapter",
+            "official_clincare_adapter",
         ]
     )
 

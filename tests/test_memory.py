@@ -946,6 +946,38 @@ def test_required_baseline_set_runs_required_unpolluted_pipelines(tmp_path, monk
     }
 
 
+def test_backbone_baseline_set_runs_exact_four_comparison_baselines(tmp_path, monkeypatch):
+    from mem_ehr_agent import optimizer
+
+    def fake_adapter(name, case, client, *, fail_on_llm_error=False, polluted=False):
+        method = "official_clincare_adapter" if name == "clincare" else f"baseline_{name}_adapter"
+        return {
+            "case_id": case["case_id"],
+            "method": method,
+            "primary_diagnosis": "pneumonia",
+            "diagnosis_list": ["pneumonia"],
+            "confidence": 0.7,
+            "evidence": [],
+            "reasoning_summary": "",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    monkeypatch.setattr(optimizer, "run_baseline", fake_adapter)
+    case = {
+        "case_id": "case_backbone",
+        "demographics": {},
+        "events": [{"event_id": "ev_1", "time": 0, "type": "clinical", "text": "fever and cough"}],
+        "poison_records": [],
+    }
+    preds = optimizer.run_baselines([case], None, tmp_path, max_workers=2, baseline_set="backbone")
+    assert {pred["method"] for pred in preds} == {
+        "direct_deepseek",
+        "baseline_single_cot_agent",
+        "baseline_amem_adapter",
+        "official_clincare_adapter",
+    }
+
+
 def test_fast_formal_ablation_group_parser_selects_pollution_ablation():
     from mem_ehr_agent.optimizer import parse_ablation_groups
 
@@ -959,6 +991,30 @@ def test_fast_formal_ablation_group_parser_selects_pollution_ablation():
         "ablate_no_evidence_note_injection",
         "ablate_with_polluted_memory",
     ]
+
+
+def test_pairwise_ablation_groups_resolve_exact_two_feature_flags():
+    from mem_ehr_agent.optimizer import parse_ablation_groups
+
+    groups = parse_ablation_groups(
+        "no_evidence_no_cleaning,no_evidence_fixed_top_k,no_cleaning_fixed_top_k",
+        default=[],
+    )
+    assert groups == [
+        (
+            "ablate_no_evidence_no_cleaning",
+            {"disable_evidence_note_injection": True, "critic_audit_only": True},
+        ),
+        (
+            "ablate_no_evidence_fixed_top_k",
+            {"disable_evidence_note_injection": True, "disable_dynamic_top_k": True},
+        ),
+        (
+            "ablate_no_cleaning_fixed_top_k",
+            {"critic_audit_only": True, "disable_dynamic_top_k": True},
+        ),
+    ]
+    assert all(len(features) == 2 for _, features in groups)
 
 
 def test_compact_case_context_limits_long_timelines():

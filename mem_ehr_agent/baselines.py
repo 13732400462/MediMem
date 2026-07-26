@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from typing import Any
 
 from pathlib import Path
 
-from .agents import case_context, compact_memory_lines, pollution_memory_context, run_llm_prediction, sanitize_runtime_text
+from .agents import (
+    case_context,
+    compact_case_context,
+    compact_memory_lines,
+    pollution_memory_context,
+    run_llm_prediction,
+    sanitize_runtime_text,
+)
 from .amem_baseline import run_amem_adapter
 from .llm import DeepSeekClient
 from .memory import bootstrap_memory
@@ -23,6 +32,10 @@ BASELINE_SOURCES = {
     "colacare": {
         "paper": "Wang et al., WWW 2025, ColaCare: Enhancing Electronic Health Record Modeling through LLM-Driven Multi-Agent Collaboration",
         "repo": "https://github.com/PKU-AICare/ColaCare",
+    },
+    "clincare": {
+        "paper": "Li et al., AAAI 2026, CliCARE",
+        "repo": "released-source CliCARE KG alignment adapter",
     },
 }
 
@@ -145,6 +158,86 @@ def run_colacare_adapter(
     return pred
 
 
+def _clincare_term_path() -> Path | None:
+    configured = os.getenv("CLICARE_ROOT", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(Path(configured) / "KG_Alignment" / "entities_and_relations.txt")
+    package_path = Path(__file__).resolve()
+    candidates.extend(
+        [
+            Path.cwd() / "external_baselines" / "CliCARE-main" / "KG_Alignment" / "entities_and_relations.txt",
+            package_path.parents[1] / "external_baselines" / "CliCARE-main" / "KG_Alignment" / "entities_and_relations.txt",
+            package_path.parents[2] / "external_baselines" / "CliCARE-main" / "KG_Alignment" / "entities_and_relations.txt",
+        ]
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+@lru_cache(maxsize=1)
+def load_clincare_terms() -> tuple[str, ...]:
+    path = _clincare_term_path()
+    if path is None:
+        return ()
+    terms = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        term = line.strip(" -\t")
+        if term and len(term) <= 80:
+            terms.append(term)
+    return tuple(terms[:200])
+
+
+def run_clincare_adapter(
+    case: dict[str, Any],
+    client: DeepSeekClient | None,
+    *,
+    fail_on_llm_error: bool = False,
+) -> dict[str, Any]:
+    text = compact_case_context(
+        case,
+        max_events=16,
+        include_labs=True,
+        include_time=True,
+        event_text_limit=140,
+    )
+    matched = [term for term in load_clincare_terms() if term.lower() in text.lower()][:20]
+    context = "\n".join(
+        [
+            f"case_id: {case['case_id']}",
+            "[CLICARE_OFFICIAL_KG_ALIGNMENT_ADAPTER]",
+            (
+                "The released CliCARE KG alignment code expects Neo4j guideline and temporal KG assets. "
+                "This protocol adapter uses the downloaded KG schema terms and trajectory-alignment framing "
+                "under the same model endpoint."
+            ),
+            "[MATCHED_KG_TERMS]",
+            "\n".join(f"- {term}" for term in matched) if matched else "- no direct KG term match",
+            "[CURRENT_CASE_CONTEXT]",
+            text,
+        ]
+    )
+    pred = run_llm_prediction(
+        case,
+        method="official_clincare_adapter",
+        client=client,
+        context=context,
+        extra=(
+            "CliCARE-style clinical KG alignment: align visible case events to guideline/KG concepts before "
+            "answering. Do not assume unavailable MIMIC or Neo4j records."
+        ),
+        temperature=0.05,
+        fail_on_llm_error=fail_on_llm_error,
+    )
+    pred["official_baseline"] = "CliCARE"
+    pred["baseline_source"] = BASELINE_SOURCES["clincare"]
+    pred["adapter_note"] = (
+        "Released KG/Neo4j assets are unavailable; this frozen adapter uses downloaded KG schema terms and "
+        "CliCARE trajectory-alignment framing, with the dependency difference recorded."
+    )
+    pred["matched_kg_terms"] = matched
+    return pred
+
+
 def run_baseline(
     name: str,
     case: dict[str, Any],
@@ -159,4 +252,8 @@ def run_baseline(
         return run_ddo_adapter(case, client, fail_on_llm_error=fail_on_llm_error, polluted=polluted)
     if name == "colacare":
         return run_colacare_adapter(case, client, fail_on_llm_error=fail_on_llm_error, polluted=polluted)
+    if name == "clincare":
+        if polluted:
+            raise ValueError("CliCARE adapter has no polluted-memory variant.")
+        return run_clincare_adapter(case, client, fail_on_llm_error=fail_on_llm_error)
     raise ValueError(f"Unknown baseline: {name}")
