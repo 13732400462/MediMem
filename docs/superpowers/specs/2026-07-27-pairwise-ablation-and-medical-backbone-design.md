@@ -1,179 +1,140 @@
-# Pairwise Ablation and Medical Backbone Evaluation Design
+# 两因素消融与医疗多骨干模型实验设计
 
-## Goal
+## 一、目标
 
-Add two independent experiments without changing the accepted results in the
-current main medical table or the archived non-medical timeline table:
+在不修改当前正文医疗主表既有结果、也不修改已归档非医疗长时间线表格结果的前提下，新增两组实验：
 
-1. extend the PMOA-TTS component analysis with the three pairwise removals of
-   the positive components already shown in the paper; and
-2. add a Section 4.2 medical-backbone comparison covering five pipelines and
-   five backbones under the frozen five-source protocol.
+1. 在 PMOA-TTS 组件分析中，补充正文已有三个正向组件的两两联合消融；
+2. 在论文第 4.2 节新增医疗多骨干模型比较，覆盖五条推理流程和五个骨干模型。
 
-The existing Qwen3-VL scale comparison remains the Section 4.1 Table 2. The
-non-medical LoCoMo, LongMemEval, DialSim, and RHELM table retains its accepted
-values and moves to the appendix. It is not rerun or combined with the new
-medical-backbone table.
+现有 Qwen3-VL 不同规模比较继续作为第 4.1 节的 Table 2。LoCoMo、LongMemEval、DialSim 和 RHELM 四个非医疗数据源的表格保留已验收数值并移至附录，不重新运行，也不与新增医疗多骨干模型表合并。
 
-## Frozen Experiment Matrix
+## 二、冻结实验矩阵
 
-### Pairwise component ablation
+### 2.1 两因素组件消融
 
-The ablation uses the same 5,000 frozen PMOA-TTS cases, Qwen3-VL-8B model,
-prompt, decoding configuration, evaluator, request seed, and strict
-no-fallback gates as the existing complete ablation. The three new variants
-are:
+消融实验继续使用现有完整消融相同的 5,000 个冻结 PMOA-TTS 样本、Qwen3-VL-8B、提示词、解码配置、评估器、请求随机种子和严格零回退门槛。
 
-- no source-aligned evidence notes and no applied memory cleaning (`-E-C`);
-- no source-aligned evidence notes and fixed top-k retrieval (`-E-K`); and
-- no applied memory cleaning and fixed top-k retrieval (`-C-K`).
+新增三个变体：
 
-Here `E` denotes source-aligned evidence notes, `C` applied memory cleaning,
-and `K` dynamic top-k retrieval. Full MediMem and the three existing
-single-factor rows remain the comparison anchors. The implementation must
-compose existing feature flags; it must not introduce a different prompt,
-evaluator, sample subset, or scoring rule for the pairwise rows.
+- 同时移除 source-aligned evidence notes 和 applied memory cleaning（`-E-C`）；
+- 同时移除 source-aligned evidence notes，并将动态检索改为 fixed top-k（`-E-K`）；
+- 同时移除 applied memory cleaning，并将动态检索改为 fixed top-k（`-C-K`）。
 
-### Medical backbone comparison
+其中，`E` 表示 source-aligned evidence notes，`C` 表示 applied memory cleaning，`K` 表示 dynamic top-k retrieval。Full MediMem 和已有三个单因素消融行继续作为比较基准。
 
-The new Section 4.2 table uses the frozen five-source, 500-cases-per-source
-protocol already used by the accepted Qwen3-VL scale table:
+实现时必须复用现有功能开关的组合，不得为两因素行更换提示词、评估器、样本子集或计分规则。
 
-- MedMCQA: 500;
-- MedQA: 500;
-- Medical Meadow WikiDoc: 500;
-- PMOA-TTS: 500; and
-- PMC-Patients: 500.
+### 2.2 医疗多骨干模型比较
 
-The five pipelines are:
+新增第 4.2 节表格使用现有 Qwen3-VL 尺度主表对应的冻结五源协议，每个数据源 500 个样本：
 
-- Direct;
-- CoT;
-- A-MEM;
-- CliCARE; and
-- MediMem (Ours).
+- MedMCQA：500；
+- MedQA：500；
+- Medical Meadow WikiDoc：500；
+- PMOA-TTS：500；
+- PMC-Patients：500。
 
-The five backbones are:
+五条推理流程为：
 
-- Qwen3-VL-30B;
-- Llama-3.1-70B (`llama-3.1-70b`);
-- DeepSeek-V3 (`deepseek-v3`);
-- GPT-4.1 (`gpt-4.1`); and
-- Gemini-2.5-Flash (`gemini-2.5-flash`).
+- Direct；
+- CoT；
+- A-MEM；
+- CliCARE；
+- MediMem（Ours）。
 
-The accepted Qwen3-VL-30B cells are reused from their original complete frozen
-runs after manifest and sample-ID verification. They are not rerun. Each of
-the four remote backbones runs all five pipelines over all 2,500 frozen cases,
-for 20 new model-pipeline units and 50,000 pipeline-case units. Every unit uses
-the same visible inputs, method adapter, prompt family, maximum completion
-budget, request seed, evaluator, metric implementation, and strict
-no-fallback policy. Results from different runs or sample subsets may not be
-spliced.
+五个骨干模型为：
 
-## API and Model Audit
+- Qwen3-VL-30B；
+- Llama-3.1-70B（`llama-3.1-70b`）；
+- DeepSeek-V3（`deepseek-v3`）；
+- GPT-4.1（`gpt-4.1`）；
+- Gemini-2.5-Flash（`gemini-2.5-flash`）。
 
-The WLAI OpenAI-compatible endpoint is `https://api.wlai.vip/v1`. The API key
-is read only inside the experiment process from
-`/root/.config/medimem/wlai.key`; it must never appear in commands, logs,
-manifests, predictions, Git, or paper files.
+Qwen3-VL-30B 的单元格复用其原始完整冻结运行的已验收结果，但在使用前必须重新核验 manifest 和样本 ID，不重新运行该模型。
 
-Before formal launch, the supervisor records:
+其余四个远程模型分别运行全部五条推理流程和全部 2,500 个冻结样本，共形成 20 个新增“模型—流程”实验单元，以及 50,000 个“流程—样本”推理单元。
 
-- the UTC query time and SHA-256 of the sanitized `/v1/models` response;
-- a minimal live chat-completion probe for each exact target model ID;
-- the returned model identity and non-empty usage fields;
-- frozen sample-manifest hashes;
-- code commit, prompt/config hashes, evaluator version, and method-adapter
-  identities; and
-- a redacted API configuration containing the base URL but no secret.
+每个实验单元必须使用相同的可见输入、方法适配器、对应提示词模板、最大生成预算、请求随机种子、评估器、指标实现和严格零回退策略。禁止拼接不同运行或不同样本子集的结果。
 
-The incomplete nature of the `/v1/models` catalogue is respected: an exact
-model is accepted based on a successful live probe, not catalogue membership
-alone.
+## 三、API 与模型审计
 
-## Execution Architecture
+WLAI 的 OpenAI-compatible 接口为 `https://api.wlai.vip/v1`。API 密钥只能由实验进程从 `/root/.config/medimem/wlai.key` 内部读取，不得出现在命令、日志、manifest、prediction、Git 或论文文件中。
 
-GPU 0 is reserved for the pairwise PMOA-TTS ablation. It hosts the local
-Qwen3-VL-8B service and runs the three pairwise variants with enough genuine
-worker concurrency to keep the service saturated.
+正式运行前，调度器必须记录：
 
-GPU 1 is reserved for the medical-backbone experiment. Remote APIs perform
-the target-model generation. GPU 1 runs the existing CUDA-capable local
-embedding and retrieval work used by the A-MEM and MediMem adapters; Direct,
-CoT, and the released-source CliCARE adapter remain on their frozen execution
-paths. Medical Top-1 and Diagnosis F1 are computed deterministically and do
-not add an LLM judge. No artificial workload may be added to create a
-misleading GPU-Util value.
+- `/v1/models` 查询的 UTC 时间，以及脱敏响应的 SHA-256；
+- 对每个精确目标模型 ID 的最小 live chat-completion probe；
+- API 返回的模型身份和非空 usage 字段；
+- 冻结样本 manifest 的哈希；
+- 代码提交号、提示词与配置哈希、评估器版本和方法适配器身份；
+- 仅包含 base URL、不包含密钥的脱敏 API 配置。
 
-The medical supervisor interleaves model and dataset queues so API waiting
-from one queue does not idle all workers. Concurrency begins with bounded
-probes and increases only while the endpoint returns stable success without
-rate-limit or transport failures. Each target model has an independent run
-root, progress journal, prediction files, metrics, and audit. Resume is
-allowed only for missing sample IDs under byte-identical frozen
-configuration. End-to-end throughput, API concurrency, GPU utilization, and
-GPU memory are reported separately.
+`/v1/models` 返回的模型目录可能不完整。因此，判断目标模型是否可用时，以精确模型 ID 的 live probe 是否成功为准，不能仅依据模型是否出现在列表中。
 
-Because target generation is remote, sustained 100% GPU utilization on GPU 1
-is not a validity requirement and cannot be guaranteed. The optimization
-target is maximum valid end-to-end throughput, not synthetic GPU load.
+## 四、执行架构
 
-## Output Table
+### 4.1 GPU 0：两因素消融
 
-The current Section 4.1 Table 2 remains a separate Qwen3-VL scale comparison.
-The new Section 4.2 table has columns:
+GPU 0 专用于 PMOA-TTS 两因素消融。该卡启动本地 Qwen3-VL-8B 服务，并运行三个两因素变体。通过真实推理 worker 并发尽量提高服务利用率。
 
-`Paradigm | Method | Reference | Backbone | MedMCQA | MedQA | WikiDoc |
-PMOA-TTS | PMC-Patients`
+### 4.2 GPU 1：医疗多骨干模型实验
 
-Each dataset cell reports `Top-1 / Diagnosis F1`. Rows are grouped first by
-pipeline and then by the five backbones, matching the visual organization of
-the approved reference table. Within each backbone, the best pipeline value
-for a dataset metric is bold and the second-best is underlined. The table
-reports one complete frozen-run point estimate per cell; it does not report
-mean or standard deviation.
+GPU 1 专用于医疗多骨干模型实验。目标大模型的生成由远程 API 完成；GPU 1 承担 A-MEM 和 MediMem 适配器已有的 CUDA embedding 与检索计算。Direct、CoT 和 released-source CliCARE adapter 保持各自冻结执行路径。
 
-The appendix non-medical table keeps its accepted values and protocol text.
-Moving it must not silently renumber or break references.
+医疗 Top-1 和 Diagnosis F1 由确定性指标程序计算，不额外引入 LLM judge。不得添加与实验无关的计算来人为制造 GPU-Util。
 
-## Validation and Admission Gates
+医疗实验调度器应交错执行不同模型和数据源的任务队列，避免某一队列等待 API 时导致全部 worker 空闲。并发度先通过有限 probe 测试，再在无 rate limit 和传输错误的前提下逐步提高。
 
-Every new formal unit must satisfy all of the following:
+每个目标模型必须拥有独立的 run root、进度日志、prediction 文件、metrics 和审计报告。只有在冻结配置逐字节一致时，才允许补跑缺失样本 ID。
 
-- exact frozen sample-ID set and expected count;
-- unique prediction IDs and complete metric coverage;
-- live API and real-data requirements enabled;
-- zero fallback, blocked method, API error, worker failure, missing
-  prediction, and progress failure;
-- zero critical leakage and zero needs-review findings;
-- manifest and validation guards passed;
-- exact target model ID and method-adapter identity recorded; and
-- no reference diagnosis, gold answer, evaluator field, or adversarial target
-  visible during inference.
+GPU 利用率、GPU 显存、API 并发度和端到端吞吐必须分别记录。由于目标模型生成发生在远程 API，GPU 1 持续达到 100% 利用率不作为实验有效性门槛，也无法保证；优化目标是最大化真实有效的端到端吞吐，而不是制造合成负载。
 
-The pairwise ablation additionally verifies that each row differs from Full
-MediMem in exactly the declared two feature flags. The medical-backbone audit
-checks a complete 4-by-5 grid of new model-pipeline units and separately
-verifies the provenance of the five reused Qwen3-VL-30B units.
+## 五、正文表格结构
 
-Failed or incomplete units remain archived as failed runs and do not enter the
-paper. Numeric cells remain `Pending` until their complete unit passes every
-gate.
+现有第 4.1 节 Table 2 继续作为独立的 Qwen3-VL 尺度比较，不修改已有数值。
 
-## Paper and Archive Updates
+第 4.2 节新增表格，列结构为：
 
-After all accepted units pass:
+`Paradigm | Method | Reference | Backbone | MedMCQA | MedQA | WikiDoc | PMOA-TTS | PMC-Patients`
 
-1. generate the pairwise ablation rows from audited metrics;
-2. generate the new Section 4.2 table from the audited medical grid;
-3. retain the existing Section 4.1 Table 2 values unchanged;
-4. move the accepted non-medical table and its analysis to the appendix;
-5. update claims only to match the completed results, including negative or
-   mixed findings;
-6. archive manifests, predictions, metrics, validations, probes, sanitized
-   service records, commands, and utilization traces locally; and
-7. follow the established LaTeX build, visual verification, PDF, ZIP, and
-   Overleaf synchronization workflow.
+每个数据集单元格报告 `Top-1 / Diagnosis F1`。
 
-No result is inferred, fabricated, or copied from a different model, dataset
-version, sample count, evaluator, or run.
+行先按 Direct、CoT、A-MEM、CliCARE、MediMem 五条流程分组，再在每组中列出五个骨干模型，与用户确认的参考表结构一致。同一个骨干模型下，每个数据集指标的最佳流程使用粗体，次佳流程使用下划线。
+
+每个单元格报告一次完整冻结运行的点估计，不报告 mean 或 standard deviation。
+
+附录中的非医疗表保留原有已验收数值和协议说明。移动表格时必须同步检查编号与交叉引用，不能造成静默错引。
+
+## 六、验证与结果准入门槛
+
+每个新增正式实验单元必须同时满足：
+
+- 样本 ID 与冻结集合完全一致，数量正确；
+- prediction ID 唯一，指标覆盖完整；
+- 开启 live API 和真实数据要求；
+- fallback、blocked method、API error、worker failure、missing prediction 和 progress failure 均为 0；
+- critical leakage 和 needs review 均为 0；
+- manifest guard 和 validation guard 全部通过；
+- 记录精确目标模型 ID 和方法适配器身份；
+- 推理阶段不可见 reference diagnosis、gold answer、evaluator 字段或 adversarial target。
+
+两因素消融还必须验证：每个变体相对 Full MediMem 恰好只改变声明的两个功能开关。
+
+医疗多骨干模型审计必须验证完整的 `4 个新增模型 × 5 条流程` 网格，并单独核验五个复用的 Qwen3-VL-30B 实验单元的来源。
+
+失败或未完成的单元只能作为失败运行归档，不得写入论文。任何未通过全部门槛的数值单元格必须保持为 `Pending`。
+
+## 七、论文与实验归档
+
+全部实验通过验收后：
+
+1. 从审计通过的 metrics 生成两因素消融行；
+2. 从审计通过的医疗实验网格生成第 4.2 节新表；
+3. 保持第 4.1 节 Table 2 的已有数值不变；
+4. 将已验收非医疗表格及其分析移动至附录；
+5. 只根据真实完成结果更新正文结论，包括负向或混合结果；
+6. 在本地归档 manifest、prediction、metrics、validation、probe、脱敏服务记录、精确命令和利用率轨迹；
+7. 按既有流程完成 LaTeX 编译、逐页视觉检查、PDF、Overleaf ZIP 和网页端 Overleaf 同步。
+
+禁止推断、虚构实验数值，也禁止从不同模型、数据版本、样本量、评估器或运行中复制结果。
