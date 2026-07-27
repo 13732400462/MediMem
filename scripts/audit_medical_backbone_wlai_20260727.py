@@ -213,9 +213,15 @@ def main() -> None:
                 failures.append(audit)
                 continue
             evaluated = evaluate_predictions(truth, ordered)
-            for row in build_source_metrics(
+            source_metric_method = (
+                "full_medimem_merged" if method == "MediMem" else internal_method
+            )
+            source_rows = build_source_metrics(
                 truth, evaluated["case_rows"], include_overall=False
-            ):
+            )
+            for row in source_rows:
+                if row.get("method") != source_metric_method:
+                    continue
                 metric_rows.append(
                     {
                         "model": label,
