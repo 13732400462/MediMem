@@ -79,7 +79,34 @@ def main() -> None:
             "final_audit_20260722/canonical_predictions/30b"
         ),
     )
+    parser.add_argument("--repair-model-id")
+    parser.add_argument("--repair-method")
+    parser.add_argument("--repair-prediction", type=Path)
     args = parser.parse_args()
+    repair_args = (
+        args.repair_model_id,
+        args.repair_method,
+        args.repair_prediction,
+    )
+    if any(value is not None for value in repair_args) and not all(
+        value is not None for value in repair_args
+    ):
+        raise RuntimeError(
+            "Repair overlay requires --repair-model-id, --repair-method, "
+            "and --repair-prediction together"
+        )
+    repair_key = (
+        (args.repair_model_id, args.repair_method)
+        if args.repair_prediction is not None
+        else None
+    )
+    repair_rows = (
+        read_jsonl(args.repair_prediction)
+        if args.repair_prediction is not None
+        else []
+    )
+    if args.repair_prediction is not None and len(repair_rows) != 1:
+        raise RuntimeError("Repair prediction must contain exactly one JSONL row")
     out = args.run_root / "audit"
     out.mkdir(parents=True, exist_ok=False)
     truth = read_jsonl(args.dataset)
@@ -113,6 +140,28 @@ def main() -> None:
                 predictions = [
                     row for row in predictions if row.get("method") == internal_method
                 ]
+            raw_fallback_count = sum(
+                bool(row.get("fallback_reason") or row.get("llm_error"))
+                for row in predictions
+            )
+            applied_repairs: list[str] = []
+            if repair_key == (model_id, method):
+                repair = repair_rows[0]
+                repair_case_id = str(repair.get("case_id") or "")
+                prediction_ids = {str(row.get("case_id")) for row in predictions}
+                if repair_case_id not in prediction_ids:
+                    raise RuntimeError(
+                        f"Repair case is absent from target cell: {repair_case_id}"
+                    )
+                if repair.get("fallback_reason") or repair.get("llm_error"):
+                    raise RuntimeError(
+                        f"Repair prediction still uses fallback: {repair_case_id}"
+                    )
+                predictions = [
+                    repair if str(row.get("case_id")) == repair_case_id else row
+                    for row in predictions
+                ]
+                applied_repairs.append(repair_case_id)
             by_id = {str(row.get("case_id")): row for row in predictions}
             ids_exact = (
                 len(predictions) == 2500
@@ -143,6 +192,15 @@ def main() -> None:
                 "unique_predictions": len(by_id),
                 "ids_exact": ids_exact,
                 "fallback_count": fallback_count,
+                "raw_fallback_count": raw_fallback_count,
+                "repair_count": len(applied_repairs),
+                "repair_case_ids": ";".join(applied_repairs),
+                "repair_source_file": (
+                    str(args.repair_prediction) if applied_repairs else ""
+                ),
+                "repair_source_sha256": (
+                    sha256(args.repair_prediction) if applied_repairs else ""
+                ),
                 "progress_failed": len(failed_progress),
                 "critical_leakage_count": int(
                     leakage.get("critical_leakage_count", 0) or 0
@@ -217,7 +275,7 @@ def main() -> None:
         }
         audit["passed"] = bool(audit["passed"] and audit["fallback_count"] == 0)
         audit_rows.append(audit)
-        if not passed:
+        if not audit["passed"]:
             failures.append(audit)
             continue
         evaluated = evaluate_predictions(truth, ordered)
@@ -247,6 +305,17 @@ def main() -> None:
         "passed_cells": sum(bool(row["passed"]) for row in audit_rows),
         "failure_count": len(failures),
         "failures": failures,
+        "repair_overlay": (
+            {
+                "model_id": args.repair_model_id,
+                "method": args.repair_method,
+                "source_file": str(args.repair_prediction),
+                "source_sha256": sha256(args.repair_prediction),
+                "case_ids": [str(row.get("case_id")) for row in repair_rows],
+            }
+            if args.repair_prediction is not None
+            else None
+        ),
         "passed": len(audit_rows) == 25 and not failures,
     }
     (out / "audit_summary.json").write_text(
