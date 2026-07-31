@@ -1,182 +1,75 @@
-# 纵向 EHR 记忆增强多智能体系统
+# MediMem
 
-本项目用于实现 proposal 中的“面向长期复诊的记忆增强多智能体临床规划与推理系统”。当前版本完成了代码框架、10 条开源病例增强样本、DeepSeek 推理、DDO/ColaCare baseline adapter、自动优化循环和中文实验报告。
+MediMem 是一个面向长期复诊场景的记忆增强多智能体临床规划与推理系统。当前实现聚焦推理阶段的可审计记忆治理：构建纵向患者记忆、由 Critic 审查并受控更新、生成与来源对齐的证据笔记，以及执行证据约束诊断和扰动式反事实审计。
 
-## 服务器位置
+本仓库保存可复现的源码、测试、运行脚本和少量经过筛选的公开基准资产。论文源文件、私有数据、API 密钥、完整实验输出和模型权重不属于本代码仓库。
 
-项目根目录：
+## 核心实现
+
+- `mem_ehr_agent/agents.py`：多智能体推理和诊断流程。
+- `mem_ehr_agent/memory.py`：记忆存储、Critic 审查和安全更新。
+- `mem_ehr_agent/benchmark.py`：长期记忆 benchmark、检索、基线适配和反事实复核。
+- `mem_ehr_agent/metrics.py`：诊断、证据检索和审计指标。
+- `mem_ehr_agent/optimizer.py`：实验编排与准入检查。
+- `mem_ehr_agent/data_builder.py`、`data_sources.py`、`expanded_data.py`：数据构建与来源适配。
+- `scripts/`：正式实验、消融、筛选和审计入口。
+- `tests/`：核心记忆、推理、指标、恢复和数据流程测试。
+
+MediMem 不是新训练的端到端模型。仓库中的“模型”是推理与记忆治理代码；基础 LLM、embedding 和 reranker 权重由运行环境单独提供，不提交 Git。
+
+## 环境安装
+
+要求 Python 3.10 或更高版本。
 
 ```bash
-/home/syh/mem_ehr_agent
-```
-
-最新完成实验：
-
-```bash
-/home/syh/mem_ehr_agent/runs/20260512_165750
-```
-
-DeepSeek 测试配置已写入服务器 `.env`，文件权限为 `600`。不要提交或打印 API key。
-
-## 快速运行
-
-```bash
-cd /home/syh/mem_ehr_agent
+python -m venv .venv
 source .venv/bin/activate
-python -m mem_ehr_agent data validate --dataset data/processed/samples.jsonl
-python -m mem_ehr_agent optimize --dataset data/processed/samples.jsonl --max-rounds 10 --require-api --max-workers 6
+python -m pip install -e ".[dev]"
 ```
 
-运行产物会写入：
+Windows PowerShell 激活命令为：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+
+如需语义检索依赖：
 
 ```bash
-data/processed/samples.jsonl
-runs/<timestamp>/predictions/*.jsonl
-runs/<timestamp>/metrics.csv
-runs/<timestamp>/optimization_log.jsonl
-runs/<timestamp>/analysis_zh.md
+python -m pip install -e ".[dev,semantic]"
 ```
 
-记忆模块不用 SQL。所有记忆以 JSONL 原子记忆卡保存。
+## 配置与运行
 
-## 数据构建
-
-首轮 smoke 数据集包含 10 条纵向 EHR 风格病例：
+以 `config/example.env` 为模板，在本地创建 `.env` 或通过进程环境变量传入配置。不要把真实密钥写入代码、脚本参数、日志、实验 manifest 或 Git。
 
 ```bash
-data/processed/samples.jsonl
+python -m mem_ehr_agent --help
+python -m pytest -q
 ```
 
-数据来源：
+正式实验需要显式启用真实数据和在线 API 准入检查，并使用冻结的样本 manifest、模型标识、prompt、evaluator 和指标定义。不得将 fallback、失败或不完整 run 写成正式结果。
 
-- PMOA-TTS：PubMed Open Access 病例报告，包含带时间戳的临床事件序列。
-- PMC-Patients：PubMed Central 病例摘要，用作辅助病例上下文。
+## 数据、模型与输出边界
 
-每条 JSONL 样本包含：
+以下内容只保留在本地或服务器，不上传 Git：
 
-- `case_id`：病例编号。
-- `source_refs`：开源数据来源引用。
-- `demographics`：人口学信息。
-- `events`：纵向临床事件时间线。
-- `encounters`：按时间聚合后的就诊片段。
-- `synthetic_labs`：基于病例生成的结构化化验指标。
-- `memory_seed`：初始工作记忆。
-- `poison_records`：用于测试记忆污染的旧假设或错误记录。
-- `labels.primary_diagnosis`：主诊断标签。
-- `labels.diagnosis_list`：诊断列表标签。
-- `qa_tasks`：SR/IDR/CDR 评测问题。
-- `expected_memory_ops`：预期记忆操作。
-- `counterfactuals`：反事实干预样本。
+- `.env`、密钥文件和机器本地配置；
+- `data/raw/`、`data/processed/` 和未获再分发许可的数据；
+- `runs/`、大规模 predictions、judge 输出、缓存和临时报告；
+- `.codex_tmp/`、`models/`、`checkpoints/` 及 `*.safetensors`、`*.bin`、`*.onnx` 等模型文件；
+- 论文 LaTeX 源文件、编译产物和 Overleaf 归档。
 
-说明：服务器直连 Hugging Face 较慢，所以本轮数据先在本地通过公开接口抓取，再同步到服务器。
+`datasets/amem_original/` 中当前已跟踪的文件是用于可复现性核验的公开基准资产；新增数据在确认许可、去标识化和体积后才能提交。`outputs/nonmedical_timeline_main_table_20260719.csv` 是经过筛选的聚合结果，不包含逐样本预测或私有输入。
 
-## 方法实现
+## 研究边界
 
-系统按 proposal 的三阶段实现：
+- 规则、guard、记忆清理和扰动审计是推理期治理逻辑，不应描述为可学习模块或训练目标。
+- released-source clinical adapters 通过统一协议接入，不代表完整复现原论文 benchmark。
+- 所有论文数值必须回溯到同一正式 run 的 predictions、metrics、manifest、validation 和审计文件。
+- 非医疗长期记忆 benchmark 的结果不应被外推为所有场景中的普遍领先。
 
-1. 多智能体纵向 EHR 解析：模拟文本、数值/化验、时序、统筹决策等角色，对长病历进行结构化解析。
-2. 动态记忆清洗：使用 JSONL 原子记忆卡维护患者工作记忆，支持 `Write`、`Revise`、`Invalidate`、`Flag`、`Discard` 操作。
-3. 反事实复核：记录 CPG 风格 proxy，用于衡量关键证据被移除时诊断置信度是否合理变化。
+## 许可证与第三方代码
 
-当前记忆设计：
-
-- 不使用 SQL。
-- JSONL 是唯一可信存储。
-- 后续可以增加 embedding/FAISS sidecar，但索引只能作为可重建加速结构，不能作为主存储。
-
-## Baseline 设置
-
-本轮比较方法：
-
-- Direct DeepSeek：截断病例上下文，不使用记忆。
-- DDO adapter：模拟 DDO 的医疗多智能体问诊/诊断流程。
-- ColaCare adapter：模拟 ColaCare 的结构化 EHR DoctorAgent/MetaAgent 流程。
-- Ours：带 JSONL 动态记忆、批判智能体和记忆清洗的多智能体方法。
-
-官方参考：
-
-- DDO：Jia et al., EMNLP 2025，`https://github.com/zh-jia/DDO`
-- ColaCare：Wang et al., WWW 2025，`https://github.com/PKU-AICare/ColaCare`
-
-注意：服务器侧 GitHub clone 不稳定，出现过 `early EOF`。因此第一轮实验采用统一 JSONL adapter 进行比较，保证所有方法使用同一批输入样本和统一输出协议。
-
-## 最新实验结果
-
-实验目录：
-
-```bash
-runs/20260512_165750
-```
-
-指标表：
-
-| 方法 | N | 主诊断准确率 | 诊断列表 F1 | CDR F1 | 记忆污染抑制率 | CPG Proxy | 平均 Token |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| ColaCare adapter | 10 | 0.300 | 0.405 | 0.421 | 0.000 | 0.100 | 563.1 |
-| DDO adapter | 10 | 0.500 | 0.500 | 0.432 | 0.000 | 0.100 | 1083.7 |
-| Direct DeepSeek | 10 | 0.400 | 0.345 | 0.383 | 0.000 | 0.130 | 358.6 |
-| Ours | 10 | **0.600** | **0.607** | **0.619** | **1.000** | **0.220** | 1481.8 |
-
-最佳优化轮次：
-
-```text
-Round 1
-strategy = {"top_k": 3, "rounds": 1, "temperature": 0.05}
-ours primary accuracy = 0.600
-best baseline primary accuracy = 0.500
-won = true
-```
-
-结论：
-
-在 10 条病例的 DeepSeek 实验中，我们的方法超过最强 baseline DDO adapter：
-
-- 主诊断准确率：`0.600` vs `0.500`
-- 诊断列表 F1：`0.607` vs `0.500`
-- CDR F1：`0.619` vs `0.432`
-- 记忆污染抑制率：`1.000` vs `0.000`
-- CPG Proxy：`0.220` vs `0.100`
-
-这说明当前版本的动态记忆清洗和全时间线证据整合，在小样本纵向病例诊断上带来了增益。
-
-## 结果文件
-
-```bash
-runs/20260512_165750/analysis_zh.md
-runs/20260512_165750/metrics.csv
-runs/20260512_165750/baseline_metrics.csv
-runs/20260512_165750/optimization_log.jsonl
-runs/20260512_165750/progress.jsonl
-runs/20260512_165750/predictions/baselines.jsonl
-runs/20260512_165750/predictions/ours_round_001.jsonl
-```
-
-## 测试结果
-
-服务器测试命令：
-
-```bash
-cd /home/syh/mem_ehr_agent
-.venv/bin/python -m pytest -q
-```
-
-结果：
-
-```text
-5 passed
-```
-
-测试覆盖：
-
-- JSONL 病例 schema 校验。
-- JSONL 记忆状态转换。
-- 主诊断匹配和 F1 指标计算。
-
-## 下一步
-
-- 将病例数量从 10 条扩展到 50/100 条。
-- 对主诊断标签和时间线一致性做人工抽查。
-- 加入 ICD/MeSH/UMLS 风格诊断归一化。
-- 等服务器 GitHub 访问稳定后，补充 DDO 和 ColaCare 官方 repo 的完整复现。
-- 将当前 CPG proxy 升级为真实 DeepSeek 反事实重跑。
-- 增加消融实验：无记忆清洗、无批判智能体、无反事实复核、不同 `top_k` 检索数量。
+`A-mem-main/` 是保留许可证和来源说明的第三方参考实现。使用或再分发时分别遵循其目录内的许可证。项目自身许可证尚未单独声明；对外发布前应补充与依赖兼容的许可证。

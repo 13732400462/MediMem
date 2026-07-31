@@ -1,12 +1,63 @@
+# Secrets and machine-local configuration
 .env
+.env.*
+!.env.example
 config/local.yaml
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python environments, caches, and coverage
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local data, experiment runs, and generated reports
 data/raw/
 data/processed/
+data/cache/
 runs/
 baseline_repos/
-__pycache__/
-*.pyc
-.pytest_cache/
-.venv/
+outputs/*
+!outputs/nonmedical_timeline_main_table_20260719.csv
+*.log
+texput.log
+
+# Downloaded model weights and local inference caches
 .codex_tmp/
-outputs/
+.cache/
+checkpoints/
+models/
+weights/
+*.bin
+*.ckpt
+*.gguf
+*.h5
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Temporary and packaged artifacts
+tmp/
+temp/
+*.tmp
+*.bak
+*.zip
+*.tar
+*.tar.gz
