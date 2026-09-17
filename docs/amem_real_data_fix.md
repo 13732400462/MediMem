@@ -6,13 +6,13 @@
 - 数据构建新增真实数据强制模式，抓不到 PMOA-TTS 或 PMC-Patients 时会直接失败，不再静默使用内置 fallback：
 
 ```bash
-python -m mem_ehr_agent data build --n 50 --output data/processed/samples_50_real.jsonl --require-real-data
+python -m medimem data build --n 50 --output data/processed/samples_50_real.jsonl --require-real-data
 ```
 
 - 对无法直接访问 Hugging Face 的服务器，支持使用离线真实数据缓存：
 
 ```bash
-python -m mem_ehr_agent data build \
+python -m medimem data build \
   --n 50 \
   --output data/processed/samples_50_real.jsonl \
   --require-real-data \
@@ -46,13 +46,14 @@ Network is unreachable
 本次已验证的服务器命令：
 
 ```bash
-python -m mem_ehr_agent data build \
+python -m medimem data build \
   --n 50 \
   --output data/processed/samples_50_real.jsonl \
   --require-real-data \
   --cache-dir /home/syh/mem_ehr_hf_cache
 
-python -m mem_ehr_agent data validate --dataset data/processed/samples_50_real.jsonl
+python -m medimem data validate --dataset data/processed/samples_50_real.jsonl
 ```
 
 验证结果：成功构建并校验 50 条真实来源样本，数据备注显示 PMOA-TTS 和 PMC-Patients 均来自 cache，而不是 fallback。
+
