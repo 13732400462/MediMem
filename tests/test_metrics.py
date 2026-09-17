@@ -1,4 +1,4 @@
-from mem_ehr_agent.metrics import (
+from medimem.metrics import (
     build_leakage_audit,
     build_leakage_audit_details,
     build_expected_memory_op_distribution,
@@ -23,7 +23,7 @@ from mem_ehr_agent.metrics import (
     summarize_leakage_audit_details,
     token_f1,
 )
-from mem_ehr_agent.medical_terms import canonicalize_diagnosis
+from medimem.medical_terms import canonicalize_diagnosis
 
 
 def test_token_f1_overlap():
@@ -636,3 +636,4 @@ def test_full_ours_merged_aggregates_dynamic_topk_rows():
     assert summary["full_ours_merged"]["primary_diagnosis_top1_accuracy"] == 0.5
     slice_rows = build_slice_breakdown(cases, result["case_rows"])
     assert any(row["slice"] == "all" and row["method"] == "full_ours_merged" for row in slice_rows)
+

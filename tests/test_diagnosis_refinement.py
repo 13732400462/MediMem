@@ -1,4 +1,4 @@
-from mem_ehr_agent.agents import (
+from medimem.agents import (
     answer_entity_source_candidates,
     evidence_driven_diagnosis_rerank,
     evidence_gated_diagnosis_recall,
@@ -7,8 +7,8 @@ from mem_ehr_agent.agents import (
     run_ours,
     select_primary_for_task_profile,
 )
-from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.medical_terms import canonicalize_diagnosis
+from medimem.llm import LLMResult
+from medimem.medical_terms import canonicalize_diagnosis
 
 
 def test_refinement_keeps_primary_as_first_item():
@@ -550,3 +550,4 @@ def test_answer_entity_source_candidates_ignore_gold_candidate_markers():
     }
 
     assert answer_entity_source_candidates(case) == []
+

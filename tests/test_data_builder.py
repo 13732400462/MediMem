@@ -1,5 +1,5 @@
-from mem_ehr_agent.data_builder import build_case, is_fragment_like_label, write_prefix_slices
-from mem_ehr_agent.data_sources import fallback_pmc_rows, fallback_pmoa_rows
+from medimem.data_builder import build_case, is_fragment_like_label, write_prefix_slices
+from medimem.data_sources import fallback_pmc_rows, fallback_pmoa_rows
 
 
 def _norm(text):
@@ -88,3 +88,4 @@ def test_fragment_like_label_flagger():
     assert is_fragment_like_label("by ITS sequencing")
     assert is_fragment_like_label("no personal history of breast cancer")
     assert not is_fragment_like_label("Systemic lupus erythematosus")
+

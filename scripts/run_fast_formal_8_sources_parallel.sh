@@ -65,7 +65,7 @@ run_medical_source() {
   export DEEPSEEK_BASE_URL="$base_url"
 
   log "START source=$source build n=$PER_SOURCE_N base_url=$base_url"
-  if ! "$PY" -m mem_ehr_agent data build-medical-pool \
+  if ! "$PY" -m medimem data build-medical-pool \
       --per-source-n "$PER_SOURCE_N" \
       --sources "$source" \
       --output-dir "$data_dir" \
@@ -81,7 +81,7 @@ run_medical_source() {
   fi
 
   log "START source=$source validate"
-  if ! "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$source_dir/validate.log" 2>&1; then
+  if ! "$PY" -m medimem data validate --dataset "$dataset_path" > "$source_dir/validate.log" 2>&1; then
     local err
     err="$(tail -40 "$source_dir/validate.log" | tr '\n' ' ')"
     log "BLOCKED source=$source stage=validate"
@@ -90,7 +90,7 @@ run_medical_source() {
   fi
 
   log "START source=$source experiment max_workers=$MAX_WORKERS_PER_PORT"
-  if ! "$PY" -m mem_ehr_agent experiment-suite \
+  if ! "$PY" -m medimem experiment-suite \
       --dataset "$dataset_path" \
       --require-api \
       --max-workers "$MAX_WORKERS_PER_PORT" \
@@ -130,7 +130,7 @@ run_locomo() {
   export DEEPSEEK_BASE_URL="$base_url"
 
   log "START source=locomo benchmark sample_n=$LOCOMO_SAMPLE_N base_url=$base_url"
-  if ! "$PY" -m mem_ehr_agent benchmark run \
+  if ! "$PY" -m medimem benchmark run \
       --dataset locomo \
       --methods "$LOCOMO_METHODS" \
       --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -250,3 +250,4 @@ if [ "$status_a" -ne 0 ] || [ "$status_b" -ne 0 ]; then
   exit 1
 fi
 log "FINISHED run_root=$RUN_ROOT"
+

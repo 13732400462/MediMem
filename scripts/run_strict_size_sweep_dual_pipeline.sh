@@ -139,7 +139,7 @@ run_medical_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START medical model=$served_name workers=$PIPELINE_WORKERS per_source_n=$PER_SOURCE_N"
-  "$PY" -m mem_ehr_agent data build-medical-pool \
+  "$PY" -m medimem data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources "$MEDICAL_SOURCES" \
     --output-dir "$data_dir" \
@@ -155,8 +155,8 @@ import sys
 print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
-  "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$run_dir/validate.log" 2>&1
-  "$PY" -u -m mem_ehr_agent experiment-suite \
+  "$PY" -m medimem data validate --dataset "$dataset_path" > "$run_dir/validate.log" 2>&1
+  "$PY" -u -m medimem experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$PIPELINE_WORKERS" \
@@ -183,7 +183,7 @@ run_locomo_pipeline() {
   export DEEPSEEK_MODEL="$served_name"
 
   log "START locomo model=$served_name workers=$PIPELINE_WORKERS sample_n=$LOCOMO_SAMPLE_N"
-  "$PY" -u -m mem_ehr_agent benchmark run \
+  "$PY" -u -m medimem benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -348,3 +348,4 @@ run_wave "/root/models/qwen_vl_size_sweep/0_8b" "qwen3-vl-0_8b" "/root/models/qw
 run_wave "/root/models/qwen_vl_size_sweep/4b" "qwen3-vl-4b" "/root/models/qwen_vl_size_sweep/8b" "qwen3-vl-8b"
 summarize_and_gate
 log "FINISHED strict size sweep summary=$SUMMARY_JSON"
+

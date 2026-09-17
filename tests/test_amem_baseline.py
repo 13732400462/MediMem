@@ -1,6 +1,6 @@
-from mem_ehr_agent.amem_baseline import SourceAlignedAMEMSystem, build_amem_context, event_to_note_fields, run_amem_adapter
-from mem_ehr_agent.data_builder import build_case
-from mem_ehr_agent.data_sources import fallback_pmc_rows, fallback_pmoa_rows
+from medimem.amem_baseline import SourceAlignedAMEMSystem, build_amem_context, event_to_note_fields, run_amem_adapter
+from medimem.data_builder import build_case
+from medimem.data_sources import fallback_pmc_rows, fallback_pmoa_rows
 
 
 def test_source_aligned_amem_system_links_and_retrieves_notes():
@@ -28,3 +28,4 @@ def test_amem_context_contains_retrieved_notes():
     context, count = build_amem_context(case, top_k=2)
     assert count == 2
     assert "[A-MEM SOURCE-ALIGNED RETRIEVED MEMORY NOTES]" in context
+

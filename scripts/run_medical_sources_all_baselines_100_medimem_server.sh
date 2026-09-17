@@ -211,7 +211,7 @@ run_source() {
   mkdir -p "$source_dir" "$data_dir"
 
   log "START source=$source build n=$PER_SOURCE_N"
-  if ! "$PY" -m mem_ehr_agent data build-medical-pool \
+  if ! "$PY" -m medimem data build-medical-pool \
       --per-source-n "$PER_SOURCE_N" \
       --sources "$source" \
       --output-dir "$data_dir" \
@@ -227,7 +227,7 @@ run_source() {
   fi
 
   log "START source=$source validate"
-  if ! "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$source_dir/validate.log" 2>&1; then
+  if ! "$PY" -m medimem data validate --dataset "$dataset_path" > "$source_dir/validate.log" 2>&1; then
     local err
     err="$(tail -40 "$source_dir/validate.log" | tr '\n' ' ')"
     log "BLOCKED source=$source stage=validate"
@@ -237,7 +237,7 @@ run_source() {
   fi
 
   log "START source=$source experiment max_workers=$MAX_WORKERS"
-  if ! "$PY" -m mem_ehr_agent experiment-suite \
+  if ! "$PY" -m medimem experiment-suite \
       --dataset "$dataset_path" \
       --require-api \
       --max-workers "$MAX_WORKERS" \
@@ -283,3 +283,4 @@ if [ "$completed" -lt "${#SOURCES[@]}" ]; then
   exit 1
 fi
 log "FINISHED completed=$completed target=${#SOURCES[@]}"
+
