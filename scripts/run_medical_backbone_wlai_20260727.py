@@ -244,7 +244,7 @@ def main() -> None:
             str(args.python),
             "-u",
             "-m",
-            "mem_ehr_agent",
+            "medimem",
             "experiment-suite",
             "--dataset",
             str(dataset),
@@ -343,3 +343,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

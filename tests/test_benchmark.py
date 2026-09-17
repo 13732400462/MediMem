@@ -2,7 +2,7 @@ import json
 import sys
 import types
 
-from mem_ehr_agent.benchmark import (
+from medimem.benchmark import (
     FULL_CONTEXT_SHORTCUT_ADVICE,
     amem_retrieved_context,
     assert_no_full_context_shortcut,
@@ -39,8 +39,8 @@ from mem_ehr_agent.benchmark import (
     weighted_rrf_scores,
     judge_prediction,
 )
-from mem_ehr_agent.cli import build_parser
-from mem_ehr_agent.memory import MemoryStore
+from medimem.cli import build_parser
+from medimem.memory import MemoryStore
 from scripts.screen_table2_hierarchical_retrieval import (
     retrieve_hierarchical_grid,
 )
@@ -1191,7 +1191,7 @@ def test_amem_runner_uses_source_aligned_memory_flow():
 
 
 def test_amem_local_method_is_reported_as_wrapper(tmp_path):
-    from mem_ehr_agent.benchmark import run_local_method
+    from medimem.benchmark import run_local_method
 
     sample = {
         "sample_id": "conv-1__qa_0000",
@@ -1272,3 +1272,4 @@ def test_locomo_metrics_split_main_auxiliary_and_category():
     assert "soft_match" in auxiliary
     assert "sbert_similarity" in result["official_style"][0]
     assert "bert_f1" in result["skipped_metrics"]
+

@@ -1,5 +1,5 @@
-from mem_ehr_agent.config import get_deepseek_config
-from mem_ehr_agent.llm import extract_json_object
+from medimem.config import get_deepseek_config
+from medimem.llm import extract_json_object
 
 
 def test_extract_json_object_accepts_markdown_and_explanation():
@@ -35,3 +35,4 @@ def test_config_explicit_api_key_takes_precedence_over_key_file(tmp_path, monkey
     monkeypatch.setenv("DEEPSEEK_API_KEY_FILE", str(key_path))
     cfg = get_deepseek_config(env_path=tmp_path / "missing.env")
     assert cfg.api_key == "environment-key"
+

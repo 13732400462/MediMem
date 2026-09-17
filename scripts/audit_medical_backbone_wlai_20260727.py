@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.metrics import (
+from medimem.metrics import (
     build_leakage_audit,
     build_source_metrics,
     evaluate_predictions,
@@ -336,3 +336,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

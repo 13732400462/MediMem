@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import load_dialsim_samples, load_frozen_sample_ids
+from medimem.benchmark import load_dialsim_samples, load_frozen_sample_ids
 
 
 def canonical_hash(value: Any) -> str:
@@ -217,3 +217,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

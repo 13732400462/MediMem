@@ -51,7 +51,7 @@ def run_dataset(
     command = [
         str(python),
         "-m",
-        "mem_ehr_agent.cli",
+        "medimem.cli",
         "benchmark",
         "run",
         "--dataset",
@@ -290,3 +290,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

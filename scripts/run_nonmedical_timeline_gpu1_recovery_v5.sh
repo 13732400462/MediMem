@@ -38,7 +38,7 @@ run_step() {
 
 core_methods="direct,static_rag,amem,ddo,gmemory,meminsight,memoryos,medimem"
 run_step core_rhelm \
-  "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
+  "$CORE_PY" -m medimem.cli benchmark run \
   --dataset rhelm --methods "$core_methods" \
   --dataset-path "$ROOT/datasets/amem_original/rhelm/data" \
   --max-workers 8 --output-root "$RUN_ROOT/core" --require-api \
@@ -67,3 +67,4 @@ for dataset in dialsim rhelm longmemeval; do
 done
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_ROOT/QUEUE_COMPLETE"
+

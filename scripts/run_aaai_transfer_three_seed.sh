@@ -13,11 +13,11 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 cd "$ROOT"
-python -m mem_ehr_agent data validate --dataset "$DATASET"
+python -m medimem data validate --dataset "$DATASET"
 [[ "$(wc -l < "$DATASET")" -eq 3000 ]] || { echo "expected 3000 transfer cases" >&2; exit 1; }
 
 for seed in $SEEDS; do
-  python -u -m mem_ehr_agent experiment-suite \
+  python -u -m medimem experiment-suite \
     --dataset "$DATASET" --require-api --max-workers "$MAX_WORKERS" \
     --suite-profile fast-formal --baseline-set required --ablation-groups full \
     --counterfactual-policy risk_sample --counterfactual-sample-rate 0.20 \
@@ -26,8 +26,9 @@ for seed in $SEEDS; do
 done
 
 mapfile -t prediction_dirs < <(find "$OUTPUT_ROOT" -type d -name predictions | sort)
-python -m mem_ehr_agent analyze-run \
+python -m medimem analyze-run \
   --dataset "$DATASET" --predictions "${prediction_dirs[@]}" \
   --output-dir "$OUTPUT_ROOT/statistical_analysis" --target-method full_medimem \
   --compare-methods direct_deepseek,baseline_single_cot_agent,baseline_static_rag,baseline_amem_adapter \
   --resamples 10000 --random-seed 20260706
+

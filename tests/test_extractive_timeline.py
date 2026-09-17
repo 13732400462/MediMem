@@ -1,4 +1,4 @@
-from mem_ehr_agent.extractive_timeline import build_extractive_timeline
+from medimem.extractive_timeline import build_extractive_timeline
 
 
 def turns():
@@ -48,3 +48,4 @@ def test_extractive_timeline_uniformly_samples_too_many_sessions():
     assert diagnostics["sessions_sampled"] is True
     assert "session=s0" in memory
     assert "session=s199" in memory
+

@@ -23,7 +23,7 @@ implementation.
 
 ## Task 2: Implement the isolated retriever
 
-Modify `mem_ehr_agent/benchmark.py`:
+Modify `medimem/benchmark.py`:
 
 - add a frozen cross-encoder wrapper with model identity and thread-safe batch
   prediction;
@@ -35,7 +35,7 @@ Modify `mem_ehr_agent/benchmark.py`:
 - propagate diagnostics into predictions and manifests; and
 - include every retrieval and model parameter in cache identity.
 
-Modify `mem_ehr_agent/cli.py` to expose the explicit evidence-rerank arguments.
+Modify `medimem/cli.py` to expose the explicit evidence-rerank arguments.
 
 Run:
 
@@ -119,3 +119,4 @@ Copy the formal predictions, judges, metrics, manifests, validations, audit,
 logs, and exact commands into the local result archive. Then stop every vLLM
 process recorded as started by this experiment, verify process exit and port
 release, and leave unrelated services untouched.
+

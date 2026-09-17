@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import evidence_recall_at5
+from medimem.benchmark import evidence_recall_at5
 
 
 DATASETS = {
@@ -73,7 +73,7 @@ def run_candidate(
         command = [
             str(python),
             "-m",
-            "mem_ehr_agent.cli",
+            "medimem.cli",
             "benchmark",
             "run",
             "--dataset",
@@ -326,3 +326,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from mem_ehr_agent.resume import load_valid_resume_predictions
+from medimem.resume import load_valid_resume_predictions
 
 
 def prediction(sample_id: str, answer: str = "Boston") -> dict:
@@ -105,3 +105,4 @@ def test_resume_rejects_a_different_ingestion_mode(tmp_path):
             endpoint="http://127.0.0.1:8001/v1",
             expected_ingestion_mode="extractive",
         )
+

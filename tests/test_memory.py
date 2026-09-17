@@ -1,8 +1,8 @@
 import json
 
-from mem_ehr_agent.llm import LLMResult
-from mem_ehr_agent.memory import MemoryStore, apply_critique, batched_critic_prompt, bootstrap_memory, llm_critic_ops, memory_card_candidate, parse_critic_operations
-from mem_ehr_agent.agents import (
+from medimem.llm import LLMResult
+from medimem.memory import MemoryStore, apply_critique, batched_critic_prompt, bootstrap_memory, llm_critic_ops, memory_card_candidate, parse_critic_operations
+from medimem.agents import (
     case_context,
     compact_case_context,
     diagnosis_event_candidates,
@@ -876,7 +876,7 @@ def test_single_cot_agents_return_normalized_prediction_json():
 
 
 def test_run_baselines_writes_cot_pairs_to_baselines_jsonl(tmp_path, monkeypatch):
-    from mem_ehr_agent import optimizer
+    from medimem import optimizer
 
     def fake_adapter(name, case, client, *, fail_on_llm_error=False, polluted=False):
         method = f"baseline_{'polluted_' if polluted else ''}{name}_adapter"
@@ -909,7 +909,7 @@ def test_run_baselines_writes_cot_pairs_to_baselines_jsonl(tmp_path, monkeypatch
 
 
 def test_required_baseline_set_runs_required_unpolluted_pipelines(tmp_path, monkeypatch):
-    from mem_ehr_agent import optimizer
+    from medimem import optimizer
 
     def fake_adapter(name, case, client, *, fail_on_llm_error=False, polluted=False):
         method = f"baseline_{'polluted_' if polluted else ''}{name}_adapter"
@@ -947,7 +947,7 @@ def test_required_baseline_set_runs_required_unpolluted_pipelines(tmp_path, monk
 
 
 def test_backbone_baseline_set_runs_exact_four_comparison_baselines(tmp_path, monkeypatch):
-    from mem_ehr_agent import optimizer
+    from medimem import optimizer
 
     def fake_adapter(name, case, client, *, fail_on_llm_error=False, polluted=False):
         method = "official_clincare_adapter" if name == "clincare" else f"baseline_{name}_adapter"
@@ -979,7 +979,7 @@ def test_backbone_baseline_set_runs_exact_four_comparison_baselines(tmp_path, mo
 
 
 def test_fast_formal_ablation_group_parser_selects_pollution_ablation():
-    from mem_ehr_agent.optimizer import parse_ablation_groups
+    from medimem.optimizer import parse_ablation_groups
 
     groups = parse_ablation_groups(
         "full,no_memory_cleaning,no_evidence_note_injection,with_polluted_memory",
@@ -994,7 +994,7 @@ def test_fast_formal_ablation_group_parser_selects_pollution_ablation():
 
 
 def test_pairwise_ablation_groups_resolve_exact_two_feature_flags():
-    from mem_ehr_agent.optimizer import parse_ablation_groups
+    from medimem.optimizer import parse_ablation_groups
 
     groups = parse_ablation_groups(
         "no_evidence_no_cleaning,no_evidence_fixed_top_k,no_cleaning_fixed_top_k",
@@ -1052,3 +1052,4 @@ def test_visible_diagnosis_candidate_can_refine_primary_without_gold():
     assert updated["primary_diagnosis"] == "pneumonia"
     assert updated["primary_selection"]["event_id"] == "ev_1"
     assert "hidden" not in str(updated)
+

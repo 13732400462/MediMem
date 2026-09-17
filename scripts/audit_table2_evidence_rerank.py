@@ -6,11 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import (
+from medimem.benchmark import (
     evidence_recall_at5,
     normalize_answer,
 )
-from mem_ehr_agent.metrics import token_f1
+from medimem.metrics import token_f1
 
 
 EXPECTED = {
@@ -91,7 +91,7 @@ def main() -> None:
     parser.add_argument(
         "--current-table",
         type=Path,
-        default=Path("mem_ehr_agent/outputs/nonmedical_timeline_main_table_20260719.csv"),
+        default=Path("medimem/outputs/nonmedical_timeline_main_table_20260719.csv"),
     )
     parser.add_argument("--git-commit", required=True)
     args = parser.parse_args()
@@ -267,3 +267,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

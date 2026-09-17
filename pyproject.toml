@@ -12,7 +12,8 @@ dev = ["pytest>=8.0.0"]
 semantic = ["sentence-transformers>=3.0.0,<6.0.0"]
 
 [project.scripts]
-mem-ehr = "mem_ehr_agent.cli:main"
+mem-ehr = "medimem.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+

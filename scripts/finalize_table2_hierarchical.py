@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from mem_ehr_agent.benchmark import evidence_recall_at5
+from medimem.benchmark import evidence_recall_at5
 
 
 EXPECTED = {
@@ -430,3 +430,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

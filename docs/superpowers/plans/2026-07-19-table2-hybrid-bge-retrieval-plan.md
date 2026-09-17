@@ -10,7 +10,7 @@ LoCoMo development set, and run the four-source formal test once.
 
 Files:
 
-- `mem_ehr_agent/benchmark.py`
+- `medimem/benchmark.py`
 - `tests/test_benchmark.py`
 
 Steps:
@@ -28,8 +28,8 @@ Steps:
 
 Files:
 
-- `mem_ehr_agent/benchmark.py`
-- `mem_ehr_agent/cli.py`
+- `medimem/benchmark.py`
+- `medimem/cli.py`
 - `pyproject.toml`
 - `tests/test_benchmark.py`
 
@@ -105,3 +105,4 @@ Steps:
 3. Otherwise leave the paper unchanged and record the run as unadopted.
 4. Stop only this run's two vLLM process groups.
 5. Confirm ports 8001/8002 are released and both GPUs report zero memory use.
+

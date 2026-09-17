@@ -39,7 +39,7 @@ outputs/*
 texput.log
 
 # Downloaded model weights and local inference caches
-.codex_tmp/
+.agent_tmp/
 .cache/
 checkpoints/
 models/
@@ -61,3 +61,4 @@ temp/
 *.zip
 *.tar
 *.tar.gz
+

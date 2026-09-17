@@ -114,7 +114,7 @@ export MEDICAL_STRICT_NO_LEAK_FILTER=1
 export MEDICAL_LLM_SEED=20260606
 export CUDA_VISIBLE_DEVICES=0
 
-"$PY" -u -m mem_ehr_agent experiment-suite \
+"$PY" -u -m medimem experiment-suite \
   --dataset "$DATASET" \
   --require-api \
   --max-workers "$WORKERS" \
@@ -183,3 +183,4 @@ PY
 
 touch "$RUN_ROOT/FORMAL_COMPLETE"
 echo "pairwise ablation complete: $run_dir"
+

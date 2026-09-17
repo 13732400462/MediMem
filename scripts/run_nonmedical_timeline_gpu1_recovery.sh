@@ -40,7 +40,7 @@ core_methods="direct,static_rag,amem,ddo,gmemory,meminsight,memoryos,medimem"
 
 if [ "${SKIP_CORE_LOCOMO:-0}" != 1 ]; then
   run_step core_locomo \
-    "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
+    "$CORE_PY" -m medimem.cli benchmark run \
     --dataset locomo --methods "$core_methods" \
     --dataset-path "$ROOT/datasets/amem_original/locomo/locomo10.official.json" \
     --sample-manifest "$ROOT/data/processed/locomo_dev_selection_20260715/split_manifest.json" \
@@ -49,7 +49,7 @@ if [ "${SKIP_CORE_LOCOMO:-0}" != 1 ]; then
 fi
 
 run_step core_dialsim \
-  "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
+  "$CORE_PY" -m medimem.cli benchmark run \
   --dataset dialsim --methods "$core_methods" \
   --dataset-path "$ROOT/datasets/amem_original/dialsim" \
   --sample-n 1000 --random-seed "$SEED" \
@@ -57,7 +57,7 @@ run_step core_dialsim \
   --locomo-top-k 32 --locomo-coarse-k 32 --judge-answers
 
 run_step core_rhelm \
-  "$CORE_PY" -m mem_ehr_agent.cli benchmark run \
+  "$CORE_PY" -m medimem.cli benchmark run \
   --dataset rhelm --methods "$core_methods" \
   --dataset-path "$ROOT/datasets/amem_original/rhelm/data" \
   --max-workers 8 --output-root "$RUN_ROOT/core" --require-api \
@@ -95,3 +95,4 @@ for dataset in locomo dialsim rhelm longmemeval; do
 done
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_ROOT/QUEUE_COMPLETE"
+

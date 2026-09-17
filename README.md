@@ -2,16 +2,16 @@
 
 MediMem 是一个面向长期复诊场景的记忆增强多智能体临床规划与推理系统。当前实现聚焦推理阶段的可审计记忆治理：构建纵向患者记忆、由 Critic 审查并受控更新、生成与来源对齐的证据笔记，以及执行证据约束诊断和扰动式反事实审计。
 
-本仓库保存可复现的源码、测试、运行脚本和少量经过筛选的公开基准资产。论文源文件、私有数据、API 密钥、完整实验输出和模型权重不属于本代码仓库。
+本仓库只保存 MediMem 的源码、测试、运行脚本和必要配置。数据集、API 密钥、实验输出和模型权重不属于本代码仓库。
 
 ## 核心实现
 
-- `mem_ehr_agent/agents.py`：多智能体推理和诊断流程。
-- `mem_ehr_agent/memory.py`：记忆存储、Critic 审查和安全更新。
-- `mem_ehr_agent/benchmark.py`：长期记忆 benchmark、检索、基线适配和反事实复核。
-- `mem_ehr_agent/metrics.py`：诊断、证据检索和审计指标。
-- `mem_ehr_agent/optimizer.py`：实验编排与准入检查。
-- `mem_ehr_agent/data_builder.py`、`data_sources.py`、`expanded_data.py`：数据构建与来源适配。
+- `medimem/agents.py`：多智能体推理和诊断流程。
+- `medimem/memory.py`：记忆存储、Critic 审查和安全更新。
+- `medimem/benchmark.py`：长期记忆 benchmark、检索、基线适配和反事实复核。
+- `medimem/metrics.py`：诊断、证据检索和审计指标。
+- `medimem/optimizer.py`：实验编排与准入检查。
+- `medimem/data_builder.py`、`data_sources.py`、`expanded_data.py`：数据构建与来源适配。
 - `scripts/`：正式实验、消融、筛选和审计入口。
 - `tests/`：核心记忆、推理、指标、恢复和数据流程测试。
 
@@ -45,7 +45,7 @@ python -m pip install -e ".[dev,semantic]"
 以 `config/example.env` 为模板，在本地创建 `.env` 或通过进程环境变量传入配置。不要把真实密钥写入代码、脚本参数、日志、实验 manifest 或 Git。
 
 ```bash
-python -m mem_ehr_agent --help
+python -m medimem --help
 python -m pytest -q
 ```
 
@@ -58,10 +58,9 @@ python -m pytest -q
 - `.env`、密钥文件和机器本地配置；
 - `data/raw/`、`data/processed/` 和未获再分发许可的数据；
 - `runs/`、大规模 predictions、judge 输出、缓存和临时报告；
-- `.codex_tmp/`、`models/`、`checkpoints/` 及 `*.safetensors`、`*.bin`、`*.onnx` 等模型文件；
+- `.agent_tmp/`、`models/`、`checkpoints/` 及 `*.safetensors`、`*.bin`、`*.onnx` 等模型文件；
 - 论文 LaTeX 源文件、编译产物和 Overleaf 归档。
 
-`datasets/amem_original/` 中当前已跟踪的文件是用于可复现性核验的公开基准资产；新增数据在确认许可、去标识化和体积后才能提交。`outputs/nonmedical_timeline_main_table_20260719.csv` 是经过筛选的聚合结果，不包含逐样本预测或私有输入。
 
 ## 研究边界
 
@@ -72,4 +71,6 @@ python -m pytest -q
 
 ## 许可证与第三方代码
 
-`A-mem-main/` 是保留许可证和来源说明的第三方参考实现。使用或再分发时分别遵循其目录内的许可证。项目自身许可证尚未单独声明；对外发布前应补充与依赖兼容的许可证。
+本仓库不包含第三方模型源码、数据集或实验输出；相关依赖通过外部环境或公开数据源按各自许可获取。项目自身许可证尚未单独声明；对外发布前应补充与依赖兼容的许可证。
+
+

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import (
+from medimem.benchmark import (
     TimelineCrossEncoder,
     TimelineSemanticEncoder,
     build_locomo_memory_store,
@@ -221,3 +221,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import (
+from medimem.benchmark import (
     TEMPORAL_TERMS,
     TimelineSemanticEncoder,
     _hierarchical_turn_bundle,
@@ -505,3 +505,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

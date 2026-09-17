@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mem_ehr_agent.optimizer import write_fast_formal_gate
+from medimem.optimizer import write_fast_formal_gate
 
 
 def _summaries() -> list[dict[str, object]]:
@@ -40,3 +40,4 @@ def test_gate_records_but_excludes_intentional_sanitization_ablation_leakage(tmp
     assert gate["passed"] is True
     assert gate["critical_leakage_count"] == 0
     assert gate["intentional_ablation_critical_leakage_count"] == 4
+

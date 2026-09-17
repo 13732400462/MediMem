@@ -10,7 +10,7 @@
 
 ## 任务 1：扩展并测试消融组合
 
-修改 `mem_ehr_agent/optimizer.py`：
+修改 `medimem/optimizer.py`：
 
 - 注册三个两因素消融名称与精确功能开关；
 - 将新方法加入消融指标和差值输出白名单；
@@ -30,7 +30,7 @@ pytest tests/test_memory.py tests/test_metrics.py -q
 
 ## 任务 2：增加精确五流程模式
 
-修改 `mem_ehr_agent/baselines.py` 和 `mem_ehr_agent/optimizer.py`：
+修改 `medimem/baselines.py` 和 `medimem/optimizer.py`：
 
 - 增加 released-source CliCARE adapter；
 - 增加只运行 Direct、CoT、A-MEM、CliCARE 的 `backbone` baseline set；
@@ -38,7 +38,7 @@ pytest tests/test_memory.py tests/test_metrics.py -q
 - 不运行 Static RAG、DDO、ColaCare 或其他无关方法；
 - 在 manifest、pipeline comparison 和 gate 中记录五条目标流程。
 
-修改 `mem_ehr_agent/cli.py` 和测试：
+修改 `medimem/cli.py` 和测试：
 
 - 暴露 `--baseline-set backbone`；
 - 验证该模式输出的方法集合恰好正确；
@@ -52,7 +52,7 @@ pytest tests/test_memory.py tests/test_optimizer_gate.py -q
 
 ## 任务 3：安全读取 WLAI 密钥
 
-修改 `mem_ehr_agent/config.py`：
+修改 `medimem/config.py`：
 
 - 支持通过密钥文件路径读取 API key；
 - 命令行和进程环境只传密钥文件路径，不传密钥内容；
@@ -141,3 +141,4 @@ git diff --check
 - 将非医疗表移动至附录；
 - 编译并逐页检查论文；
 - 更新 PDF、Overleaf ZIP、网页端 Overleaf 和两份项目上下文。
+
