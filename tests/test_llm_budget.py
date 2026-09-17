@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mem_ehr_agent.llm import CompletionBudgetClient, LLMError, LLMResult
+from medimem.llm import CompletionBudgetClient, LLMError, LLMResult
 
 
 class FakeClient:
@@ -44,3 +44,4 @@ def test_completion_budget_preserves_reserved_tokens() -> None:
     client.reserved_completion_tokens = 0
     client.chat([], max_tokens=20)
     assert client.cumulative_usage["completion_tokens"] == 60
+

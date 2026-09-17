@@ -1,6 +1,6 @@
 import pytest
 
-from mem_ehr_agent import data_sources
+from medimem import data_sources
 
 
 def test_fetch_hf_rows_discovers_preferred_split(monkeypatch):
@@ -57,3 +57,4 @@ def test_hf_json_uses_env_dataset_server(monkeypatch):
     monkeypatch.setattr(data_sources.requests, "get", fake_get)
     data_sources.hf_json("rows", {"dataset": "demo"})
     assert seen["url"] == "https://hf-mirror.example/api/rows"
+

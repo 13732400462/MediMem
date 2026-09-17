@@ -14,9 +14,9 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 cd "$ROOT"
-python -m mem_ehr_agent data validate --dataset "$DATASET"
+python -m medimem data validate --dataset "$DATASET"
 for seed in $SEEDS; do
-  python -u -m mem_ehr_agent experiment-suite \
+  python -u -m medimem experiment-suite \
     --dataset "$DATASET" --require-api --max-workers "$MAX_WORKERS" \
     --suite-profile fast-formal --baseline-set none --ablation-groups with_polluted_memory \
     --counterfactual-policy risk_sample --counterfactual-sample-rate 0.20 \
@@ -26,8 +26,9 @@ done
 
 mapfile -t core_dirs < <(find "$CORE_ROOT" -type d -name predictions | sort)
 mapfile -t pollution_dirs < <(find "$OUTPUT_ROOT" -type d -name predictions | sort)
-python -m mem_ehr_agent analyze-run \
+python -m medimem analyze-run \
   --dataset "$DATASET" --predictions "${core_dirs[@]}" "${pollution_dirs[@]}" \
   --output-dir "$OUTPUT_ROOT/statistical_analysis" \
   --target-method ablate_with_polluted_memory_medimem --compare-methods full_medimem \
   --resamples 10000 --random-seed 20260706
+
