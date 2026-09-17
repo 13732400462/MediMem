@@ -254,7 +254,7 @@ run_medical_pipeline() {
 
   log "START medical model=$served_name phase=$phase workers=$workers per_source_n=$PER_SOURCE_N"
   if ! run_logged "build-medical:$served_name:$phase" "$run_dir/build.log" \
-  "$PY" -m mem_ehr_agent data build-medical-pool \
+  "$PY" -m medimem data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources "$MEDICAL_SOURCES" \
     --output-dir "$data_dir" \
@@ -273,12 +273,12 @@ print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
   if ! run_logged "validate-medical:$served_name:$phase" "$run_dir/validate.log" \
-    "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path"; then
+    "$PY" -m medimem data validate --dataset "$dataset_path"; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"medical_pooled\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"validate\",\"workers\":$workers,\"log\":\"$run_dir/validate.log\"}"
     return 1
   fi
   if ! run_logged "experiment-medical:$served_name:$phase" "$run_dir/experiment.log" \
-    "$PY" -u -m mem_ehr_agent experiment-suite \
+    "$PY" -u -m medimem experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -315,7 +315,7 @@ run_pmoa_ablation_pipeline() {
 
   log "START pmoa ablation model=$served_name phase=$phase workers=$workers per_source_n=$PER_SOURCE_N groups=$PMOA_ABLATION_GROUPS"
   if ! run_logged "build-pmoa:$served_name:$phase" "$run_dir/build.log" \
-  "$PY" -m mem_ehr_agent data build-medical-pool \
+  "$PY" -m medimem data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources pmoa_tts \
     --output-dir "$data_dir" \
@@ -334,12 +334,12 @@ print(json.loads(open(sys.argv[1], encoding="utf-8").read())["pooled_path"])
 PY
 )"
   if ! run_logged "validate-pmoa:$served_name:$phase" "$run_dir/validate.log" \
-    "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path"; then
+    "$PY" -m medimem data validate --dataset "$dataset_path"; then
     append_json "$BLOCKED_JSONL" "{\"model\":\"$served_name\",\"pipeline\":\"pmoa_ablation\",\"phase\":\"$phase\",\"status\":\"failed\",\"stage\":\"validate\",\"workers\":$workers,\"log\":\"$run_dir/validate.log\"}"
     return 1
   fi
   if ! run_logged "experiment-pmoa:$served_name:$phase" "$run_dir/experiment.log" \
-    "$PY" -u -m mem_ehr_agent experiment-suite \
+    "$PY" -u -m medimem experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -375,7 +375,7 @@ run_locomo_pipeline() {
 
   log "START locomo model=$served_name phase=$phase workers=$workers sample_n=$LOCOMO_SAMPLE_N"
   if ! run_logged "benchmark-locomo:$served_name:$phase" "$run_dir/benchmark.log" \
-    "$PY" -u -m mem_ehr_agent benchmark run \
+    "$PY" -u -m medimem benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -675,3 +675,4 @@ fi
 summarize_and_gate
 log "FINISHED strict size sweep summary=$SUMMARY_JSON"
 exit "$overall_status"
+

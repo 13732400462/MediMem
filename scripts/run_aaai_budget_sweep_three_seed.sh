@@ -15,13 +15,13 @@ export TRANSFORMERS_OFFLINE=1
 
 cd "$ROOT"
 mkdir -p "$OUTPUT_ROOT"
-python -m mem_ehr_agent data validate --dataset "$CORE_DATASET"
+python -m medimem data validate --dataset "$CORE_DATASET"
 
 for budget in $BUDGETS; do
   for seed in $SEEDS; do
     run_root="$OUTPUT_ROOT/budget_${budget}_seed_${seed}"
     mkdir -p "$run_root"
-    python -u -m mem_ehr_agent experiment-suite \
+    python -u -m medimem experiment-suite \
       --dataset "$CORE_DATASET" \
       --require-api \
       --max-workers "$MAX_WORKERS" \
@@ -39,7 +39,7 @@ for budget in $BUDGETS; do
 done
 
 mapfile -t prediction_dirs < <(find "$OUTPUT_ROOT" -type d -name predictions | sort)
-python -m mem_ehr_agent analyze-run \
+python -m medimem analyze-run \
   --dataset "$CORE_DATASET" \
   --predictions "${prediction_dirs[@]}" \
   --output-dir "$OUTPUT_ROOT/statistical_analysis" \
@@ -47,3 +47,4 @@ python -m mem_ehr_agent analyze-run \
   --compare-methods direct_deepseek,baseline_single_cot_agent,baseline_static_rag,baseline_amem_adapter \
   --resamples 10000 \
   --random-seed 20260706
+

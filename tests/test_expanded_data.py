@@ -1,4 +1,4 @@
-from mem_ehr_agent.expanded_data import (
+from medimem.expanded_data import (
     MEDICAL_DATASET_SPECS,
     dedupe_cases_by_source_id,
     dedupe_source_rows,
@@ -7,8 +7,8 @@ from mem_ehr_agent.expanded_data import (
     source_rows_to_cases,
     validate_medical_source_cases,
 )
-from mem_ehr_agent.agents import case_context
-from mem_ehr_agent.data_sources import load_cached_rows
+from medimem.agents import case_context
+from medimem.data_sources import load_cached_rows
 
 
 def test_load_cached_rows_prefers_enough_nested_cache(tmp_path):
@@ -282,3 +282,4 @@ def test_soap_summary_without_assessment_entity_disables_diagnosis_metric():
     pmoa_like = generic_row_to_pmoa_like(row, MEDICAL_DATASET_SPECS["medical_dialogue_to_soap"], 2)
     assert pmoa_like["diagnoses"] == ["Medical dialogue SOAP assessment unavailable"]
     assert pmoa_like["_diagnosis_metric_applicable"] is False
+

@@ -1,4 +1,4 @@
-from mem_ehr_agent.error_analysis import build_error_analysis, render_error_analysis
+from medimem.error_analysis import build_error_analysis, render_error_analysis
 
 
 def test_error_analysis_buckets_and_render(tmp_path):
@@ -28,3 +28,4 @@ def test_error_analysis_buckets_and_render(tmp_path):
     text = render_error_analysis(tmp_path, analysis)
     assert "Ours 错 / A-MEM 对" in text
     assert (tmp_path / "error_analysis_zh.md").exists()
+

@@ -18,19 +18,19 @@ cd "$ROOT"
 mkdir -p "$(dirname "$CORE_DATASET")" "$OUTPUT_ROOT"
 
 if [[ ! -s "$CORE_DATASET" ]]; then
-  python -m mem_ehr_agent filter-sources \
+  python -m medimem filter-sources \
     --dataset "$SOURCE_DATASET" \
     --sources pmoa_tts,pmc_patients \
     --output "$CORE_DATASET"
 fi
 
-python -m mem_ehr_agent data validate --dataset "$CORE_DATASET"
+python -m medimem data validate --dataset "$CORE_DATASET"
 [[ "$(wc -l < "$CORE_DATASET")" -eq 2000 ]] || { echo "expected 2000 core cases" >&2; exit 1; }
 
 for seed in $SEEDS; do
   seed_root="$OUTPUT_ROOT/seed_${seed}"
   mkdir -p "$seed_root"
-  python -u -m mem_ehr_agent experiment-suite \
+  python -u -m medimem experiment-suite \
     --dataset "$CORE_DATASET" \
     --require-api \
     --max-workers "$MAX_WORKERS" \
@@ -46,7 +46,7 @@ for seed in $SEEDS; do
 done
 
 mapfile -t prediction_dirs < <(find "$OUTPUT_ROOT" -type d -name predictions | sort)
-python -m mem_ehr_agent analyze-run \
+python -m medimem analyze-run \
   --dataset "$CORE_DATASET" \
   --predictions "${prediction_dirs[@]}" \
   --output-dir "$OUTPUT_ROOT/statistical_analysis" \
@@ -54,3 +54,4 @@ python -m mem_ehr_agent analyze-run \
   --compare-methods direct_deepseek,baseline_single_cot_agent,baseline_static_rag,baseline_amem_adapter \
   --resamples 10000 \
   --random-seed 20260706
+

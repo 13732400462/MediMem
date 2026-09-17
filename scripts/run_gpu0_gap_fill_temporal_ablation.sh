@@ -200,7 +200,7 @@ run_8b_locomo() {
   log "START 8B LoCoMo sample_n=$LOCOMO_SAMPLE_N workers=$workers"
   local out="$model_root/locomo_gap_fill"
   mkdir -p "$out"
-  "$PY" -u -m mem_ehr_agent benchmark run \
+  "$PY" -u -m medimem benchmark run \
     --dataset locomo \
     --methods "$LOCOMO_METHODS" \
     --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -226,7 +226,7 @@ run_pmoa_temporal_ablation() {
   export DEEPSEEK_BASE_URL="http://127.0.0.1:${PORT}/v1"
   export DEEPSEEK_MODEL="$served_name"
   log "BUILD PMOA model=$served_name n=$PER_SOURCE_N"
-  "$PY" -m mem_ehr_agent data build-medical-pool \
+  "$PY" -m medimem data build-medical-pool \
     --per-source-n "$PER_SOURCE_N" \
     --sources pmoa_tts \
     --output-dir "$data_dir" \
@@ -241,9 +241,9 @@ import sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["pooled_path"])
 PY
 )"
-  "$PY" -m mem_ehr_agent data validate --dataset "$dataset_path" > "$out/validate.log" 2>&1
+  "$PY" -m medimem data validate --dataset "$dataset_path" > "$out/validate.log" 2>&1
   log "START PMOA temporal ablation model=$served_name workers=$workers groups=$PMOA_ABLATION_GROUPS"
-  "$PY" -u -m mem_ehr_agent experiment-suite \
+  "$PY" -u -m medimem experiment-suite \
     --dataset "$dataset_path" \
     --require-api \
     --max-workers "$workers" \
@@ -408,3 +408,4 @@ for spec in "${MODELS[@]}"; do
 done
 summarize
 log "FINISHED summary=$SUMMARY_JSON report=$RUN_ROOT/gap_fill_summary.md"
+
