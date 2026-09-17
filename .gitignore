@@ -34,7 +34,6 @@ data/cache/
 runs/
 baseline_repos/
 outputs/*
-!outputs/nonmedical_timeline_main_table_20260719.csv
 *.log
 texput.log
 
@@ -61,4 +60,5 @@ temp/
 *.zip
 *.tar
 *.tar.gz
+
 
