@@ -1,4 +1,4 @@
-from mem_ehr_agent.report import render_report
+from medimem.report import render_report
 
 
 def test_report_renders_na_and_pollution_breakdown(tmp_path):
@@ -43,3 +43,4 @@ def test_report_renders_na_and_pollution_breakdown(tmp_path):
     assert "## 预期操作分布" in text
     assert "valid_historical_fact | Keep=1" in text
     assert "## 污染类型分解" in text
+

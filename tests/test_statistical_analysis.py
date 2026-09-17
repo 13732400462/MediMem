@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mem_ehr_agent.statistical_analysis import (
+from medimem.statistical_analysis import (
     canonical_method,
     holm_adjust,
     paired_bootstrap_ci,
@@ -29,3 +29,4 @@ def test_holm_adjustment_is_monotone_in_sorted_order() -> None:
     assert adjusted[0] == 0.03
     assert adjusted[2] >= adjusted[0]
     assert adjusted[1] >= adjusted[2]
+

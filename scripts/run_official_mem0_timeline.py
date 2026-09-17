@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from mem_ehr_agent.benchmark import (
+from medimem.benchmark import (
     NATIVE_BENCHMARKS,
     answer_with_context,
     build_client_for_base_url,
@@ -27,7 +27,7 @@ from mem_ehr_agent.benchmark import (
     validate_horizontal_run,
     write_csv,
 )
-from mem_ehr_agent.io_utils import append_jsonl, ensure_dir, write_jsonl, write_text
+from medimem.io_utils import append_jsonl, ensure_dir, write_jsonl, write_text
 
 
 METHOD = "official_mem0_timeline_adapter"
@@ -275,3 +275,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

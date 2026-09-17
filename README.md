@@ -7,13 +7,13 @@
 项目根目录：
 
 ```bash
-/home/syh/mem_ehr_agent
+/home/syh/medimem
 ```
 
 最新完成实验：
 
 ```bash
-/home/syh/mem_ehr_agent/runs/20260512_165750
+/home/syh/medimem/runs/20260512_165750
 ```
 
 DeepSeek 测试配置已写入服务器 `.env`，文件权限为 `600`。不要提交或打印 API key。
@@ -21,10 +21,10 @@ DeepSeek 测试配置已写入服务器 `.env`，文件权限为 `600`。不要�
 ## 快速运行
 
 ```bash
-cd /home/syh/mem_ehr_agent
+cd /home/syh/medimem
 source .venv/bin/activate
-python -m mem_ehr_agent data validate --dataset data/processed/samples.jsonl
-python -m mem_ehr_agent optimize --dataset data/processed/samples.jsonl --max-rounds 10 --require-api --max-workers 6
+python -m medimem data validate --dataset data/processed/samples.jsonl
+python -m medimem optimize --dataset data/processed/samples.jsonl --max-rounds 10 --require-api --max-workers 6
 ```
 
 运行产物会写入：
@@ -156,7 +156,7 @@ runs/20260512_165750/predictions/ours_round_001.jsonl
 服务器测试命令：
 
 ```bash
-cd /home/syh/mem_ehr_agent
+cd /home/syh/medimem
 .venv/bin/python -m pytest -q
 ```
 
@@ -180,3 +180,4 @@ cd /home/syh/mem_ehr_agent
 - 等服务器 GitHub 访问稳定后，补充 DDO 和 ColaCare 官方 repo 的完整复现。
 - 将当前 CPG proxy 升级为真实 DeepSeek 反事实重跑。
 - 增加消融实验：无记忆清洗、无批判智能体、无反事实复核、不同 `top_k` 检索数量。
+

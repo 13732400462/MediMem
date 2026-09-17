@@ -132,7 +132,7 @@ build_shared_pool() {
   mkdir -p "$data_dir"
   log "BUILD shared pool sources=$MEDICAL_SOURCES per_source_n=$PER_SOURCE_N seed=$RANDOM_SEED"
   run_logged "build-shared-pool" "$RUN_ROOT/build_shared_pool.log" \
-    "$PY" -m mem_ehr_agent data build-medical-pool \
+    "$PY" -m medimem data build-medical-pool \
       --per-source-n "$PER_SOURCE_N" \
       --sources "$MEDICAL_SOURCES" \
       --output-dir "$data_dir" \
@@ -150,9 +150,9 @@ PY
     exit 1
   fi
   run_logged "validate-shared-pool" "$RUN_ROOT/validate_shared_pool.log" \
-    "$PY" -m mem_ehr_agent data validate --dataset "$SHARED_POOL_PATH"
+    "$PY" -m medimem data validate --dataset "$SHARED_POOL_PATH"
   run_logged "validate-shared-pmoa" "$RUN_ROOT/validate_shared_pmoa.log" \
-    "$PY" -m mem_ehr_agent data validate --dataset "$SHARED_PMOA_PATH"
+    "$PY" -m medimem data validate --dataset "$SHARED_PMOA_PATH"
   append_json "$STATUS_JSONL" "{\"stage\":\"shared_data\",\"status\":\"ready\",\"pool\":\"$SHARED_POOL_PATH\",\"pmoa\":\"$SHARED_PMOA_PATH\",\"seed\":$RANDOM_SEED}"
 }
 
@@ -163,7 +163,7 @@ run_pool() {
   export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$served"
   log "START pool model=$served workers=$MAX_WORKERS dataset=$SHARED_POOL_PATH"
   run_logged "pool:$served" "$out/experiment.log" \
-    "$PY" -u -m mem_ehr_agent experiment-suite \
+    "$PY" -u -m medimem experiment-suite \
       --dataset "$SHARED_POOL_PATH" \
       --require-api \
       --max-workers "$MAX_WORKERS" \
@@ -181,7 +181,7 @@ run_locomo() {
   export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$served"
   log "START locomo model=$served workers=$MAX_WORKERS sample_n=$LOCOMO_SAMPLE_N seed=$RANDOM_SEED"
   run_logged "locomo:$served" "$out/benchmark.log" \
-    "$PY" -u -m mem_ehr_agent benchmark run \
+    "$PY" -u -m medimem benchmark run \
       --dataset locomo \
       --methods "$LOCOMO_METHODS" \
       --dataset-path "$LOCOMO_DATASET_PATH" \
@@ -200,7 +200,7 @@ run_pmoa() {
   export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$served"
   log "START pmoa model=$served workers=$MAX_WORKERS dataset=$SHARED_PMOA_PATH groups=$PMOA_ABLATION_GROUPS"
   run_logged "pmoa:$served" "$out/experiment.log" \
-    "$PY" -u -m mem_ehr_agent experiment-suite \
+    "$PY" -u -m medimem experiment-suite \
       --dataset "$SHARED_PMOA_PATH" \
       --require-api \
       --max-workers "$MAX_WORKERS" \
@@ -264,3 +264,4 @@ log "FINISHED summary=$SUMMARY_JSON left_status=$left_status right_status=$right
 if [ "$left_status" -ne 0 ] || [ "$right_status" -ne 0 ]; then
   exit 1
 fi
+
